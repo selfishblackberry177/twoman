@@ -75,6 +75,7 @@ class RemoteStream(object):
         self.fin_offset = None
         self.closed = False
         self.remote_eof_sent = False
+        self.remote_read_eof = False
         self.pending_window = 0
         self.window_flush_task = None
 
@@ -135,6 +136,7 @@ class RemoteStream(object):
                     await self.send_credit_event.wait()
                 data = await self.reader.read(min(READ_CHUNK, self.send_credit))
                 if not data:
+                    self.remote_read_eof = True
                     trace("remote EOF stream=%s send_offset=%s" % (self.stream_id, self.send_offset))
                     await self.flush_window()
                     await self.agent.transport.send_frame(
@@ -142,6 +144,8 @@ class RemoteStream(object):
                         Frame(FRAME_FIN, stream_id=self.stream_id, offset=self.send_offset),
                     )
                     trace("send FIN stream=%s offset=%s" % (self.stream_id, self.send_offset))
+                    if self.remote_eof_sent:
+                        await self.close()
                     return
                 lane = self._data_lane(len(data))
                 trace("send DATA stream=%s lane=%s offset=%s bytes=%s" % (self.stream_id, lane, self.send_offset, len(data)))
@@ -198,6 +202,8 @@ class RemoteStream(object):
             self.writer.write_eof()
             await self.writer.drain()
         self.remote_eof_sent = True
+        if self.remote_read_eof:
+            await self.close()
 
     async def close(self):
         current_task = asyncio.current_task()

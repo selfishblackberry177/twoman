@@ -357,6 +357,9 @@ async def relay_stream(runtime, stream, reader, writer, initial_payload=b"", con
         if failure is not None:
             with contextlib.suppress(Exception):
                 await stream.reset(str(failure))
+        elif not stream.closed:
+            with contextlib.suppress(Exception):
+                await stream.finish()
         await runtime.release_stream(stream.stream_id)
         writer.close()
         await writer.wait_closed()

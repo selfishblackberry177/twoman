@@ -251,10 +251,19 @@ class BrokerState(object):
     async def cleanup(self):
         peer_cutoff = now_ms() - self.peer_ttl_ms
         stream_cutoff = now_ms() - self.stream_ttl_ms
+        resets = []
         async with self.lock:
             stale_peers = [key for key, peer in self.peers.items() if peer.last_seen_ms < peer_cutoff]
             for key in stale_peers:
                 role, peer_session_id = key
+                stale_streams_for_peer = [
+                    stream
+                    for stream in self.streams_by_agent.values()
+                    if stream.helper_session_id == peer_session_id or stream.agent_session_id == peer_session_id
+                ]
+                for stream in stale_streams_for_peer:
+                    resets.extend(self._reset_frames_for_stale_peer_locked(role, peer_session_id, stream))
+                    self._drop_stream_locked(stream)
                 del self.peers[key]
                 if role == "agent" and self.agent_session_id == peer_session_id:
                     self.agent_session_id = ""
@@ -262,7 +271,49 @@ class BrokerState(object):
 
             stale_streams = [stream for stream in self.streams_by_agent.values() if stream.last_seen_ms < stream_cutoff]
             for stream in stale_streams:
+                resets.extend(self._reset_frames_for_stale_stream_locked(stream))
                 self._drop_stream_locked(stream)
+
+        for role, peer_session_id, lane, frame in resets:
+            await self.queue_frame(role, peer_session_id, lane, frame)
+
+    def _reset_frames_for_stale_peer_locked(self, stale_role, stale_peer_session_id, stream):
+        payload = make_error_payload("peer expired")
+        resets = []
+        if stale_role == "helper" and stream.agent_session_id and ("agent", stream.agent_session_id) in self.peers:
+            resets.append((
+                "agent",
+                stream.agent_session_id,
+                LANE_CTL,
+                Frame(FRAME_RST, stream_id=stream.agent_stream_id, payload=payload),
+            ))
+        if stale_role == "agent" and stream.helper_session_id and ("helper", stream.helper_session_id) in self.peers:
+            resets.append((
+                "helper",
+                stream.helper_session_id,
+                LANE_CTL,
+                Frame(FRAME_RST, stream_id=stream.helper_stream_id, payload=payload),
+            ))
+        return resets
+
+    def _reset_frames_for_stale_stream_locked(self, stream):
+        payload = make_error_payload("stream expired")
+        resets = []
+        if stream.helper_session_id and ("helper", stream.helper_session_id) in self.peers:
+            resets.append((
+                "helper",
+                stream.helper_session_id,
+                LANE_CTL,
+                Frame(FRAME_RST, stream_id=stream.helper_stream_id, payload=payload),
+            ))
+        if stream.agent_session_id and ("agent", stream.agent_session_id) in self.peers:
+            resets.append((
+                "agent",
+                stream.agent_session_id,
+                LANE_CTL,
+                Frame(FRAME_RST, stream_id=stream.agent_stream_id, payload=payload),
+            ))
+        return resets
 
     async def stats(self):
         async with self.lock:
