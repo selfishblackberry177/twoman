@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+from collections import deque
 import contextlib
 import json
 import os
@@ -81,9 +82,14 @@ class PeerState(object):
         self.queues = dict((lane, LaneQueue()) for lane in LANES)
         self.data_pri_streak = 0
         self.data_bulk_wait_since_ms = 0
+        self.active_streams = 0
+        self.open_events_ms = deque()
 
     def touch(self):
         self.last_seen_ms = now_ms()
+
+    def buffered_bytes_total(self):
+        return sum(queue.buffered_bytes for queue in self.queues.values())
 
 
 class StreamState(object):
@@ -107,6 +113,13 @@ class BrokerState(object):
         self.peer_ttl_ms = int(config.get("peer_ttl_seconds", 90)) * 1000
         self.stream_ttl_ms = int(config.get("stream_ttl_seconds", 300)) * 1000
         self.max_lane_bytes = int(config.get("max_lane_bytes", 16 * 1024 * 1024))
+        self.max_streams_per_peer_session = max(1, int(config.get("max_streams_per_peer_session", 256)))
+        self.max_open_rate_per_peer_session = max(1, int(config.get("max_open_rate_per_peer_session", 120)))
+        self.open_rate_window_ms = max(1000, int(config.get("open_rate_window_seconds", 10)) * 1000)
+        self.max_peer_buffered_bytes = max(
+            self.max_lane_bytes,
+            int(config.get("max_peer_buffered_bytes", min(self.max_lane_bytes * 2, 32 * 1024 * 1024))),
+        )
         self.peers = {}
         self.streams_by_helper = {}
         self.streams_by_agent = {}
@@ -157,6 +170,10 @@ class BrokerState(object):
             queue = peer.queues[lane]
             if queue.buffered_bytes >= self.max_lane_bytes:
                 trace("drop frame type=%s stream=%s target=%s/%s lane=%s reason=queue-full buffered=%s" % (frame.type_id, frame.stream_id, role, peer_session_id, lane, queue.buffered_bytes))
+                return False
+            total_buffered = peer.buffered_bytes_total()
+            if total_buffered >= self.max_peer_buffered_bytes:
+                trace("drop frame type=%s stream=%s target=%s/%s lane=%s reason=peer-buffer-full buffered=%s" % (frame.type_id, frame.stream_id, role, peer_session_id, lane, total_buffered))
                 return False
         await peer.queues[lane].put(payload)
         if frame.type_id != FRAME_DATA:
@@ -214,18 +231,27 @@ class BrokerState(object):
                 self._drop_stream_locked(stream)
 
     async def _handle_open(self, helper_session_id, frame):
+        open_error = ""
         async with self.lock:
             agent_session_id = self.agent_session_id
             helper_peer = self.peers.get(("helper", helper_session_id))
             helper_peer_label = helper_peer.peer_label if helper_peer is not None else helper_session_id
+            if helper_peer is None:
+                open_error = "helper session unavailable"
+            else:
+                open_error = self._reserve_helper_open_locked(helper_peer)
             if not agent_session_id or ("agent", agent_session_id) not in self.peers:
                 agent_session_id = ""
-            if agent_session_id:
+            if agent_session_id and not open_error:
                 agent_stream_id = self.next_agent_stream_id
                 self.next_agent_stream_id += 1
                 stream = StreamState(helper_session_id, helper_peer_label, frame.stream_id, agent_session_id, agent_stream_id)
                 self.streams_by_helper[(helper_session_id, frame.stream_id)] = stream
                 self.streams_by_agent[agent_stream_id] = stream
+                helper_peer.active_streams += 1
+                agent_peer = self.peers.get(("agent", agent_session_id))
+                if agent_peer is not None:
+                    agent_peer.active_streams += 1
                 trace("open helper=%s/%s helper_stream=%s agent_session=%s agent_stream=%s" % (
                     helper_peer_label,
                     helper_session_id,
@@ -233,6 +259,15 @@ class BrokerState(object):
                     agent_session_id,
                     agent_stream_id,
                 ))
+        if open_error:
+            trace("open fail stream=%s helper=%s reason=%s" % (frame.stream_id, helper_session_id, open_error))
+            await self.queue_frame(
+                "helper",
+                helper_session_id,
+                LANE_CTL,
+                Frame(FRAME_OPEN_FAIL, stream_id=frame.stream_id, payload=make_error_payload(open_error)),
+            )
+            return
         if not agent_session_id:
             trace("open fail stream=%s helper=%s reason=no-agent" % (frame.stream_id, helper_session_id))
             await self.queue_frame(
@@ -247,6 +282,24 @@ class BrokerState(object):
     def _drop_stream_locked(self, stream):
         self.streams_by_helper.pop((stream.helper_session_id, stream.helper_stream_id), None)
         self.streams_by_agent.pop(stream.agent_stream_id, None)
+        helper_peer = self.peers.get(("helper", stream.helper_session_id))
+        if helper_peer is not None and helper_peer.active_streams > 0:
+            helper_peer.active_streams -= 1
+        agent_peer = self.peers.get(("agent", stream.agent_session_id))
+        if agent_peer is not None and agent_peer.active_streams > 0:
+            agent_peer.active_streams -= 1
+
+    def _reserve_helper_open_locked(self, helper_peer):
+        current_ms = now_ms()
+        window_start = current_ms - self.open_rate_window_ms
+        while helper_peer.open_events_ms and helper_peer.open_events_ms[0] < window_start:
+            helper_peer.open_events_ms.popleft()
+        if helper_peer.active_streams >= self.max_streams_per_peer_session:
+            return "too many concurrent streams"
+        if len(helper_peer.open_events_ms) >= self.max_open_rate_per_peer_session:
+            return "too many new streams"
+        helper_peer.open_events_ms.append(current_ms)
+        return ""
 
     async def cleanup(self):
         peer_cutoff = now_ms() - self.peer_ttl_ms
@@ -325,6 +378,10 @@ class BrokerState(object):
                 "streams": len(self.streams_by_agent),
                 "agent_peer_label": self.agent_peer_label,
                 "agent_session_id": self.agent_session_id,
+                "max_streams_per_peer_session": self.max_streams_per_peer_session,
+                "max_open_rate_per_peer_session": self.max_open_rate_per_peer_session,
+                "open_rate_window_seconds": int(self.open_rate_window_ms / 1000),
+                "max_peer_buffered_bytes": self.max_peer_buffered_bytes,
                 "buffered_ctl_bytes": buffered[LANE_CTL],
                 "buffered_pri_bytes": buffered["pri"],
                 "buffered_bulk_bytes": buffered["bulk"],

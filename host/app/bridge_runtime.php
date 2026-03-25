@@ -123,6 +123,10 @@ function bridge_runtime_write_config()
         'peer_ttl_seconds' => isset($config['bridge_max_agent_idle_seconds']) ? (int) $config['bridge_max_agent_idle_seconds'] : 90,
         'stream_ttl_seconds' => isset($config['bridge_session_ttl_seconds']) ? (int) $config['bridge_session_ttl_seconds'] : 300,
         'max_lane_bytes' => bridge_runtime_max_lane_bytes(),
+        'max_streams_per_peer_session' => isset($config['bridge_max_streams_per_peer_session']) ? (int) $config['bridge_max_streams_per_peer_session'] : 256,
+        'max_open_rate_per_peer_session' => isset($config['bridge_max_open_rate_per_peer_session']) ? (int) $config['bridge_max_open_rate_per_peer_session'] : 120,
+        'open_rate_window_seconds' => isset($config['bridge_open_rate_window_seconds']) ? (int) $config['bridge_open_rate_window_seconds'] : 10,
+        'max_peer_buffered_bytes' => isset($config['bridge_max_peer_buffered_bytes']) ? (int) $config['bridge_max_peer_buffered_bytes'] : min(bridge_runtime_max_lane_bytes() * 2, 32 * 1024 * 1024),
     ];
 
     $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);

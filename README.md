@@ -54,54 +54,65 @@ More detail: [docs/ARCHITECTURE.md](/home/shahab/dev/hobby/mintm/docs/ARCHITECTU
 
 ## Quick Start
 
-### 1. Configure the host
+### One-command deployment
 
-Copy:
-- `host/twoman.htaccess` into your public `/.htaccess`
-- `host/public/api.php` into your public Twoman path
-- `host/app/bridge_runtime.php`
-- `host/app/bootstrap.php`
-- `host/runtime/http_broker_daemon.py`
+Twoman now ships with repo-level scripts for each side:
 
-Create `host/app/config.php` from `host/app/config.sample.php` and set:
-- `public_base_path`
-- `client_tokens`
-- `agent_tokens`
-- `bridge_local_port`
+- `scripts/deploy_host.sh`: uploads the cPanel host files, writes `host/app/config.php`, restarts the broker, and verifies health
+- `scripts/deploy_hidden_server.sh`: uploads the hidden agent files, writes `config.json`, installs `systemd` units, enables the watchdog, and restarts the agent
+- `scripts/start_client.sh`: writes `local_client/config.json` if needed and starts the local helper in the foreground
 
-### 2. Configure the hidden server
-
-Copy `hidden_server/config.sample.json` to `config.json` and set:
-- `broker_base_url`
-- `agent_token`
-
-Run:
+### 1. Deploy the cPanel host
 
 ```bash
-python3 hidden_server/agent.py --config hidden_server/config.json
+export TWOMAN_CPANEL_BASE_URL='https://your-host.example:2083'
+export TWOMAN_CPANEL_USERNAME='cpanel-user'
+export TWOMAN_CPANEL_PASSWORD='cpanel-password'
+export TWOMAN_CPANEL_HOME='/home/cpanel-user'
+export TWOMAN_PUBLIC_ORIGIN='https://your-host.example'
+export TWOMAN_PUBLIC_BASE_PATH='/twoman'
+export TWOMAN_CLIENT_TOKEN='replace-with-client-token'
+export TWOMAN_AGENT_TOKEN='replace-with-agent-token'
+
+./scripts/deploy_host.sh
 ```
 
-### 3. Configure the local helper
-
-Copy `local_client/config.sample.json` to `config.json` and set:
-- `broker_base_url`
-- `client_token`
-
-Run:
+### 2. Deploy the hidden server
 
 ```bash
-python3 local_client/helper.py --config local_client/config.json
+export TWOMAN_SERVER_HOST='185.219.7.36'
+export TWOMAN_SERVER_USER='root'
+export TWOMAN_SERVER_PASSWORD='server-password'
+export TWOMAN_SERVER_DIR='/opt/twoman'
+export TWOMAN_BROKER_BASE_URL='https://your-host.example/twoman/bridge/v2'
+export TWOMAN_AGENT_TOKEN='replace-with-agent-token'
+export TWOMAN_AGENT_PEER_ID='agent-main'
+
+./scripts/deploy_hidden_server.sh
 ```
+
+### 3. Start the local helper
+
+```bash
+export TWOMAN_BROKER_BASE_URL='https://your-host.example/twoman/bridge/v2'
+export TWOMAN_CLIENT_TOKEN='replace-with-client-token'
+./scripts/start_client.sh
+```
+
+This starts the helper in the foreground. `Ctrl+C` stops it cleanly.
 
 Default helper ports:
-- HTTP proxy: `127.0.0.1:8080`
-- SOCKS5 proxy: `127.0.0.1:1080`
+- HTTP proxy: `127.0.0.1:18092`
+- SOCKS5 proxy: `127.0.0.1:11092`
 
 ## Requirements
 
 - cPanel host with LiteSpeed `.htaccess` reverse proxy support to `127.0.0.1`
 - Python 3 on the host for `host/runtime/http_broker_daemon.py`
 - Python 3.9+ recommended for helper and hidden agent
+- `curl` for `scripts/deploy_host.sh`
+- `ssh` and `scp` for `scripts/deploy_hidden_server.sh`
+- `sshpass` only if you use password-based hidden-server deploys
 - `pip install -r requirements.txt`
 
 ### 4. Verify
@@ -116,13 +127,13 @@ curl -H 'X-Relay-Token: YOUR_CLIENT_TOKEN' \
 SOCKS egress:
 
 ```bash
-curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org
+curl --socks5-hostname 127.0.0.1:11092 https://api.ipify.org
 ```
 
 HTTP egress:
 
 ```bash
-curl --proxy http://127.0.0.1:8080 https://api.ipify.org
+curl --proxy http://127.0.0.1:18092 https://api.ipify.org
 ```
 
 Expected result: the origin IP should be the hidden server, not the local client.
@@ -149,6 +160,8 @@ Tracing is off by default to avoid log growth on production hosts.
 - The broker is the hot-path component on the cPanel host. PHP is only bootstrap/supervision.
 - Browser workloads are materially heavier than Telegram or one-shot `curl` probes.
 - SOCKS is generally the better app-facing surface than the HTTP proxy for real-world use.
+- The broker now enforces per-session safety limits for concurrent streams, open-rate bursts, and queued bytes.
+- The hidden agent watchdog restarts the service before file descriptors or `CLOSE-WAIT` sockets can pile up into an outage.
 
 ## Security
 
