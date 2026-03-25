@@ -62,6 +62,9 @@ Twoman now ships with repo-level scripts for each side:
 - `scripts/deploy_hidden_server.sh`: uploads the hidden agent files, writes `config.json`, installs `systemd` units, enables the watchdog, and restarts the agent
 - `scripts/start_client.sh`: writes `local_client/config.json` if needed and starts the local helper in the foreground
 
+Manual fallback:
+- [docs/MANUAL_DEPLOY.md](/home/shahab/dev/hobby/mintm/docs/MANUAL_DEPLOY.md)
+
 ### 1. Deploy the cPanel host
 
 ```bash
