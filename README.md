@@ -1,5 +1,9 @@
 # Twoman
 
+<p align="center">
+  <img src="android-client/assets/logo.png" alt="Twoman logo" width="160" />
+</p>
+
 Twoman is a host-preserving relay for shared cPanel hosting and managed
 CloudLinux app runtimes.
 
