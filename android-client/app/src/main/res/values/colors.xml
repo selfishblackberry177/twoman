@@ -5,4 +5,6 @@
     <color name="twoman_surface">#F5F5F5</color>
     <color name="twoman_outline">#D4D4D8</color>
     <color name="twoman_muted">#52525B</color>
+    <color name="twoman_success">#16A34A</color>
+    <color name="twoman_warning">#D97706</color>
 </resources>

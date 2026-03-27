@@ -4,6 +4,9 @@
     <string name="status_proxy">Proxy</string>
     <string name="status_vpn">VPN</string>
     <string name="action_add">Add</string>
+    <string name="action_connect">Connect</string>
+    <string name="action_disconnect">Disconnect</string>
+    <string name="action_copy">Copy</string>
     <string name="action_logs">Logs</string>
     <string name="action_starting">Starting</string>
     <string name="action_stop">Stop</string>
@@ -11,8 +14,10 @@
     <string name="action_stopped">Off</string>
     <string name="action_proxy">Proxy</string>
     <string name="action_proxy_on">Proxy on</string>
+    <string name="action_selected_proxy">Proxy selected</string>
     <string name="action_vpn">VPN</string>
     <string name="action_vpn_on">VPN on</string>
+    <string name="action_selected_vpn">VPN selected</string>
     <string name="action_edit">Edit</string>
     <string name="action_share">Share</string>
     <string name="action_delete">Delete</string>
@@ -36,6 +41,15 @@
     <string name="profile_running_proxy">Running in Proxy mode</string>
     <string name="profile_running_vpn">Running in VPN mode</string>
     <string name="profile_running_proxy_shared">Running in Proxy mode • LAN %1$s</string>
+    <string name="profile_selected_proxy">Selected for Proxy</string>
+    <string name="profile_selected_vpn">Selected for VPN</string>
+    <string name="selection_none">Choose a profile</string>
+    <string name="selection_mode_proxy">Proxy selected</string>
+    <string name="selection_mode_vpn">VPN selected</string>
+    <string name="status_ready">Ready to connect</string>
+    <string name="status_connected_proxy">Connected with Proxy</string>
+    <string name="status_connected_vpn">Connected with VPN</string>
+    <string name="status_error">Connection error</string>
     <string name="status_idle_message">Choose Proxy or VPN on a saved profile.</string>
     <string name="status_proxy_starting">Starting proxy</string>
     <string name="status_vpn_starting">Starting VPN</string>
@@ -46,6 +60,8 @@
     <string name="import_applied">Import applied</string>
     <string name="save_requires_fields">Fill all fields</string>
     <string name="vpn_permission_denied">VPN permission denied</string>
+    <string name="toast_select_profile">Select a profile first</string>
     <string name="toast_proxy_starting">Proxy starting</string>
     <string name="toast_vpn_starting">VPN starting</string>
+    <string name="toast_logs_copied">Logs copied</string>
 </resources>

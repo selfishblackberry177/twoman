@@ -84,22 +84,90 @@
             app:iconPadding="4dp"
             app:iconSize="16dp"
             app:iconTint="@color/twoman_black" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/stopButton"
-            style="@style/Widget.Material3.Button.OutlinedButton"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="8dp"
-            android:layout_weight="1"
-            android:text="@string/action_stop"
-            android:textSize="13sp"
-            app:icon="@drawable/ic_stop_square"
-            app:iconGravity="textStart"
-            app:iconPadding="4dp"
-            app:iconSize="16dp"
-            app:iconTint="@color/twoman_black" />
     </LinearLayout>
+
+    <com.google.android.material.card.MaterialCardView
+        android:id="@+id/connectCard"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        app:cardBackgroundColor="@color/twoman_surface"
+        app:cardCornerRadius="24dp"
+        app:strokeColor="@color/twoman_outline"
+        app:strokeWidth="1dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <ImageView
+                    android:id="@+id/connectionStateIcon"
+                    android:layout_width="20dp"
+                    android:layout_height="20dp"
+                    android:contentDescription="@string/status_stopped"
+                    android:src="@drawable/ic_check_circle"
+                    app:tint="@color/twoman_muted" />
+
+                <TextView
+                    android:id="@+id/connectionStateText"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:text="@string/status_ready"
+                    android:textAppearance="?attr/textAppearanceBodyMedium"
+                    android:textColor="@color/twoman_black" />
+
+                <com.google.android.material.progressindicator.CircularProgressIndicator
+                    android:id="@+id/connectionProgress"
+                    android:layout_width="18dp"
+                    android:layout_height="18dp"
+                    android:indeterminate="true"
+                    android:visibility="gone"
+                    app:indicatorColor="@color/twoman_black"
+                    app:trackThickness="2dp" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/selectedProfileText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:text="@string/selection_none"
+                android:textAppearance="?attr/textAppearanceTitleMedium"
+                android:textColor="@color/twoman_black"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/selectedModeText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="@string/selection_mode_proxy"
+                android:textAppearance="?attr/textAppearanceBodyMedium"
+                android:textColor="@color/twoman_muted" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/connectButton"
+                style="@style/Widget.Material3.Button"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="14dp"
+                android:text="@string/action_connect"
+                app:icon="@drawable/ic_connect"
+                app:iconGravity="textStart"
+                app:iconPadding="6dp"
+                app:iconSize="18dp" />
+        </LinearLayout>
+    </com.google.android.material.card.MaterialCardView>
 
     <androidx.recyclerview.widget.RecyclerView
         android:id="@+id/profileList"

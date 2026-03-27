@@ -106,6 +106,21 @@ class ProxyService : Service() {
     private fun requestStop() {
         stopRequested = true
         stopForeground(STOP_FOREGROUND_REMOVE)
+        currentProfile?.let { profile ->
+            stateStore.write(
+                RuntimeStatus(
+                    running = true,
+                    mode = currentMode,
+                    profileId = profile.id,
+                    profileName = profile.name,
+                    brokerBaseUrl = profile.brokerBaseUrl,
+                    httpPort = profile.httpPort,
+                    socksPort = profile.socksPort,
+                    logPath = AppFiles.runtimeLogFile(this, profile.id).absolutePath,
+                    message = getString(R.string.status_stopping_message),
+                ),
+            )
+        }
         val threadToJoin = helperThread
         thread(name = "twoman-python-stop", start = true) {
             val stopped = runCatching {
@@ -142,6 +157,21 @@ class ProxyService : Service() {
                 stopSelf()
                 Process.killProcess(Process.myPid())
                 return@thread
+            }
+            currentProfile?.let { profile ->
+                stateStore.write(
+                    RuntimeStatus(
+                        running = false,
+                        mode = "stopped",
+                        profileId = profile.id,
+                        profileName = profile.name,
+                        brokerBaseUrl = profile.brokerBaseUrl,
+                        httpPort = profile.httpPort,
+                        socksPort = profile.socksPort,
+                        logPath = AppFiles.runtimeLogFile(this, profile.id).absolutePath,
+                        message = "",
+                    ),
+                )
             }
             stopSelf()
         }

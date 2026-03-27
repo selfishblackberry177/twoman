@@ -200,15 +200,15 @@ class TunnelVpnService : VpnService() {
         activeProfile?.let { profile ->
             stateStore.write(
                 RuntimeStatus(
-                    running = false,
-                    mode = "stopped",
+                    running = true,
+                    mode = ProxyService.MODE_VPN,
                     profileId = profile.id,
                     profileName = profile.name,
                     brokerBaseUrl = profile.brokerBaseUrl,
                     httpPort = profile.httpPort,
                     socksPort = profile.socksPort,
                     logPath = AppFiles.runtimeLogFile(this, profile.id).absolutePath,
-                    message = "",
+                    message = getString(R.string.status_stopping_message),
                 ),
             )
         }

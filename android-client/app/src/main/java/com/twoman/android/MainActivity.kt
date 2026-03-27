@@ -3,12 +3,14 @@ package com.twoman.android
 import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.content.res.ColorStateList
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.View
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
@@ -17,6 +19,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
 import androidx.recyclerview.widget.LinearLayoutManager
+import com.google.android.material.color.MaterialColors
 import com.twoman.android.databinding.ActivityMainBinding
 import com.twoman.android.databinding.DialogProfileBinding
 import java.net.InetSocketAddress
@@ -25,13 +28,16 @@ import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity() {
     private val loggerTag = "TwomanUi"
-    private val modeSwitchTimeoutMs = 8_000L
+    private val modeSwitchTimeoutMs = 10_000L
+    private val restartSettleMs = 1_500L
     private lateinit var binding: ActivityMainBinding
     private lateinit var profileStore: ProfileStore
+    private lateinit var selectionStore: SelectionStore
     private lateinit var stateStore: RuntimeStateStore
     private lateinit var adapter: ProfileAdapter
     private val uiHandler = Handler(Looper.getMainLooper())
     private var pendingVpnProfile: ClientProfile? = null
+    private var profiles: List<ClientProfile> = emptyList()
 
     private val statusTicker = object : Runnable {
         override fun run() {
@@ -62,11 +68,11 @@ class MainActivity : AppCompatActivity() {
         applyInsets()
 
         profileStore = ProfileStore(this)
+        selectionStore = SelectionStore(this)
         stateStore = RuntimeStateStore(this)
 
         adapter = ProfileAdapter(
-            onProxy = { startProxy(it) },
-            onVpn = { startVpn(it) },
+            onSelectMode = { profile, mode -> selectProfileMode(profile, mode) },
             onEdit = { showProfileDialog(it) },
             onShare = { shareProfile(it) },
             onDelete = { deleteProfile(it) },
@@ -74,10 +80,8 @@ class MainActivity : AppCompatActivity() {
         binding.profileList.layoutManager = LinearLayoutManager(this)
         binding.profileList.adapter = adapter
         binding.addButton.setOnClickListener { showProfileDialog(null) }
-        binding.stopButton.setOnClickListener { stopEverything() }
-        binding.logsButton.setOnClickListener {
-            startActivity(Intent(this, LogActivity::class.java))
-        }
+        binding.logsButton.setOnClickListener { startActivity(Intent(this, LogActivity::class.java)) }
+        binding.connectButton.setOnClickListener { onConnectClicked() }
 
         requestNotificationPermissionIfNeeded()
         reloadProfiles()
@@ -101,58 +105,111 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun reloadProfiles() {
-        adapter.submit(profileStore.loadProfiles().sortedBy { it.name.lowercase() })
+        profiles = profileStore.loadProfiles().sortedBy { it.name.lowercase() }
+        val selection = ensureSelection(profiles)
+        adapter.submit(profiles)
+        adapter.setSelection(selection.profileId, selection.mode)
         adapter.setRuntimeStatus(resolveRuntimeStatus())
     }
 
     private fun renderStatus() {
         val status = resolveRuntimeStatus()
+        val selection = ensureSelection(profiles)
+        val selectedProfile = profiles.firstOrNull { it.id == selection.profileId }
         val starting = !status.running && status.message == getString(R.string.status_starting_message)
         val stopping = status.running && status.message == getString(R.string.status_stopping_message)
-        val activeProfile = if (status.profileId.isBlank()) {
-            null
-        } else {
-            profileStore.loadProfiles().firstOrNull { it.id == status.profileId }
-        }
-        val shareAddress = activeProfile
-            ?.takeIf { it.shareLanSocks && status.mode == ProxyService.MODE_PROXY }
+        val shareAddress = selectedProfile
+            ?.takeIf { it.shareLanSocks && status.mode == ProxyService.MODE_PROXY && status.running }
             ?.let { LanShareInfo.displayAddress(it.socksPort) }
+        val effectiveMode = if (status.running || starting) status.mode else selection.mode
+
+        adapter.setSelection(selection.profileId, selection.mode)
         adapter.setRuntimeStatus(status)
-        binding.stopButton.isEnabled = status.running && !stopping
-        binding.stopButton.text = getString(
-            when {
-                starting -> R.string.action_starting
-                stopping -> R.string.action_stopping
-                status.running -> R.string.action_stop
-                else -> R.string.action_stopped
-            },
-        )
+
+        binding.selectedProfileText.text = selectedProfile?.name ?: getString(R.string.selection_none)
+        binding.selectedModeText.text = when (effectiveMode) {
+            ProxyService.MODE_VPN -> getString(R.string.selection_mode_vpn)
+            else -> getString(R.string.selection_mode_proxy)
+        }
+
         when {
             starting -> {
-                binding.statusText.text = when (status.mode) {
+                binding.statusText.text = when (effectiveMode) {
                     ProxyService.MODE_VPN -> getString(R.string.status_vpn_starting)
                     else -> getString(R.string.status_proxy_starting)
                 }
                 binding.portsText.text = getString(R.string.status_starting_message)
+                updateConnectionUi(
+                    stateText = getString(R.string.status_starting_message),
+                    iconTint = MaterialColors.getColor(binding.root, com.google.android.material.R.attr.colorPrimary),
+                    buttonText = getString(R.string.action_starting),
+                    buttonIcon = R.drawable.ic_connect,
+                    buttonEnabled = false,
+                    progressVisible = true,
+                )
             }
-            !status.running -> {
-                binding.statusText.text = getString(R.string.status_stopped)
-                binding.portsText.text = status.message.ifBlank { getString(R.string.status_idle_message) }
+            stopping -> {
+                binding.statusText.text = getString(R.string.status_stopping_message)
+                binding.portsText.text = getString(R.string.status_stopping_message)
+                updateConnectionUi(
+                    stateText = getString(R.string.status_stopping_message),
+                    iconTint = getColor(R.color.twoman_warning),
+                    buttonText = getString(R.string.action_stopping),
+                    buttonIcon = R.drawable.ic_stop_square,
+                    buttonEnabled = false,
+                    progressVisible = true,
+                )
             }
-            status.mode == ProxyService.MODE_VPN -> {
-                binding.statusText.text = "${getString(R.string.status_vpn)}  ${status.profileName}"
-                binding.portsText.text = status.message.ifBlank { "HTTP ${status.httpPort}   SOCKS ${status.socksPort}" }
+            status.running -> {
+                binding.statusText.text = when (status.mode) {
+                    ProxyService.MODE_VPN -> "${getString(R.string.status_vpn)}  ${status.profileName}"
+                    else -> "${getString(R.string.status_proxy)}  ${status.profileName}"
+                }
+                binding.portsText.text = listOfNotNull(
+                    "HTTP ${status.httpPort}   SOCKS ${status.socksPort}",
+                    shareAddress?.let { "LAN $it" },
+                ).joinToString("\n")
+                updateConnectionUi(
+                    stateText = when (status.mode) {
+                        ProxyService.MODE_VPN -> getString(R.string.status_connected_vpn)
+                        else -> getString(R.string.status_connected_proxy)
+                    },
+                    iconTint = getColor(R.color.twoman_success),
+                    buttonText = getString(R.string.action_disconnect),
+                    buttonIcon = R.drawable.ic_stop_square,
+                    buttonEnabled = true,
+                    progressVisible = false,
+                )
             }
             else -> {
-                binding.statusText.text = "${getString(R.string.status_proxy)}  ${status.profileName}"
-                binding.portsText.text = status.message.ifBlank {
-                    listOfNotNull(
-                        "HTTP ${status.httpPort}   SOCKS ${status.socksPort}",
-                        shareAddress?.let { "LAN $it" },
-                    ).joinToString("\n")
-                }
+                binding.statusText.text = getString(R.string.status_stopped)
+                binding.portsText.text = status.message.ifBlank { getString(R.string.status_idle_message) }
+                updateConnectionUi(
+                    stateText = if (status.message.isBlank()) getString(R.string.status_ready) else getString(R.string.status_error),
+                    iconTint = if (status.message.isBlank()) getColor(R.color.twoman_muted) else getColor(R.color.twoman_warning),
+                    buttonText = getString(R.string.action_connect),
+                    buttonIcon = R.drawable.ic_connect,
+                    buttonEnabled = selectedProfile != null,
+                    progressVisible = false,
+                )
             }
         }
+    }
+
+    private fun updateConnectionUi(
+        stateText: String,
+        iconTint: Int,
+        buttonText: String,
+        buttonIcon: Int,
+        buttonEnabled: Boolean,
+        progressVisible: Boolean,
+    ) {
+        binding.connectionStateText.text = stateText
+        binding.connectionStateIcon.imageTintList = ColorStateList.valueOf(iconTint)
+        binding.connectionProgress.visibility = if (progressVisible) View.VISIBLE else View.GONE
+        binding.connectButton.text = buttonText
+        binding.connectButton.setIconResource(buttonIcon)
+        binding.connectButton.isEnabled = buttonEnabled
     }
 
     private fun resolveRuntimeStatus(): RuntimeStatus {
@@ -178,13 +235,33 @@ class MainActivity : AppCompatActivity() {
         ViewCompat.requestApplyInsets(binding.root)
     }
 
+    private fun onConnectClicked() {
+        val status = resolveRuntimeStatus()
+        if (status.running) {
+            stopEverything()
+            return
+        }
+        val selection = ensureSelection(profiles)
+        val profile = profiles.firstOrNull { it.id == selection.profileId }
+        if (profile == null) {
+            Toast.makeText(this, getString(R.string.toast_select_profile), Toast.LENGTH_SHORT).show()
+            return
+        }
+        when (selection.mode) {
+            ProxyService.MODE_VPN -> startVpn(profile)
+            else -> startProxy(profile)
+        }
+    }
+
     private fun startProxy(profile: ClientProfile) {
         Log.i(loggerTag, "startProxy profile=${profile.name} id=${profile.id}")
+        selectionStore.write(SelectionStore.Selection(profile.id, ProxyService.MODE_PROXY))
         switchToMode(profile, ProxyService.MODE_PROXY)
     }
 
     private fun startVpn(profile: ClientProfile) {
         Log.i(loggerTag, "startVpn profile=${profile.name} id=${profile.id}")
+        selectionStore.write(SelectionStore.Selection(profile.id, ProxyService.MODE_VPN))
         val intent = VpnService.prepare(this)
         if (intent != null) {
             pendingVpnProfile = profile
@@ -215,13 +292,9 @@ class MainActivity : AppCompatActivity() {
                     renderStatus()
                 }
                 requestRuntimeStop(currentStatus)
-                val deadline = System.currentTimeMillis() + modeSwitchTimeoutMs
-                while (System.currentTimeMillis() < deadline) {
-                    if (isRuntimeFullyStopped(currentStatus)) {
-                        break
-                    }
-                    Thread.sleep(200)
-                }
+                waitForRuntimeStopped(currentStatus)
+            } else {
+                settleAfterRecentStop()
             }
             runOnUiThread {
                 markRuntimeStarting(profile, mode)
@@ -234,6 +307,25 @@ class MainActivity : AppCompatActivity() {
                 }
                 renderStatus()
             }
+        }
+    }
+
+    private fun waitForRuntimeStopped(status: RuntimeStatus) {
+        val deadline = System.currentTimeMillis() + modeSwitchTimeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (isRuntimeFullyStopped(status)) {
+                break
+            }
+            Thread.sleep(200)
+        }
+        settleAfterRecentStop()
+    }
+
+    private fun settleAfterRecentStop() {
+        val state = stateStore.read()
+        val ageMs = System.currentTimeMillis() - state.updatedAtEpochMs
+        if (!state.running && ageMs < restartSettleMs) {
+            Thread.sleep(restartSettleMs - ageMs)
         }
     }
 
@@ -274,6 +366,9 @@ class MainActivity : AppCompatActivity() {
         if (RuntimeHealth.isServiceRunning(this, ProxyService::class.java.name)) {
             return false
         }
+        if (RuntimeHealth.isProcessRunning(this, "${packageName}:proxy")) {
+            return false
+        }
         return !isPortListening(status.socksPort) && !isPortListening(status.httpPort)
     }
 
@@ -288,9 +383,40 @@ class MainActivity : AppCompatActivity() {
         }.isSuccess
     }
 
+    private fun ensureSelection(items: List<ClientProfile>): SelectionStore.Selection {
+        val stored = selectionStore.read()
+        val selectedProfile = items.firstOrNull { it.id == stored.profileId } ?: items.firstOrNull()
+        val normalized = SelectionStore.Selection(
+            profileId = selectedProfile?.id.orEmpty(),
+            mode = when (stored.mode) {
+                ProxyService.MODE_VPN -> ProxyService.MODE_VPN
+                else -> ProxyService.MODE_PROXY
+            },
+        )
+        if (normalized != stored) {
+            selectionStore.write(normalized)
+        }
+        return normalized
+    }
+
+    private fun selectProfileMode(profile: ClientProfile, mode: String) {
+        Log.i(loggerTag, "selectProfileMode profile=${profile.name} mode=$mode")
+        selectionStore.write(SelectionStore.Selection(profile.id, mode))
+        renderStatus()
+    }
+
     private fun deleteProfile(profile: ClientProfile) {
         val updated = profileStore.loadProfiles().filterNot { it.id == profile.id }
         profileStore.saveProfiles(updated)
+        if (selectionStore.read().profileId == profile.id) {
+            val replacement = updated.firstOrNull()
+            selectionStore.write(
+                SelectionStore.Selection(
+                    profileId = replacement?.id.orEmpty(),
+                    mode = selectionStore.read().mode,
+                ),
+            )
+        }
         reloadProfiles()
     }
 
@@ -387,6 +513,12 @@ class MainActivity : AppCompatActivity() {
             .filterNot { it.id == profile.id }
             .plus(profile)
         profileStore.saveProfiles(updated)
+        selectionStore.write(
+            SelectionStore.Selection(
+                profileId = profile.id,
+                mode = selectionStore.read().mode,
+            ),
+        )
         reloadProfiles()
     }
 
