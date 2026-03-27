@@ -19,9 +19,11 @@ import androidx.core.view.updatePadding
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.twoman.android.databinding.ActivityMainBinding
 import com.twoman.android.databinding.DialogProfileBinding
+import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity() {
     private val loggerTag = "TwomanUi"
+    private val modeSwitchTimeoutMs = 8_000L
     private lateinit var binding: ActivityMainBinding
     private lateinit var profileStore: ProfileStore
     private lateinit var stateStore: RuntimeStateStore
@@ -45,10 +47,7 @@ class MainActivity : AppCompatActivity() {
                 renderStatus()
                 return@registerForActivityResult
             }
-            stopEverything()
-            markRuntimeStarting(profile, ProxyService.MODE_VPN)
-            TunnelVpnService.start(this, profile)
-            renderStatus()
+            switchToMode(profile, ProxyService.MODE_VPN)
         }
 
     private val notificationPermissionLauncher =
@@ -106,10 +105,23 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderStatus() {
         val status = resolveRuntimeStatus()
+        val stopping = status.running && status.message == getString(R.string.status_stopping_message)
+        val activeProfile = if (status.profileId.isBlank()) {
+            null
+        } else {
+            profileStore.loadProfiles().firstOrNull { it.id == status.profileId }
+        }
+        val shareAddress = activeProfile
+            ?.takeIf { it.shareLanSocks && status.mode == ProxyService.MODE_PROXY }
+            ?.let { LanShareInfo.displayAddress(it.socksPort) }
         adapter.setRuntimeStatus(status)
-        binding.stopButton.isEnabled = status.running
+        binding.stopButton.isEnabled = status.running && !stopping
         binding.stopButton.text = getString(
-            if (status.running) R.string.action_stop else R.string.action_stopped,
+            when {
+                stopping -> R.string.action_stopping
+                status.running -> R.string.action_stop
+                else -> R.string.action_stopped
+            },
         )
         when {
             !status.running -> {
@@ -118,11 +130,16 @@ class MainActivity : AppCompatActivity() {
             }
             status.mode == ProxyService.MODE_VPN -> {
                 binding.statusText.text = "${getString(R.string.status_vpn)}  ${status.profileName}"
-                binding.portsText.text = "HTTP ${status.httpPort}   SOCKS ${status.socksPort}"
+                binding.portsText.text = status.message.ifBlank { "HTTP ${status.httpPort}   SOCKS ${status.socksPort}" }
             }
             else -> {
                 binding.statusText.text = "${getString(R.string.status_proxy)}  ${status.profileName}"
-                binding.portsText.text = "HTTP ${status.httpPort}   SOCKS ${status.socksPort}"
+                binding.portsText.text = status.message.ifBlank {
+                    listOfNotNull(
+                        "HTTP ${status.httpPort}   SOCKS ${status.socksPort}",
+                        shareAddress?.let { "LAN $it" },
+                    ).joinToString("\n")
+                }
             }
         }
     }
@@ -152,10 +169,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun startProxy(profile: ClientProfile) {
         Log.i(loggerTag, "startProxy profile=${profile.name} id=${profile.id}")
-        stopEverything()
-        markRuntimeStarting(profile, ProxyService.MODE_PROXY)
-        ProxyService.start(this, profile, ProxyService.MODE_PROXY)
-        Toast.makeText(this, getString(R.string.toast_proxy_starting), Toast.LENGTH_SHORT).show()
+        switchToMode(profile, ProxyService.MODE_PROXY)
     }
 
     private fun startVpn(profile: ClientProfile) {
@@ -166,18 +180,64 @@ class MainActivity : AppCompatActivity() {
             vpnPermissionLauncher.launch(intent)
             return
         }
-        stopEverything()
-        markRuntimeStarting(profile, ProxyService.MODE_VPN)
-        TunnelVpnService.start(this, profile)
-        Toast.makeText(this, getString(R.string.toast_vpn_starting), Toast.LENGTH_SHORT).show()
+        switchToMode(profile, ProxyService.MODE_VPN)
     }
 
     private fun stopEverything() {
         Log.i(loggerTag, "stopEverything")
-        TunnelVpnService.stop(this)
-        ProxyService.stop(this)
-        stateStore.write(RuntimeStatus())
+        val status = resolveRuntimeStatus()
+        if (!status.running) {
+            renderStatus()
+            return
+        }
+        stateStore.write(status.copy(message = getString(R.string.status_stopping_message)))
+        requestRuntimeStop(status)
         renderStatus()
+    }
+
+    private fun switchToMode(profile: ClientProfile, mode: String) {
+        thread(name = "twoman-ui-switch", start = true) {
+            val currentStatus = resolveRuntimeStatus()
+            if (currentStatus.running) {
+                runOnUiThread {
+                    stateStore.write(currentStatus.copy(message = getString(R.string.status_stopping_message)))
+                    renderStatus()
+                }
+                requestRuntimeStop(currentStatus)
+                val deadline = System.currentTimeMillis() + modeSwitchTimeoutMs
+                while (System.currentTimeMillis() < deadline) {
+                    if (!RuntimeHealth.resolve(this, stateStore.read()).running) {
+                        break
+                    }
+                    Thread.sleep(200)
+                }
+            }
+            runOnUiThread {
+                markRuntimeStarting(profile, mode)
+                if (mode == ProxyService.MODE_VPN) {
+                    TunnelVpnService.start(this, profile)
+                    Toast.makeText(this, getString(R.string.toast_vpn_starting), Toast.LENGTH_SHORT).show()
+                } else {
+                    ProxyService.start(this, profile, ProxyService.MODE_PROXY)
+                    Toast.makeText(this, getString(R.string.toast_proxy_starting), Toast.LENGTH_SHORT).show()
+                }
+                renderStatus()
+            }
+        }
+    }
+
+    private fun requestRuntimeStop(status: RuntimeStatus) {
+        val vpnServiceRunning = RuntimeHealth.isServiceRunning(this, TunnelVpnService::class.java.name)
+        val proxyServiceRunning = RuntimeHealth.isServiceRunning(this, ProxyService::class.java.name)
+        if (status.mode == ProxyService.MODE_VPN || vpnServiceRunning) {
+            TunnelVpnService.stop(this)
+        }
+        if (status.mode == ProxyService.MODE_PROXY ||
+            status.mode == ProxyService.MODE_VPN ||
+            proxyServiceRunning
+        ) {
+            ProxyService.stop(this)
+        }
     }
 
     private fun markRuntimeStarting(profile: ClientProfile, mode: String) {
@@ -221,6 +281,7 @@ class MainActivity : AppCompatActivity() {
         dialogBinding.verifyTlsSwitch.isChecked = profile.verifyTls
         dialogBinding.http2CtlSwitch.isChecked = profile.http2Ctl
         dialogBinding.http2DataSwitch.isChecked = profile.http2Data
+        dialogBinding.shareLanSwitch.isChecked = profile.shareLanSocks
         dialogBinding.importButton.setOnClickListener {
             importedProfileHolder[0] = applyImportedProfile(dialogBinding)
         }
@@ -249,6 +310,7 @@ class MainActivity : AppCompatActivity() {
         dialogBinding.verifyTlsSwitch.isChecked = imported.verifyTls
         dialogBinding.http2CtlSwitch.isChecked = imported.http2Ctl
         dialogBinding.http2DataSwitch.isChecked = imported.http2Data
+        dialogBinding.shareLanSwitch.isChecked = imported.shareLanSocks
         Toast.makeText(this, getString(R.string.import_applied), Toast.LENGTH_SHORT).show()
         return imported
     }
@@ -276,6 +338,7 @@ class MainActivity : AppCompatActivity() {
             verifyTls = dialogBinding.verifyTlsSwitch.isChecked,
             http2Ctl = dialogBinding.http2CtlSwitch.isChecked,
             http2Data = dialogBinding.http2DataSwitch.isChecked,
+            shareLanSocks = dialogBinding.shareLanSwitch.isChecked,
             httpPort = httpPort,
             socksPort = socksPort,
             httpTimeoutSeconds = baseProfile?.httpTimeoutSeconds ?: 30,

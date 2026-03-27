@@ -6,7 +6,8 @@
     <string name="action_add">Add</string>
     <string name="action_logs">Logs</string>
     <string name="action_stop">Stop</string>
-    <string name="action_stopped">Stopped</string>
+    <string name="action_stopping">Stopping</string>
+    <string name="action_stopped">Off</string>
     <string name="action_proxy">Proxy</string>
     <string name="action_proxy_on">Proxy on</string>
     <string name="action_vpn">VPN</string>
@@ -26,13 +27,16 @@
     <string name="label_verify_tls">Verify TLS</string>
     <string name="label_http2_ctl">HTTP/2 control</string>
     <string name="label_http2_data">HTTP/2 data</string>
+    <string name="label_share_lan_socks">Share SOCKS on LAN</string>
     <string name="notification_proxy_title">Twoman proxy</string>
     <string name="notification_vpn_title">Twoman VPN</string>
     <string name="notification_channel_name">Twoman</string>
     <string name="logs_title">Logs</string>
     <string name="profile_running_proxy">Running in Proxy mode</string>
     <string name="profile_running_vpn">Running in VPN mode</string>
+    <string name="profile_running_proxy_shared">Running in Proxy mode • LAN %1$s</string>
     <string name="status_idle_message">Choose Proxy or VPN on a saved profile.</string>
+    <string name="status_stopping_message">Stopping…</string>
     <string name="share_chooser_title">Share profile</string>
     <string name="import_failed">Invalid import text</string>
     <string name="import_applied">Import applied</string>

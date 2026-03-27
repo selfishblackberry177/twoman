@@ -3,6 +3,8 @@ package com.twoman.android
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.net.InetAddresses
+import android.net.IpPrefix
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -21,6 +23,8 @@ class TunnelVpnService : VpnService() {
     private var activeProfile: ClientProfile? = null
     @Volatile
     private var workerStarted = false
+    @Volatile
+    private var stopRequested = false
 
     override fun onCreate() {
         super.onCreate()
@@ -29,10 +33,18 @@ class TunnelVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            Log.i(loggerTag, "TunnelVpnService stop requested")
+            thread(name = "twoman-vpn-stop", start = true) {
+                stopTunnel("stop requested")
+            }
+            return START_NOT_STICKY
+        }
         val profileJson = intent?.getStringExtra(EXTRA_PROFILE_JSON) ?: return START_NOT_STICKY
         val profile = ClientProfile.fromJson(JSONObject(profileJson))
         Log.i(loggerTag, "TunnelVpnService onStartCommand profile=${profile.name}")
         activeProfile = profile
+        stopRequested = false
         NotificationHelper.ensureChannel(this)
         startForeground(
             NotificationHelper.VPN_NOTIFICATION_ID,
@@ -71,6 +83,10 @@ class TunnelVpnService : VpnService() {
     private fun startTunnel(profile: ClientProfile) {
         ProxyService.start(this, profile, ProxyService.MODE_VPN)
         waitForLocalPort(profile.socksPort)
+        if (stopRequested) {
+            stopTunnel("start cancelled")
+            return
+        }
 
         val configureIntent = PendingIntent.getActivity(
             this,
@@ -89,6 +105,29 @@ class TunnelVpnService : VpnService() {
             runCatching { builder.addDnsServer(dnsServer) }
         }
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // Keep local-network access outside the VPN so same-Wi-Fi clients and wireless
+            // debugging do not disappear as soon as the tunnel comes up.
+            listOf(
+                "10.0.0.0/8",
+                "172.16.0.0/12",
+                "192.168.0.0/16",
+                "169.254.0.0/16",
+                "fc00::/7",
+                "fe80::/10",
+            ).forEach { cidr ->
+                runCatching {
+                    val (address, prefixLength) = cidr.split("/", limit = 2)
+                    builder.excludeRoute(
+                        IpPrefix(
+                            InetAddresses.parseNumericAddress(address),
+                            prefixLength.toInt(),
+                        ),
+                    )
+                }
+            }
+        }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             runCatching { builder.addDisallowedApplication(packageName) }
         }
@@ -100,6 +139,10 @@ class TunnelVpnService : VpnService() {
         }
 
         vpnInterface = builder.establish() ?: error("failed to establish VPN interface")
+        if (stopRequested) {
+            stopTunnel("vpn established after stop")
+            return
+        }
 
         val key = Key().apply {
             mark = 0
@@ -131,24 +174,15 @@ class TunnelVpnService : VpnService() {
         )
     }
 
-    private fun waitForLocalPort(port: Int) {
-        repeat(50) {
-            runCatching {
-                Socket().use { socket ->
-                    socket.connect(InetSocketAddress("127.0.0.1", port), 250)
-                }
-            }.onSuccess { return }
-            Thread.sleep(200)
-        }
-        error("local SOCKS proxy did not start")
-    }
-
-    override fun onDestroy() {
-        Log.i(loggerTag, "TunnelVpnService onDestroy")
-        workerStarted = false
-        runCatching { Engine.stop() }
-        runCatching { vpnInterface?.close() }
+    private fun stopTunnel(reason: String) {
+        stopRequested = true
+        Log.i(loggerTag, "TunnelVpnService stopTunnel reason=$reason")
+        val interfaceToClose = vpnInterface
         vpnInterface = null
+        Log.i(loggerTag, "TunnelVpnService closing vpn interface")
+        runCatching { interfaceToClose?.close() }.onFailure { Log.w(loggerTag, "vpnInterface close failed", it) }
+        workerStarted = false
+        Log.i(loggerTag, "TunnelVpnService requesting proxy stop")
         ProxyService.stop(this)
         activeProfile?.let { profile ->
             stateStore.write(
@@ -165,12 +199,51 @@ class TunnelVpnService : VpnService() {
                 ),
             )
         }
+        Log.i(loggerTag, "TunnelVpnService stopping foreground")
         stopForeground(STOP_FOREGROUND_REMOVE)
+        thread(name = "twoman-vpn-engine-stop", start = true) {
+            Log.i(loggerTag, "TunnelVpnService stopping engine async")
+            runCatching { Engine.stop() }.onFailure { Log.w(loggerTag, "Engine.stop failed", it) }
+        }
+        Log.i(loggerTag, "TunnelVpnService stopSelf")
+        stopSelf()
+    }
+
+    override fun onRevoke() {
+        Log.i(loggerTag, "TunnelVpnService onRevoke")
+        stopTunnel("system revoke")
+        super.onRevoke()
+    }
+
+    private fun waitForLocalPort(port: Int) {
+        repeat(50) {
+            runCatching {
+                Socket().use { socket ->
+                    socket.connect(InetSocketAddress("127.0.0.1", port), 250)
+                }
+            }.onSuccess { return }
+            Thread.sleep(200)
+        }
+        error("local SOCKS proxy did not start")
+    }
+
+    override fun onDestroy() {
+        Log.i(loggerTag, "TunnelVpnService onDestroy")
+        if (!stopRequested) {
+            stopTunnel("service destroy")
+        } else {
+            workerStarted = false
+            runCatching { Engine.stop() }
+            runCatching { vpnInterface?.close() }
+            vpnInterface = null
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        }
         super.onDestroy()
     }
 
     companion object {
         private const val ACTION_START = "com.twoman.android.action.VPN_START"
+        private const val ACTION_STOP = "com.twoman.android.action.VPN_STOP"
         const val EXTRA_PROFILE_JSON = "profile_json"
 
         fun start(context: Context, profile: ClientProfile) {
@@ -183,7 +256,11 @@ class TunnelVpnService : VpnService() {
         }
 
         fun stop(context: Context) {
-            context.stopService(Intent(context, TunnelVpnService::class.java))
+            context.startService(
+                Intent(context, TunnelVpnService::class.java).apply {
+                    action = ACTION_STOP
+                },
+            )
         }
     }
 }

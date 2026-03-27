@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="twoman_white">#FFFFFF</color>
+    <color name="twoman_black">#111111</color>
+    <color name="twoman_surface">#F5F5F5</color>
+    <color name="twoman_outline">#D4D4D8</color>
+    <color name="twoman_muted">#52525B</color>
+</resources>

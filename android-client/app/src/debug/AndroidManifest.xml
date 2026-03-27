@@ -1,0 +1,14 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <receiver
+            android:name=".DebugControlReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.twoman.android.debug.START_PROXY" />
+                <action android:name="com.twoman.android.debug.START_VPN" />
+                <action android:name="com.twoman.android.debug.STOP" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

@@ -58,6 +58,8 @@ TRACE_ENABLED = os.environ.get("TWOMAN_TRACE", "").strip().lower() in ("1", "tru
 LOGGER = logging.getLogger("twoman.helper")
 RUNTIME_LOG_PATH = ""
 FAULT_LOG_HANDLE = None
+STOP_LOOP = None
+STOP_EVENT = None
 
 
 def trace(message):
@@ -150,6 +152,14 @@ def handle_shutdown_signal(signum, _frame):
     signal_name = getattr(signal.Signals(signum), "name", str(signum))
     LOGGER.warning("helper received shutdown signal=%s", signal_name)
     raise KeyboardInterrupt()
+
+
+def request_stop():
+    global STOP_LOOP, STOP_EVENT
+    if STOP_LOOP is None or STOP_EVENT is None:
+        return False
+    STOP_LOOP.call_soon_threadsafe(STOP_EVENT.set)
+    return True
 
 
 def load_config(path):
@@ -738,6 +748,7 @@ async def relay_stream(runtime, stream, reader, writer, initial_payload=b"", con
 
 async def handle_http(runtime, reader, writer):
     try:
+        peer = writer.get_extra_info("peername")
         buffer = b""
         while not recv_until_headers(buffer) and len(buffer) < 65536:
             chunk = await reader.read(4096)
@@ -755,6 +766,7 @@ async def handle_http(runtime, reader, writer):
         else:
             host, port, initial_payload = rebuild_http_request(request_line, headers, rest)
             connected_response = None
+        LOGGER.info("http accept peer=%s method=%s host=%s port=%s connect=%s", peer, method, host, port, method == "CONNECT")
         trace("http request method=%s host=%s port=%s connect=%s" % (method, host, port, method == "CONNECT"))
         stream = runtime.new_stream(host, port)
         await relay_stream(runtime, stream, reader, writer, initial_payload=initial_payload, connected_response=connected_response)
@@ -776,6 +788,7 @@ async def handle_socks(runtime, reader, writer):
     stream = None
     udp_association = None
     try:
+        peer = writer.get_extra_info("peername")
         try:
             version, method_count = (await reader.readexactly(2))
         except asyncio.IncompleteReadError as error:
@@ -808,6 +821,7 @@ async def handle_socks(runtime, reader, writer):
         if command == 3:
             udp_association = await SocksUdpAssociation.create(runtime)
             bind_host, bind_port = udp_association.sockname()
+            LOGGER.info("socks udp accept peer=%s bind=%s:%s target=%s:%s", peer, bind_host, bind_port, host, port)
             writer.write(b"\x05\x00\x00" + encode_socks_address(bind_host, bind_port))
             await writer.drain()
             trace("socks udp association bind=%s:%s target=%s:%s" % (bind_host, bind_port, host, port))
@@ -815,6 +829,7 @@ async def handle_socks(runtime, reader, writer):
             return
         if command != 1:
             raise RuntimeError("unsupported socks command")
+        LOGGER.info("socks accept peer=%s host=%s port=%s", peer, host, port)
         stream = runtime.new_stream(host, port)
         await stream.open()
         writer.write(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + struct.pack("!H", 0))
@@ -834,16 +849,33 @@ async def handle_socks(runtime, reader, writer):
 
 
 async def main_async(config):
+    global STOP_LOOP, STOP_EVENT
     loop = asyncio.get_running_loop()
+    STOP_LOOP = loop
+    STOP_EVENT = asyncio.Event()
     loop.set_exception_handler(log_asyncio_exception)
     runtime = HelperRuntime(config)
-    listen_host = config.get("listen_host", "127.0.0.1")
+    configured_http_hosts = config.get("http_listen_hosts") or config.get("listen_hosts")
+    configured_socks_hosts = config.get("socks_listen_hosts") or config.get("listen_hosts")
+    if isinstance(configured_http_hosts, list):
+        http_listen_hosts = [str(value).strip() for value in configured_http_hosts if str(value).strip()]
+    else:
+        http_listen_hosts = [str(config.get("listen_host", "127.0.0.1")).strip()]
+    if isinstance(configured_socks_hosts, list):
+        socks_listen_hosts = [str(value).strip() for value in configured_socks_hosts if str(value).strip()]
+    else:
+        socks_listen_hosts = [str(config.get("listen_host", "127.0.0.1")).strip()]
+    if not http_listen_hosts:
+        http_listen_hosts = ["127.0.0.1"]
+    if not socks_listen_hosts:
+        socks_listen_hosts = ["127.0.0.1"]
     http_port = int(config.get("http_listen_port", 8080))
     socks_port = int(config.get("socks_listen_port", 1080))
     LOGGER.info(
-        "helper starting transport=%s listen_host=%s http_port=%s socks_port=%s trace=%s http2_ctl=%s http2_data=%s",
+        "helper starting transport=%s http_hosts=%s socks_hosts=%s http_port=%s socks_port=%s trace=%s http2_ctl=%s http2_data=%s",
         config.get("transport", "http"),
-        listen_host,
+        ",".join(http_listen_hosts),
+        ",".join(socks_listen_hosts),
         http_port,
         socks_port,
         TRACE_ENABLED,
@@ -851,33 +883,54 @@ async def main_async(config):
         bool(config.get("http2_enabled", {}).get("data", False)),
     )
     await runtime.start()
-    http_server = None
-    socks_server = None
+    http_servers = []
+    socks_servers = []
+    serve_tasks = []
+    stop_task = None
     try:
-        http_server = await asyncio.start_server(
-            lambda r, w: handle_http(runtime, r, w),
-            listen_host,
-            http_port,
-        )
-        socks_server = await asyncio.start_server(
-            lambda r, w: handle_socks(runtime, r, w),
-            listen_host,
-            socks_port,
-        )
+        for listen_host in http_listen_hosts:
+            http_servers.append(
+                await asyncio.start_server(
+                    lambda r, w: handle_http(runtime, r, w),
+                    listen_host,
+                    http_port,
+                )
+            )
+        for listen_host in socks_listen_hosts:
+            socks_servers.append(
+                await asyncio.start_server(
+                    lambda r, w: handle_socks(runtime, r, w),
+                    listen_host,
+                    socks_port,
+                )
+            )
         LOGGER.info("helper started log_path=%s", RUNTIME_LOG_PATH or "stderr-only")
-        async with http_server, socks_server:
-            await asyncio.gather(http_server.serve_forever(), socks_server.serve_forever())
+        for server in http_servers + socks_servers:
+            serve_tasks.append(asyncio.create_task(server.serve_forever()))
+        stop_task = asyncio.create_task(STOP_EVENT.wait())
+        await stop_task
     finally:
         LOGGER.info("helper stopping")
-        if http_server is not None:
+        if stop_task is not None:
+            stop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stop_task
+        for task in serve_tasks:
+            task.cancel()
+        for task in serve_tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        for http_server in http_servers:
             http_server.close()
             with contextlib.suppress(Exception):
                 await http_server.wait_closed()
-        if socks_server is not None:
+        for socks_server in socks_servers:
             socks_server.close()
             with contextlib.suppress(Exception):
                 await socks_server.wait_closed()
         await runtime.stop()
+        STOP_EVENT = None
+        STOP_LOOP = None
         LOGGER.info("helper stopped")
 
 

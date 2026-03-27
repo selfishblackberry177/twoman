@@ -9,14 +9,49 @@ object RuntimeHealth {
     private const val STARTUP_GRACE_MS = 12_000L
 
     fun resolve(context: Context, status: RuntimeStatus): RuntimeStatus {
-        if (!status.running) {
-            return status
-        }
         val proxyServiceRunning = isServiceRunning(context, ProxyService::class.java.name)
         val vpnServiceRunning = isServiceRunning(context, TunnelVpnService::class.java.name)
         val anyServiceRunning = proxyServiceRunning || vpnServiceRunning
         val anyPortListening = isListening(status.socksPort) || isListening(status.httpPort)
         val statusAgeMs = System.currentTimeMillis() - status.updatedAtEpochMs
+        val withinStartupGrace = status.updatedAtEpochMs != 0L && statusAgeMs <= STARTUP_GRACE_MS
+
+        if (!status.running) {
+            return if (!anyServiceRunning && !anyPortListening) {
+                status
+            } else {
+                status.copy(running = false)
+            }
+        }
+
+        when (status.mode) {
+            ProxyService.MODE_VPN -> {
+                if (vpnServiceRunning) {
+                    return status
+                }
+                if (withinStartupGrace && (proxyServiceRunning || anyPortListening)) {
+                    return status
+                }
+                return status.copy(
+                    running = false,
+                    mode = "stopped",
+                    message = "",
+                )
+            }
+            ProxyService.MODE_PROXY -> {
+                if (proxyServiceRunning || anyPortListening) {
+                    return status
+                }
+                if (withinStartupGrace) {
+                    return status
+                }
+                return status.copy(
+                    running = false,
+                    mode = "stopped",
+                    message = "",
+                )
+            }
+        }
 
         if (!anyServiceRunning && !anyPortListening) {
             return status.copy(
@@ -28,7 +63,7 @@ object RuntimeHealth {
         if (anyServiceRunning) {
             return status
         }
-        if (status.updatedAtEpochMs != 0L && statusAgeMs <= STARTUP_GRACE_MS) {
+        if (withinStartupGrace) {
             return status
         }
         if (anyPortListening) {
@@ -42,7 +77,7 @@ object RuntimeHealth {
     }
 
     @Suppress("DEPRECATION")
-    private fun isServiceRunning(context: Context, className: String): Boolean {
+    fun isServiceRunning(context: Context, className: String): Boolean {
         val activityManager = context.getSystemService(ActivityManager::class.java) ?: return false
         return activityManager
             .getRunningServices(Int.MAX_VALUE)

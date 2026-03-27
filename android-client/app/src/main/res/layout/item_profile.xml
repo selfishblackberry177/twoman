@@ -4,6 +4,10 @@
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:layout_marginBottom="12dp"
+    app:cardBackgroundColor="@color/twoman_white"
+    app:cardCornerRadius="24dp"
+    app:strokeColor="@color/twoman_outline"
+    app:strokeWidth="1dp"
     app:cardUseCompatPadding="true">
 
     <LinearLayout
@@ -17,6 +21,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:textAppearance="?attr/textAppearanceTitleMedium"
+            android:textColor="@color/twoman_black"
             android:textStyle="bold" />
 
         <TextView
@@ -26,14 +31,16 @@
             android:layout_marginTop="4dp"
             android:maxLines="1"
             android:ellipsize="end"
-            android:textAppearance="?attr/textAppearanceBodyMedium" />
+            android:textAppearance="?attr/textAppearanceBodyMedium"
+            android:textColor="@color/twoman_muted" />
 
         <TextView
             android:id="@+id/profilePorts"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:textAppearance="?attr/textAppearanceBodySmall" />
+            android:textAppearance="?attr/textAppearanceBodySmall"
+            android:textColor="@color/twoman_muted" />
 
         <TextView
             android:id="@+id/profileModeState"
@@ -55,7 +62,12 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="@string/action_proxy" />
+                android:text="@string/action_proxy"
+                android:textSize="13sp"
+                app:icon="@drawable/ic_proxy"
+                app:iconGravity="textStart"
+                app:iconPadding="4dp"
+                app:iconSize="16dp" />
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/vpnButton"
@@ -64,7 +76,12 @@
                 android:layout_height="wrap_content"
                 android:layout_marginStart="8dp"
                 android:layout_weight="1"
-                android:text="@string/action_vpn" />
+                android:text="@string/action_vpn"
+                android:textSize="13sp"
+                app:icon="@drawable/ic_vpn"
+                app:iconGravity="textStart"
+                app:iconPadding="4dp"
+                app:iconSize="16dp" />
         </LinearLayout>
 
         <LinearLayout
@@ -79,7 +96,14 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="@string/action_edit" />
+                android:text="@string/action_edit"
+                android:textSize="12sp"
+                android:maxLines="1"
+                app:icon="@drawable/ic_edit"
+                app:iconGravity="textStart"
+                app:iconPadding="2dp"
+                app:iconSize="14dp"
+                app:iconTint="@color/twoman_black" />
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/shareButton"
@@ -88,7 +112,14 @@
                 android:layout_height="wrap_content"
                 android:layout_marginStart="8dp"
                 android:layout_weight="1"
-                android:text="@string/action_share" />
+                android:text="@string/action_share"
+                android:textSize="12sp"
+                android:maxLines="1"
+                app:icon="@drawable/ic_share"
+                app:iconGravity="textStart"
+                app:iconPadding="2dp"
+                app:iconSize="14dp"
+                app:iconTint="@color/twoman_black" />
 
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/deleteButton"
@@ -97,7 +128,14 @@
                 android:layout_height="wrap_content"
                 android:layout_marginStart="8dp"
                 android:layout_weight="1"
-                android:text="@string/action_delete" />
+                android:text="@string/action_delete"
+                android:textSize="12sp"
+                android:maxLines="1"
+                app:icon="@drawable/ic_delete"
+                app:iconGravity="textStart"
+                app:iconPadding="2dp"
+                app:iconSize="14dp"
+                app:iconTint="@color/twoman_black" />
         </LinearLayout>
 
     </LinearLayout>

@@ -8,6 +8,7 @@ It supports:
 - profile sharing
 - profile import from shared text
 - local proxy mode
+- optional LAN-shared SOCKS mode
 - full-device VPN mode
 - in-app logs
 - launcher icon branding from the Twoman mark
@@ -25,6 +26,7 @@ Starts the embedded helper and exposes localhost proxies inside Android:
 
 - SOCKS5 on the configured SOCKS port
 - HTTP on the configured HTTP port
+- optional SOCKS binding on the phone's Wi-Fi IP for same-network clients
 
 This is the most direct way to validate the helper on-device.
 
@@ -37,6 +39,7 @@ Current design notes:
 - public-leg transport stays on the working HTTP profile
 - VPN mode uses a local SOCKS5 bridge through `tun2socks`
 - DNS UDP requests are translated to TCP DNS upstream so the tunnel stays compatible with the existing TCP-only Twoman backend
+- on Android 13+ the app excludes local/private-network routes from the VPN so nearby devices and local network access can stay reachable
 
 ## Saved Profiles
 
@@ -47,6 +50,7 @@ Profiles store:
 - client token
 - HTTP port
 - SOCKS port
+- LAN-sharing toggle for SOCKS
 - TLS verification
 - HTTP/2 control toggle
 - HTTP/2 data toggle
@@ -125,6 +129,7 @@ An `x86_64` desktop flavor can still be built separately for emulators.
 Validated on a real Android device:
 
 - Proxy mode starts and serves working SOCKS/HTTP proxy traffic
+- LAN-shared SOCKS traffic works from another device on the same Wi-Fi
 - Proxy mode stops cleanly and returns the UI to `Stopped`
 - VPN mode establishes successfully
 - VPN mode stops cleanly and returns the UI to `Stopped`

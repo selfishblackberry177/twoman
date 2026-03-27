@@ -58,9 +58,14 @@ class ProfileAdapter(
 
             binding.profileName.text = profile.name
             binding.profileBroker.text = profile.brokerBaseUrl
-            binding.profilePorts.text = "HTTP ${profile.httpPort}   SOCKS ${profile.socksPort}"
+            val shareAddress = if (profile.shareLanSocks) LanShareInfo.displayAddress(profile.socksPort) else null
+            binding.profilePorts.text = listOfNotNull(
+                "HTTP ${profile.httpPort}   SOCKS ${profile.socksPort}",
+                shareAddress?.let { "LAN $it" },
+            ).joinToString("\n")
             binding.profileModeState.visibility = if (isActiveProfile) android.view.View.VISIBLE else android.view.View.GONE
             binding.profileModeState.text = when {
+                isActiveProxy && shareAddress != null -> context.getString(R.string.profile_running_proxy_shared, shareAddress)
                 isActiveVpn -> context.getString(R.string.profile_running_vpn)
                 isActiveProxy -> context.getString(R.string.profile_running_proxy)
                 else -> ""
@@ -124,6 +129,7 @@ class ProfileAdapter(
             button.text = if (active) activeLabel else idleLabel
             button.backgroundTintList = ColorStateList.valueOf(if (active) primaryColor else neutralColor)
             button.setTextColor(if (active) onPrimaryColor else neutralTextColor)
+            button.iconTint = ColorStateList.valueOf(if (active) onPrimaryColor else neutralTextColor)
             button.strokeWidth = if (active) 0 else 1
         }
     }

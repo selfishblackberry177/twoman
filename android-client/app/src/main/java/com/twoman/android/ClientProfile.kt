@@ -12,6 +12,7 @@ data class ClientProfile(
     val verifyTls: Boolean = false,
     val http2Ctl: Boolean = true,
     val http2Data: Boolean = false,
+    val shareLanSocks: Boolean = false,
     val httpPort: Int = 28167,
     val socksPort: Int = 21167,
     val httpTimeoutSeconds: Int = 30,
@@ -32,6 +33,7 @@ data class ClientProfile(
         put("verifyTls", verifyTls)
         put("http2Ctl", http2Ctl)
         put("http2Data", http2Data)
+        put("shareLanSocks", shareLanSocks)
         put("httpPort", httpPort)
         put("socksPort", socksPort)
         put("httpTimeoutSeconds", httpTimeoutSeconds)
@@ -50,6 +52,13 @@ data class ClientProfile(
         put("broker_base_url", brokerBaseUrl)
         put("client_token", clientToken)
         put("listen_host", "127.0.0.1")
+        put("http_listen_hosts", org.json.JSONArray(listOf("127.0.0.1", "::1")))
+        put(
+            "socks_listen_hosts",
+            org.json.JSONArray(
+                if (shareLanSocks) listOf("0.0.0.0") else listOf("127.0.0.1", "::1")
+            ),
+        )
         put("http_listen_port", httpPort)
         put("socks_listen_port", socksPort)
         put("log_path", logPath)
@@ -95,6 +104,7 @@ data class ClientProfile(
             put("verifyTls", verifyTls)
             put("http2Ctl", http2Ctl)
             put("http2Data", http2Data)
+            put("shareLanSocks", shareLanSocks)
             put("httpPort", httpPort)
             put("socksPort", socksPort)
             put("httpTimeoutSeconds", httpTimeoutSeconds)
@@ -125,6 +135,7 @@ data class ClientProfile(
             verifyTls = json.optBoolean("verifyTls", false),
             http2Ctl = json.optBoolean("http2Ctl", true),
             http2Data = json.optBoolean("http2Data", false),
+            shareLanSocks = json.optBoolean("shareLanSocks", false),
             httpPort = json.optInt("httpPort", 28167),
             socksPort = json.optInt("socksPort", 21167),
             httpTimeoutSeconds = json.optInt("httpTimeoutSeconds", 30),

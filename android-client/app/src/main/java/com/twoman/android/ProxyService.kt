@@ -3,8 +3,8 @@ package com.twoman.android
 import android.app.Service
 import android.content.Context
 import android.content.Intent
-import android.os.IBinder
 import android.os.Process
+import android.os.IBinder
 import android.util.Log
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
@@ -15,6 +15,12 @@ class ProxyService : Service() {
     private val loggerTag = "TwomanSvc"
     private var helperThread: Thread? = null
     private lateinit var stateStore: RuntimeStateStore
+    @Volatile
+    private var currentMode: String = MODE_PROXY
+    @Volatile
+    private var currentProfile: ClientProfile? = null
+    @Volatile
+    private var stopRequested = false
 
     override fun onCreate() {
         super.onCreate()
@@ -25,10 +31,18 @@ class ProxyService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) {
+            Log.i(loggerTag, "ProxyService stop requested")
+            requestStop()
+            return START_NOT_STICKY
+        }
         val profileJson = intent?.getStringExtra(EXTRA_PROFILE_JSON) ?: return START_NOT_STICKY
         val mode = intent.getStringExtra(EXTRA_MODE) ?: MODE_PROXY
         val profile = ClientProfile.fromJson(JSONObject(profileJson))
         Log.i(loggerTag, "ProxyService onStartCommand mode=$mode profile=${profile.name}")
+        currentMode = mode
+        currentProfile = profile
+        stopRequested = false
         NotificationHelper.ensureChannel(this)
         startForeground(
             NotificationHelper.PROXY_NOTIFICATION_ID,
@@ -84,20 +98,64 @@ class ProxyService : Service() {
                 ),
             )
         } finally {
+            helperThread = null
+            stopSelf()
+        }
+    }
+
+    private fun requestStop() {
+        stopRequested = true
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        val threadToJoin = helperThread
+        thread(name = "twoman-python-stop", start = true) {
+            val stopped = runCatching {
+                if (!Python.isStarted()) {
+                    false
+                } else {
+                    Python.getInstance().getModule("android_entry").callAttr("stop_helper").toBoolean()
+                }
+            }.getOrElse { error ->
+                Log.w(loggerTag, "ProxyService stop helper failed", error)
+                false
+            }
+            Log.i(loggerTag, "ProxyService stop helper signalled=$stopped")
+            if (threadToJoin != null) {
+                runCatching { threadToJoin.join(2_500L) }
+            }
+            if (helperThread?.isAlive == true) {
+                Log.w(loggerTag, "ProxyService helper thread still alive after stop timeout")
+                currentProfile?.let { profile ->
+                    stateStore.write(
+                        RuntimeStatus(
+                            running = false,
+                            mode = "stopped",
+                            profileId = profile.id,
+                            profileName = profile.name,
+                            brokerBaseUrl = profile.brokerBaseUrl,
+                            httpPort = profile.httpPort,
+                            socksPort = profile.socksPort,
+                            logPath = AppFiles.runtimeLogFile(this, profile.id).absolutePath,
+                            message = "",
+                        ),
+                    )
+                }
+                stopSelf()
+                Process.killProcess(Process.myPid())
+                return@thread
+            }
             stopSelf()
         }
     }
 
     override fun onDestroy() {
         Log.i(loggerTag, "ProxyService onDestroy")
-        stateStore.write(stateStore.read().copy(running = false, mode = "stopped"))
         stopForeground(STOP_FOREGROUND_REMOVE)
-        Process.killProcess(Process.myPid())
         super.onDestroy()
     }
 
     companion object {
         private const val ACTION_START = "com.twoman.android.action.PROXY_START"
+        private const val ACTION_STOP = "com.twoman.android.action.PROXY_STOP"
         const val EXTRA_PROFILE_JSON = "profile_json"
         const val EXTRA_MODE = "mode"
         const val MODE_PROXY = "proxy"
@@ -114,7 +172,11 @@ class ProxyService : Service() {
         }
 
         fun stop(context: Context) {
-            context.stopService(Intent(context, ProxyService::class.java))
+            context.startService(
+                Intent(context, ProxyService::class.java).apply {
+                    action = ACTION_STOP
+                },
+            )
         }
     }
 }
