@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+require_env() {
+  local name="$1"
+  if [ -z "${!name:-}" ]; then
+    echo "missing required env: ${name}" >&2
+    exit 1
+  fi
+}
+
+upload_file() {
+  local source_path="$1"
+  local remote_dir="$2"
+  local remote_name="$3"
+  curl -sk --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+    -F "dir=${remote_dir}" \
+    -F "overwrite=1" \
+    -F "file-1=@${source_path};filename=${remote_name}" \
+    "${TWOMAN_CPANEL_BASE_URL}/execute/Fileman/upload_files" >/dev/null
+}
+
+upload_content() {
+  local remote_dir="$1"
+  local remote_name="$2"
+  local content="$3"
+  curl -sk --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+    --data-urlencode "dir=${remote_dir}" \
+    --data-urlencode "file=${remote_name}" \
+    --data-urlencode "content=${content}" \
+    --data-urlencode "from_charset=UTF-8" \
+    --data-urlencode "to_charset=UTF-8" \
+    --data-urlencode "fallback=1" \
+    "${TWOMAN_CPANEL_BASE_URL}/execute/Fileman/save_file_content" >/dev/null
+}
+
+delete_remote_file() {
+  local remote_dir="$1"
+  local remote_name="$2"
+  curl -sk --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+    --data-urlencode "dir=${remote_dir}" \
+    --data-urlencode "files=${remote_name}" \
+    "${TWOMAN_CPANEL_BASE_URL}/execute/Fileman/delete_files" >/dev/null || true
+}
+
+mkdir_api() {
+  local parent_path="$1"
+  local dir_name="$2"
+  curl -sk --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+    --get \
+    --data-urlencode "cpanel_jsonapi_user=${TWOMAN_CPANEL_USERNAME}" \
+    --data-urlencode "cpanel_jsonapi_apiversion=2" \
+    --data-urlencode "cpanel_jsonapi_module=Fileman" \
+    --data-urlencode "cpanel_jsonapi_func=mkdir" \
+    --data-urlencode "path=${parent_path}" \
+    --data-urlencode "name=${dir_name}" \
+    "${TWOMAN_CPANEL_BASE_URL}/json-api/cpanel" >/dev/null || true
+}
+
+ensure_remote_dir() {
+  local relative_path="$1"
+  local current=""
+  local part
+  IFS='/' read -r -a parts <<< "${relative_path}"
+  for part in "${parts[@]}"; do
+    [ -n "${part}" ] || continue
+    if [ -z "${current}" ]; then
+      current="${part}"
+      continue
+    fi
+    mkdir_api "${current}" "${part}"
+    current="${current}/${part}"
+  done
+}
+
+run_admin_mode() {
+  local mode="$1"
+  curl -sk "https://${TWOMAN_PUBLIC_HOST}/${TWOMAN_ADMIN_SCRIPT_NAME}?mode=${mode}" | python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+if payload.get("code", 1) != 0:
+    raise SystemExit(json.dumps(payload, indent=2))
+print(json.dumps(payload, indent=2))
+'
+}
+
+require_env TWOMAN_CPANEL_BASE_URL
+require_env TWOMAN_CPANEL_USERNAME
+require_env TWOMAN_CPANEL_PASSWORD
+require_env TWOMAN_CPANEL_HOME
+require_env TWOMAN_PUBLIC_HOST
+require_env TWOMAN_CLIENT_TOKEN
+require_env TWOMAN_AGENT_TOKEN
+
+TWOMAN_NODE_BUNDLE_PATH="$(mktemp)"
+cleanup() {
+  rm -f "${TWOMAN_NODE_BUNDLE_PATH}"
+}
+trap cleanup EXIT
+npx --yes esbuild host/node_selector/broker.js \
+  --bundle \
+  --platform=node \
+  --target=node20 \
+  --format=cjs \
+  --outfile="${TWOMAN_NODE_BUNDLE_PATH}" >/dev/null
+
+TWOMAN_NODE_APP_ROOT="${TWOMAN_NODE_APP_ROOT:-${TWOMAN_CPANEL_HOME}/cltwoman}"
+TWOMAN_NODE_APP_URI="${TWOMAN_NODE_APP_URI:-/twoman-node}"
+TWOMAN_NODE_VERSION="${TWOMAN_NODE_VERSION:-20}"
+TWOMAN_NODE_APP_MODE="${TWOMAN_NODE_APP_MODE:-production}"
+TWOMAN_ADMIN_SCRIPT_NAME="${TWOMAN_ADMIN_SCRIPT_NAME:-fw_twoman_node_admin.php}"
+TWOMAN_TRACE="${TWOMAN_TRACE:-0}"
+TWOMAN_DEBUG_STATS="${TWOMAN_DEBUG_STATS:-0}"
+TWOMAN_DOWN_WAIT_CTL_MS="${TWOMAN_DOWN_WAIT_CTL_MS:-1000}"
+TWOMAN_DOWN_WAIT_DATA_MS="${TWOMAN_DOWN_WAIT_DATA_MS:-1000}"
+TWOMAN_STREAMING_DATA_DOWN_HELPER="${TWOMAN_STREAMING_DATA_DOWN_HELPER:-false}"
+
+APP_RELATIVE="${TWOMAN_NODE_APP_ROOT#${TWOMAN_CPANEL_HOME}/}"
+ensure_remote_dir "${APP_RELATIVE}"
+ensure_remote_dir "logs"
+
+CONFIG_JSON="$(cat <<EOF
+{
+  "base_uri": "${TWOMAN_NODE_APP_URI}",
+  "client_tokens": ["${TWOMAN_CLIENT_TOKEN}"],
+  "agent_tokens": ["${TWOMAN_AGENT_TOKEN}"],
+  "peer_ttl_seconds": 90,
+  "stream_ttl_seconds": 300,
+  "max_lane_bytes": 16777216,
+  "max_streams_per_peer_session": 256,
+  "max_open_rate_per_peer_session": 120,
+  "open_rate_window_seconds": 10,
+  "max_peer_buffered_bytes": 33554432,
+  "flush_backpressure_bytes": 524288,
+  "flush_retry_delay_ms": 5,
+  "down_wait_ms": {
+    "ctl": ${TWOMAN_DOWN_WAIT_CTL_MS},
+    "data": ${TWOMAN_DOWN_WAIT_DATA_MS}
+  },
+  "streaming_data_down_helper": ${TWOMAN_STREAMING_DATA_DOWN_HELPER},
+  "trace_enabled": ${TWOMAN_TRACE},
+  "debug_stats_enabled": ${TWOMAN_DEBUG_STATS}
+}
+EOF
+)"
+
+upload_file "${TWOMAN_NODE_BUNDLE_PATH}" "${TWOMAN_NODE_APP_ROOT}" "app.js"
+upload_content "${TWOMAN_NODE_APP_ROOT}" "package.json" "$(cat host/node_selector/package.json)"
+upload_content "${TWOMAN_NODE_APP_ROOT}" "config.json" "${CONFIG_JSON}"
+
+ADMIN_PHP="$(cat <<EOF
+<?php
+header('Content-Type: application/json');
+function run_cmd(\$command) {
+    \$spec = [
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w'],
+    ];
+    \$proc = proc_open(\$command, \$spec, \$pipes, '${TWOMAN_CPANEL_HOME}');
+    if (!is_resource(\$proc)) {
+        return ['code' => 1, 'stdout' => '', 'stderr' => 'proc_open failed'];
+    }
+    fclose(\$pipes[0]);
+    \$stdout = stream_get_contents(\$pipes[1]);
+    \$stderr = stream_get_contents(\$pipes[2]);
+    fclose(\$pipes[1]);
+    fclose(\$pipes[2]);
+    \$code = proc_close(\$proc);
+    return ['code' => \$code, 'stdout' => \$stdout, 'stderr' => \$stderr];
+}
+
+\$appRoot = '$(printf "%s" "${APP_RELATIVE}")';
+\$appUri = '$(printf "%s" "${TWOMAN_NODE_APP_URI}")';
+\$version = '$(printf "%s" "${TWOMAN_NODE_VERSION}")';
+\$appMode = '$(printf "%s" "${TWOMAN_NODE_APP_MODE}")';
+\$selector = '/usr/sbin/cloudlinux-selector';
+\$commands = [
+    'destroy' => escapeshellarg(\$selector) . " destroy --json --interpreter nodejs --app-root " . escapeshellarg(\$appRoot) . " 2>&1 || true",
+    'create' => escapeshellarg(\$selector) . " create --json --interpreter nodejs --domain " . escapeshellarg('${TWOMAN_PUBLIC_HOST}') . " --app-root " . escapeshellarg(\$appRoot) . " --app-uri " . escapeshellarg(\$appUri) . " --app-mode " . escapeshellarg(\$appMode) . " --version " . escapeshellarg(\$version) . " --startup-file app.js 2>&1",
+    'restart' => escapeshellarg(\$selector) . " restart --json --interpreter nodejs --app-root " . escapeshellarg(\$appRoot) . " 2>&1",
+];
+\$mode = isset(\$_GET['mode']) ? \$_GET['mode'] : '';
+if (!isset(\$commands[\$mode])) {
+    http_response_code(400);
+    echo json_encode(['error' => 'invalid mode', 'mode' => \$mode, 'modes' => array_keys(\$commands)], JSON_PRETTY_PRINT);
+    exit;
+}
+\$result = run_cmd(\$commands[\$mode]);
+\$result['mode'] = \$mode;
+echo json_encode(\$result, JSON_PRETTY_PRINT);
+EOF
+)"
+
+upload_content "${TWOMAN_CPANEL_HOME}/public_html" "${TWOMAN_ADMIN_SCRIPT_NAME}" "${ADMIN_PHP}"
+
+echo "Destroying any previous Node selector app..."
+run_admin_mode destroy
+echo "Creating Node selector app..."
+run_admin_mode create
+echo "Restarting Node selector app..."
+run_admin_mode restart
+
+echo "Checking Node broker health..."
+sleep 3
+curl -sk "https://${TWOMAN_PUBLIC_HOST}${TWOMAN_NODE_APP_URI}/health" | python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+if not payload.get("ok"):
+    raise SystemExit(json.dumps(payload, indent=2))
+print(json.dumps(payload, indent=2))
+'
+delete_remote_file "${TWOMAN_CPANEL_HOME}/public_html" "${TWOMAN_ADMIN_SCRIPT_NAME}"
+echo
+echo "Node selector host deployment complete."

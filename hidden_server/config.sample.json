@@ -6,7 +6,7 @@
   "max_batch_bytes": 65536,
   "peer_id": "agent-main",
   "http2_enabled": {
-    "ctl": true,
+    "ctl": false,
     "data": false
   }
 }

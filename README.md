@@ -1,12 +1,15 @@
 # Twoman
 
-Twoman is a host-preserving relay for shared cPanel hosting.
+Twoman is a host-preserving relay for shared cPanel hosting and managed
+CloudLinux app runtimes.
 
 Final path:
 
-`app -> local helper -> cPanel host -> localhost broker on the host -> hidden reverse agent -> internet`
+`app -> local helper -> public host broker -> hidden reverse agent -> internet`
 
-The cPanel host stays in the live path. The hidden server performs outbound internet access. The local helper exposes normal HTTP and SOCKS5 proxies so apps like Telegram and browsers can use the system.
+The public host stays in the live path. The hidden server performs outbound
+internet access. The local helper exposes normal HTTP and SOCKS5 proxies so
+apps like Telegram and browsers can use the system.
 
 Compatibility note:
 - the live bridge path remains `/bridge/v2`
@@ -19,7 +22,8 @@ This repository contains the current public implementation.
 What it is good at:
 - Telegram and other lighter interactive traffic
 - SOCKS5 and HTTP proxy access through a localhost helper
-- Shared-host deployments where the public host must remain in-path
+- shared-host deployments where the public host must remain in-path
+- managed-host deployments where a real Node app runtime is available
 
 What it is not:
 - a full-speed VPN replacement
@@ -31,11 +35,21 @@ What it is not:
 - `twoman_transport.py`: shared public-leg transport
 - `local_client/helper.py`: local HTTP + SOCKS5 helper
 - `hidden_server/agent.py`: hidden reverse agent
-- `host/runtime/http_broker_daemon.py`: asyncio broker for the cPanel host
-- `host/app/bridge_runtime.php`: PHP bootstrap that starts and supervises the broker
-- `host/public/api.php`: public health/bootstrap endpoint
-- `host/twoman.htaccess`: LiteSpeed reverse-proxy rules
+- `host/node_selector/broker.js`: CloudLinux Node selector broker for managed-host deployments
+- `host/runtime/http_broker_daemon.py`: asyncio broker for bridge-style cPanel deployments
+- `host/app/bridge_runtime.php`: PHP bootstrap that starts and supervises the bridge broker
+- `host/public/api.php`: public health/bootstrap endpoint for bridge-style deployments
+- `host/twoman.htaccess`: LiteSpeed reverse-proxy rules for bridge-style deployments
 - `tests/run_e2e.sh`: local smoke test
+- `tests/run_e2e_node_http.sh`: local smoke test for the Node selector broker
+
+Backend families:
+
+- `backends/cpanel_litespeed_bridge`
+- `backends/passenger_python`
+- `backends/passenger_node`
+
+Backend overview: [docs/BACKENDS.md](/home/shahab/dev/hobby/mintm/docs/BACKENDS.md)
 
 ## Architecture
 
@@ -51,6 +65,20 @@ Key design points:
 - public authentication uses bearer tokens in `X-Relay-Token`
 
 More detail: [docs/ARCHITECTURE.md](/home/shahab/dev/hobby/mintm/docs/ARCHITECTURE.md)
+
+## Backend Strategy
+
+Twoman is one product with multiple public-host backend families.
+
+Today:
+
+- the stable fallback backend is the cPanel LiteSpeed bridge backend
+- the current best managed-host backend is the CloudLinux Node selector path
+- the Passenger Python backend is an experimental compatibility track
+- the generic Passenger Node backend remains a proof track for hosts where it genuinely works
+
+This is intentional. Different host classes expose different runtime models,
+and Twoman does not force them into one fragile host implementation.
 
 ## Quick Start
 
@@ -83,7 +111,7 @@ export TWOMAN_AGENT_TOKEN='replace-with-agent-token'
 ### 2. Deploy the hidden server
 
 ```bash
-export TWOMAN_SERVER_HOST='185.219.7.36'
+export TWOMAN_SERVER_HOST='<hidden-server-host>'
 export TWOMAN_SERVER_USER='root'
 export TWOMAN_SERVER_PASSWORD='server-password'
 export TWOMAN_SERVER_DIR='/opt/twoman'
@@ -103,6 +131,8 @@ export TWOMAN_CLIENT_TOKEN='replace-with-client-token'
 ```
 
 This starts the helper in the foreground. `Ctrl+C` stops it cleanly.
+By default, the helper writes rotating client logs to `local_client/logs/helper.log`.
+Override that location with `TWOMAN_LOG_PATH=/path/to/helper.log`.
 
 Default helper ports:
 - HTTP proxy: `127.0.0.1:18092`
@@ -156,6 +186,12 @@ TWOMAN_TRACE=1 python3 hidden_server/agent.py --config hidden_server/config.json
 ```
 
 Tracing is off by default to avoid log growth on production hosts.
+
+Client crash and runtime logs:
+
+- `scripts/start_client.sh` writes a rotating helper log to `local_client/logs/helper.log`
+- `TWOMAN_LOG_PATH` overrides the helper log location
+- uncaught exceptions and Python fault dumps are appended to the same helper log
 
 ## Operational Notes
 

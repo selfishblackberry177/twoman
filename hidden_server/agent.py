@@ -32,7 +32,7 @@ from twoman_protocol import (
     make_error_payload,
     parse_open_payload,
 )
-from twoman_transport import LaneTransport
+from twoman_transport import create_transport
 
 
 INITIAL_WINDOW = 256 * 1024
@@ -41,8 +41,11 @@ PRI_LIMIT = 64 * 1024
 WINDOW_FLUSH_BYTES = 16 * 1024
 WINDOW_FLUSH_DELAY = 0.005
 SMALL_WRITE_BYTES = 8 * 1024
+MAX_RECV_REORDER_BYTES = 1024 * 1024
 
 TRACE_ENABLED = os.environ.get("TWOMAN_TRACE", "").strip().lower() in ("1", "true", "yes", "on", "debug", "verbose")
+DEFAULT_OPEN_CONNECT_TIMEOUT_SECONDS = 12.0
+DEFAULT_HAPPY_EYEBALLS_DELAY_SECONDS = 0.25
 
 
 def trace(message):
@@ -78,12 +81,15 @@ class RemoteStream(object):
         self.remote_read_eof = False
         self.pending_window = 0
         self.window_flush_task = None
+        self.open_task = None
+        self.recv_pending = {}
+        self.recv_pending_bytes = 0
 
     async def open(self, host, port, mode):
         if mode != MODE_TCP:
             raise RuntimeError("unsupported open mode")
         trace("open stream=%s target=%s:%s" % (self.stream_id, host, port))
-        self.reader, self.writer = await asyncio.open_connection(host, port)
+        self.reader, self.writer = await self.agent.open_origin_connection(host, port)
         transport = self.writer.transport
         if transport is not None:
             sock = transport.get_extra_info("socket")
@@ -101,22 +107,19 @@ class RemoteStream(object):
             trace("recv WINDOW stream=%s bytes=%s credit=%s" % (self.stream_id, int(frame.offset), self.send_credit))
             return
         if frame.type_id == FRAME_DATA:
+            raw_offset = int(frame.offset)
             payload = frame.payload
             if frame.offset < self.recv_offset:
                 delta = self.recv_offset - frame.offset
                 if delta >= len(payload):
+                    trace("drop duplicate DATA stream=%s frame_offset=%s bytes=%s recv_offset=%s" % (self.stream_id, raw_offset, len(frame.payload), self.recv_offset))
                     return
                 payload = payload[delta:]
-            elif frame.offset > self.recv_offset:
-                await self.reset("out of order data")
+            if raw_offset > self.recv_offset:
+                await self._buffer_out_of_order_data(raw_offset, payload)
                 return
-            self.recv_offset += len(payload)
-            trace("recv DATA stream=%s offset=%s bytes=%s" % (self.stream_id, frame.offset, len(payload)))
-            self.writer.write(payload)
-            await self.writer.drain()
-            await self.grant_window(len(payload))
-            if self.fin_offset is not None and self.recv_offset >= self.fin_offset:
-                await self._finish_remote_write()
+            await self._accept_in_order_data(raw_offset, payload)
+            await self._flush_pending_data()
             return
         if frame.type_id == FRAME_FIN:
             self.fin_offset = int(frame.offset)
@@ -127,6 +130,77 @@ class RemoteStream(object):
         if frame.type_id == FRAME_RST:
             trace("recv RST stream=%s" % self.stream_id)
             await self.close()
+
+    async def _accept_in_order_data(self, raw_offset, payload):
+        self.recv_offset += len(payload)
+        trace(
+            "recv DATA stream=%s offset=%s bytes=%s recv_offset=%s pending=%s/%s" % (
+                self.stream_id,
+                raw_offset,
+                len(payload),
+                self.recv_offset,
+                len(self.recv_pending),
+                self.recv_pending_bytes,
+            )
+        )
+        self.writer.write(payload)
+        await self.writer.drain()
+        await self.grant_window(len(payload))
+        if self.fin_offset is not None and self.recv_offset >= self.fin_offset:
+            await self._finish_remote_write()
+
+    async def _buffer_out_of_order_data(self, raw_offset, payload):
+        end_offset = raw_offset + len(payload)
+        if end_offset <= self.recv_offset:
+            trace("drop late DATA stream=%s frame_offset=%s bytes=%s recv_offset=%s" % (self.stream_id, raw_offset, len(payload), self.recv_offset))
+            return
+        if raw_offset in self.recv_pending:
+            existing = self.recv_pending[raw_offset]
+            if len(existing) >= len(payload):
+                trace("drop duplicate pending DATA stream=%s frame_offset=%s bytes=%s recv_offset=%s" % (self.stream_id, raw_offset, len(payload), self.recv_offset))
+                return
+            self.recv_pending_bytes -= len(existing)
+        elif self.recv_pending_bytes + len(payload) > MAX_RECV_REORDER_BYTES:
+            trace(
+                "reorder buffer overflow stream=%s frame_offset=%s bytes=%s recv_offset=%s pending=%s" % (
+                    self.stream_id,
+                    raw_offset,
+                    len(payload),
+                    self.recv_offset,
+                    self.recv_pending_bytes,
+                )
+            )
+            await self.reset("reorder buffer overflow")
+            return
+        self.recv_pending[raw_offset] = payload
+        self.recv_pending_bytes += len(payload)
+        trace(
+            "buffer out-of-order DATA stream=%s frame_offset=%s bytes=%s recv_offset=%s pending=%s/%s" % (
+                self.stream_id,
+                raw_offset,
+                len(payload),
+                self.recv_offset,
+                len(self.recv_pending),
+                self.recv_pending_bytes,
+            )
+        )
+
+    async def _flush_pending_data(self):
+        while True:
+            payload = self.recv_pending.pop(self.recv_offset, None)
+            if payload is None:
+                return
+            self.recv_pending_bytes -= len(payload)
+            trace(
+                "flush pending DATA stream=%s frame_offset=%s bytes=%s pending=%s/%s" % (
+                    self.stream_id,
+                    self.recv_offset,
+                    len(payload),
+                    len(self.recv_pending),
+                    self.recv_pending_bytes,
+                )
+            )
+            await self._accept_in_order_data(self.recv_offset, payload)
 
     async def remote_to_helper(self):
         try:
@@ -209,6 +283,11 @@ class RemoteStream(object):
         current_task = asyncio.current_task()
         already_closed = self.closed
         self.closed = True
+        if self.open_task is not None and self.open_task is not current_task and not self.open_task.done():
+            self.open_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self.open_task
+        self.open_task = None
         if self.remote_task is not None and self.remote_task is not current_task and not self.remote_task.done():
             self.remote_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -227,9 +306,8 @@ class RemoteStream(object):
             self.agent.release_stream(self.stream_id, self)
 
     def _data_lane(self, chunk_len):
+        del chunk_len
         if self.send_offset < PRI_LIMIT:
-            return LANE_PRI
-        if chunk_len <= SMALL_WRITE_BYTES:
             return LANE_PRI
         return LANE_BULK
 
@@ -237,19 +315,16 @@ class RemoteStream(object):
 class AgentRuntime(object):
     def __init__(self, config):
         self.config = config
-        self.transport = LaneTransport(
-            base_url=config["broker_base_url"],
-            token=config["agent_token"],
-            role="agent",
-            peer_id=config.get("peer_id", "agent"),
-            on_frame=self.on_frame,
-            http_timeout_seconds=config.get("http_timeout_seconds", 60),
-            max_batch_bytes=config.get("max_batch_bytes", 65536),
-            flush_delay_seconds=config.get("flush_delay_seconds", 0.01),
-            http2_enabled=config.get("http2_enabled", True),
-            collapse_data_lanes=True,
-        )
+        self.transport = create_transport(config, "agent", config.get("peer_id", "agent"), self.on_frame)
         self.streams = {}
+        self.open_connect_timeout_seconds = max(
+            1.0, float(config.get("open_connect_timeout_seconds", DEFAULT_OPEN_CONNECT_TIMEOUT_SECONDS))
+        )
+        self.happy_eyeballs_delay_seconds = max(
+            0.0,
+            float(config.get("happy_eyeballs_delay_seconds", DEFAULT_HAPPY_EYEBALLS_DELAY_SECONDS)),
+        )
+        self.prefer_ipv4 = bool(config.get("prefer_ipv4", True))
 
     async def start(self):
         await self.transport.start()
@@ -261,15 +336,9 @@ class AgentRuntime(object):
             trace("recv OPEN stream=%s host=%s port=%s" % (frame.stream_id, details['host'], details['port']))
             stream = RemoteStream(self, frame.stream_id)
             self.streams[frame.stream_id] = stream
-            try:
-                await stream.open(details["host"], details["port"], details["mode"])
-            except Exception as error:
-                trace("open fail stream=%s error=%s" % (frame.stream_id, error))
-                await self.transport.send_frame(
-                    LANE_CTL,
-                    Frame(FRAME_OPEN_FAIL, stream_id=frame.stream_id, payload=make_error_payload(str(error))),
-                )
-                self.streams.pop(frame.stream_id, None)
+            stream.open_task = asyncio.create_task(
+                self._open_stream(stream, details["host"], details["port"], details["mode"])
+            )
             return
 
         stream = self.streams.get(frame.stream_id)
@@ -282,6 +351,82 @@ class AgentRuntime(object):
     def release_stream(self, stream_id, stream):
         if self.streams.get(stream_id) is stream:
             self.streams.pop(stream_id, None)
+
+    async def open_origin_connection(self, host, port):
+        loop = asyncio.get_running_loop()
+        infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        has_ipv4 = any(info[0] == socket.AF_INET for info in infos)
+        has_ipv6 = any(info[0] == socket.AF_INET6 for info in infos)
+
+        async def attempt(label, **kwargs):
+            trace(
+                "origin connect start host=%s port=%s strategy=%s timeout=%s"
+                % (host, port, label, self.open_connect_timeout_seconds)
+            )
+            started_at = loop.time()
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.open_connection(host, port, **kwargs),
+                    timeout=self.open_connect_timeout_seconds,
+                )
+            except Exception as error:
+                trace(
+                    "origin connect fail host=%s port=%s strategy=%s elapsed=%0.3f error=%r"
+                    % (host, port, label, loop.time() - started_at, error)
+                )
+                raise
+            trace(
+                "origin connect ok host=%s port=%s strategy=%s elapsed=%0.3f"
+                % (host, port, label, loop.time() - started_at)
+            )
+            return result
+
+        last_error = None
+        attempts = []
+        if self.prefer_ipv4 and has_ipv4:
+            attempts.append(("ipv4", {"family": socket.AF_INET}))
+        attempts.append(
+            (
+                "happy",
+                {
+                    "happy_eyeballs_delay": self.happy_eyeballs_delay_seconds,
+                    "interleave": 1,
+                },
+            )
+        )
+        if has_ipv6:
+            attempts.append(("ipv6", {"family": socket.AF_INET6}))
+
+        seen = set()
+        for label, kwargs in attempts:
+            key = tuple(sorted(kwargs.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                return await attempt(label, **kwargs)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                last_error = error
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("no origin connection strategy available")
+
+    async def _open_stream(self, stream, host, port, mode):
+        try:
+            await stream.open(host, port, mode)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            trace("open fail stream=%s error=%s" % (stream.stream_id, error))
+            if self.streams.get(stream.stream_id) is stream:
+                await self.transport.send_frame(
+                    LANE_CTL,
+                    Frame(FRAME_OPEN_FAIL, stream_id=stream.stream_id, payload=make_error_payload(str(error))),
+                )
+                self.streams.pop(stream.stream_id, None)
 
 
 def main():

@@ -3,13 +3,18 @@
 import argparse
 import asyncio
 import contextlib
+import faulthandler
 import ipaddress
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import random
+import signal
 import socket
 import struct
 import sys
+import threading
 import urllib.parse
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -36,7 +41,7 @@ from twoman_protocol import (
     parse_error_payload,
     random_peer_id,
 )
-from twoman_transport import LaneTransport
+from twoman_transport import create_transport
 
 
 INITIAL_WINDOW = 256 * 1024
@@ -45,15 +50,104 @@ READ_CHUNK = 16 * 1024
 WINDOW_FLUSH_BYTES = 16 * 1024
 WINDOW_FLUSH_DELAY = 0.005
 SMALL_WRITE_BYTES = 8 * 1024
+MAX_RECV_REORDER_BYTES = 1024 * 1024
 
 TRACE_ENABLED = os.environ.get("TWOMAN_TRACE", "").strip().lower() in ("1", "true", "yes", "on", "debug", "verbose")
+LOGGER = logging.getLogger("twoman.helper")
+RUNTIME_LOG_PATH = ""
+FAULT_LOG_HANDLE = None
 
 
 def trace(message):
     if not TRACE_ENABLED:
         return
+    if LOGGER.handlers:
+        LOGGER.debug(message)
+        return
     sys.stderr.write("[helper] %s\n" % message)
     sys.stderr.flush()
+
+
+def resolve_log_path(config_path, config):
+    env_log_path = os.environ.get("TWOMAN_LOG_PATH", "").strip()
+    if env_log_path:
+        return os.path.abspath(env_log_path)
+    configured_log_path = str(config.get("log_path", "")).strip()
+    if configured_log_path:
+        if os.path.isabs(configured_log_path):
+            return configured_log_path
+        return os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(config_path)), configured_log_path))
+    env_log_dir = os.environ.get("TWOMAN_LOG_DIR", "").strip()
+    if env_log_dir:
+        log_dir = os.path.abspath(env_log_dir)
+    else:
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(config_path)), "logs")
+    return os.path.join(log_dir, "helper.log")
+
+
+def configure_runtime_logging(config_path, config):
+    global RUNTIME_LOG_PATH, FAULT_LOG_HANDLE
+    if LOGGER.handlers:
+        return
+    RUNTIME_LOG_PATH = resolve_log_path(config_path, config)
+    log_dir = os.path.dirname(RUNTIME_LOG_PATH)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+    logger_level = logging.DEBUG if TRACE_ENABLED else logging.INFO
+    LOGGER.setLevel(logger_level)
+    LOGGER.propagate = False
+
+    file_handler = RotatingFileHandler(
+        RUNTIME_LOG_PATH,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    LOGGER.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setLevel(logging.DEBUG if TRACE_ENABLED else logging.WARNING)
+    console_handler.setFormatter(logging.Formatter("[helper] %(levelname)s %(message)s"))
+    LOGGER.addHandler(console_handler)
+
+    FAULT_LOG_HANDLE = open(RUNTIME_LOG_PATH, "a", encoding="utf-8")
+    faulthandler.enable(FAULT_LOG_HANDLE, all_threads=True)
+    sys.excepthook = log_unhandled_exception
+    threading.excepthook = log_thread_exception
+    LOGGER.info("helper logging initialized log_path=%s", RUNTIME_LOG_PATH)
+
+
+def log_unhandled_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    LOGGER.critical("unhandled helper exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+
+def log_thread_exception(args):
+    LOGGER.critical(
+        "unhandled helper thread exception thread=%s",
+        getattr(args.thread, "name", "unknown"),
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
+
+def log_asyncio_exception(loop, context):
+    del loop
+    exception = context.get("exception")
+    message = context.get("message", "asyncio loop exception")
+    if exception is None:
+        LOGGER.error("asyncio loop exception message=%s", message)
+        return
+    LOGGER.error("asyncio loop exception message=%s", message, exc_info=(type(exception), exception, exception.__traceback__))
+
+
+def handle_shutdown_signal(signum, _frame):
+    signal_name = getattr(signal.Signals(signum), "name", str(signum))
+    LOGGER.warning("helper received shutdown signal=%s", signal_name)
+    raise KeyboardInterrupt()
 
 
 def load_config(path):
@@ -139,6 +233,12 @@ class ProxyStream(object):
         self.closed = False
         self.pending_window = 0
         self.window_flush_task = None
+        self.recv_frame_count = 0
+        self.recv_data_bytes = 0
+        self.local_write_bytes = 0
+        self.local_write_count = 0
+        self.recv_pending = {}
+        self.recv_pending_bytes = 0
 
     async def open(self):
         trace("open stream=%s target=%s:%s" % (self.stream_id, self.target_host, self.target_port))
@@ -170,19 +270,19 @@ class ProxyStream(object):
             self.send_credit_event.set()
             return
         if frame.type_id == FRAME_DATA:
+            raw_offset = int(frame.offset)
             payload = frame.payload
             if frame.offset < self.recv_offset:
                 delta = self.recv_offset - frame.offset
                 if delta >= len(payload):
+                    trace("drop duplicate DATA stream=%s frame_offset=%s bytes=%s recv_offset=%s" % (self.stream_id, raw_offset, len(frame.payload), self.recv_offset))
                     return
                 payload = payload[delta:]
-            elif frame.offset > self.recv_offset:
-                await self.reset("out of order data")
+            if raw_offset > self.recv_offset:
+                await self._buffer_out_of_order_data(raw_offset, payload)
                 return
-            self.recv_offset += len(payload)
-            await self.recv_queue.put(payload)
-            if self.fin_offset is not None and self.recv_offset >= self.fin_offset:
-                await self.recv_queue.put(None)
+            await self._accept_in_order_data(raw_offset, payload)
+            await self._flush_pending_data()
             return
         if frame.type_id in (FRAME_FIN, FRAME_RST):
             if frame.type_id == FRAME_RST and frame.payload:
@@ -194,6 +294,80 @@ class ProxyStream(object):
             trace("recv FIN stream=%s fin_offset=%s recv_offset=%s" % (self.stream_id, self.fin_offset, self.recv_offset))
             if self.recv_offset >= self.fin_offset:
                 await self.recv_queue.put(None)
+
+    async def _accept_in_order_data(self, raw_offset, payload):
+        self.recv_frame_count += 1
+        self.recv_data_bytes += len(payload)
+        self.recv_offset += len(payload)
+        trace(
+            "recv DATA stream=%s frame_offset=%s accepted=%s recv_offset=%s frames=%s data_bytes=%s queue=%s pending=%s/%s" % (
+                self.stream_id,
+                raw_offset,
+                len(payload),
+                self.recv_offset,
+                self.recv_frame_count,
+                self.recv_data_bytes,
+                self.recv_queue.qsize() + 1,
+                len(self.recv_pending),
+                self.recv_pending_bytes,
+            )
+        )
+        await self.recv_queue.put(payload)
+        if self.fin_offset is not None and self.recv_offset >= self.fin_offset:
+            await self.recv_queue.put(None)
+
+    async def _buffer_out_of_order_data(self, raw_offset, payload):
+        end_offset = raw_offset + len(payload)
+        if end_offset <= self.recv_offset:
+            trace("drop late DATA stream=%s frame_offset=%s bytes=%s recv_offset=%s" % (self.stream_id, raw_offset, len(payload), self.recv_offset))
+            return
+        if raw_offset in self.recv_pending:
+            existing = self.recv_pending[raw_offset]
+            if len(existing) >= len(payload):
+                trace("drop duplicate pending DATA stream=%s frame_offset=%s bytes=%s recv_offset=%s" % (self.stream_id, raw_offset, len(payload), self.recv_offset))
+                return
+            self.recv_pending_bytes -= len(existing)
+        elif self.recv_pending_bytes + len(payload) > MAX_RECV_REORDER_BYTES:
+            trace(
+                "reorder buffer overflow stream=%s frame_offset=%s bytes=%s recv_offset=%s pending=%s" % (
+                    self.stream_id,
+                    raw_offset,
+                    len(payload),
+                    self.recv_offset,
+                    self.recv_pending_bytes,
+                )
+            )
+            await self.reset("reorder buffer overflow")
+            return
+        self.recv_pending[raw_offset] = payload
+        self.recv_pending_bytes += len(payload)
+        trace(
+            "buffer out-of-order DATA stream=%s frame_offset=%s bytes=%s recv_offset=%s pending=%s/%s" % (
+                self.stream_id,
+                raw_offset,
+                len(payload),
+                self.recv_offset,
+                len(self.recv_pending),
+                self.recv_pending_bytes,
+            )
+        )
+
+    async def _flush_pending_data(self):
+        while True:
+            payload = self.recv_pending.pop(self.recv_offset, None)
+            if payload is None:
+                return
+            self.recv_pending_bytes -= len(payload)
+            trace(
+                "flush pending DATA stream=%s frame_offset=%s bytes=%s pending=%s/%s" % (
+                    self.stream_id,
+                    self.recv_offset,
+                    len(payload),
+                    len(self.recv_pending),
+                    self.recv_pending_bytes,
+                )
+            )
+            await self._accept_in_order_data(self.recv_offset, payload)
 
     async def send_data(self, payload):
         view = memoryview(payload)
@@ -255,9 +429,8 @@ class ProxyStream(object):
         self.closed = True
 
     def _data_lane(self, chunk_len):
+        del chunk_len
         if self.send_offset < PRI_LIMIT:
-            return LANE_PRI
-        if chunk_len <= SMALL_WRITE_BYTES:
             return LANE_PRI
         return LANE_BULK
 
@@ -269,18 +442,7 @@ class HelperRuntime(object):
         seed = int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
         self.next_stream_id = max(1, seed | 1)
         self.peer_id = config.get("peer_id") or random_peer_id()
-        self.transport = LaneTransport(
-            base_url=config["broker_base_url"],
-            token=config["client_token"],
-            role="helper",
-            peer_id=self.peer_id,
-            on_frame=self.on_frame,
-            http_timeout_seconds=config.get("http_timeout_seconds", 60),
-            max_batch_bytes=config.get("max_batch_bytes", 65536),
-            flush_delay_seconds=config.get("flush_delay_seconds", 0.01),
-            http2_enabled=config.get("http2_enabled", True),
-            collapse_data_lanes=True,
-        )
+        self.transport = create_transport(config, "helper", self.peer_id, self.on_frame)
 
     async def start(self):
         await self.transport.start()
@@ -332,13 +494,56 @@ async def relay_stream(runtime, stream, reader, writer, initial_payload=b"", con
                 if payload is None:
                     if stream.open_failed and connected_response:
                         raise RuntimeError(stream.open_failed)
-                    trace("remote EOF stream=%s recv_offset=%s" % (stream.stream_id, stream.recv_offset))
+                    trace(
+                        "remote EOF stream=%s recv_offset=%s local_written=%s local_writes=%s" % (
+                            stream.stream_id,
+                            stream.recv_offset,
+                            stream.local_write_bytes,
+                            stream.local_write_count,
+                        )
+                    )
                     with contextlib.suppress(Exception):
                         writer.write_eof()
                     return
-                trace("remote write stream=%s bytes=%s" % (stream.stream_id, len(payload)))
+                write_start = stream.local_write_bytes
+                write_end = write_start + len(payload)
+                trace(
+                    "remote write start stream=%s bytes=%s local_range=%s-%s recv_offset=%s queue=%s" % (
+                        stream.stream_id,
+                        len(payload),
+                        write_start,
+                        write_end,
+                        stream.recv_offset,
+                        stream.recv_queue.qsize(),
+                    )
+                )
                 writer.write(payload)
-                await writer.drain()
+                drain_task = asyncio.create_task(writer.drain())
+                while True:
+                    try:
+                        await asyncio.wait_for(asyncio.shield(drain_task), timeout=5.0)
+                        break
+                    except asyncio.TimeoutError:
+                        trace(
+                            "remote drain waiting stream=%s local_range=%s-%s recv_offset=%s queue=%s" % (
+                                stream.stream_id,
+                                write_start,
+                                write_end,
+                                stream.recv_offset,
+                                stream.recv_queue.qsize(),
+                            )
+                        )
+                stream.local_write_bytes = write_end
+                stream.local_write_count += 1
+                trace(
+                    "remote write done stream=%s bytes=%s local_written=%s writes=%s queue=%s" % (
+                        stream.stream_id,
+                        len(payload),
+                        stream.local_write_bytes,
+                        stream.local_write_count,
+                        stream.recv_queue.qsize(),
+                    )
+                )
                 await stream.grant_window(len(payload))
 
         tasks = [asyncio.create_task(local_to_remote()), asyncio.create_task(remote_to_local())]
@@ -388,6 +593,7 @@ async def handle_http(runtime, reader, writer):
         stream = runtime.new_stream(host, port)
         await relay_stream(runtime, stream, reader, writer, initial_payload=initial_payload, connected_response=connected_response)
     except Exception as error:
+        LOGGER.warning("http proxy request failed error=%s", error)
         body = str(error).encode("utf-8", errors="replace")
         writer.write(
             b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: "
@@ -432,7 +638,8 @@ async def handle_socks(runtime, reader, writer):
         writer.write(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + struct.pack("!H", 0))
         await writer.drain()
         await relay_stream(runtime, stream, reader, writer, open_stream=False)
-    except Exception:
+    except Exception as error:
+        LOGGER.warning("socks proxy request failed error=%s", error)
         if stream is not None:
             with contextlib.suppress(Exception):
                 await stream.reset("socks failure")
@@ -443,20 +650,51 @@ async def handle_socks(runtime, reader, writer):
 
 
 async def main_async(config):
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(log_asyncio_exception)
     runtime = HelperRuntime(config)
+    listen_host = config.get("listen_host", "127.0.0.1")
+    http_port = int(config.get("http_listen_port", 8080))
+    socks_port = int(config.get("socks_listen_port", 1080))
+    LOGGER.info(
+        "helper starting transport=%s listen_host=%s http_port=%s socks_port=%s trace=%s http2_ctl=%s http2_data=%s",
+        config.get("transport", "http"),
+        listen_host,
+        http_port,
+        socks_port,
+        TRACE_ENABLED,
+        bool(config.get("http2_enabled", {}).get("ctl", False)),
+        bool(config.get("http2_enabled", {}).get("data", False)),
+    )
     await runtime.start()
-    http_server = await asyncio.start_server(
-        lambda r, w: handle_http(runtime, r, w),
-        config.get("listen_host", "127.0.0.1"),
-        int(config.get("http_listen_port", 8080)),
-    )
-    socks_server = await asyncio.start_server(
-        lambda r, w: handle_socks(runtime, r, w),
-        config.get("listen_host", "127.0.0.1"),
-        int(config.get("socks_listen_port", 1080)),
-    )
-    async with http_server, socks_server:
-        await asyncio.gather(http_server.serve_forever(), socks_server.serve_forever())
+    http_server = None
+    socks_server = None
+    try:
+        http_server = await asyncio.start_server(
+            lambda r, w: handle_http(runtime, r, w),
+            listen_host,
+            http_port,
+        )
+        socks_server = await asyncio.start_server(
+            lambda r, w: handle_socks(runtime, r, w),
+            listen_host,
+            socks_port,
+        )
+        LOGGER.info("helper started log_path=%s", RUNTIME_LOG_PATH or "stderr-only")
+        async with http_server, socks_server:
+            await asyncio.gather(http_server.serve_forever(), socks_server.serve_forever())
+    finally:
+        LOGGER.info("helper stopping")
+        if http_server is not None:
+            http_server.close()
+            with contextlib.suppress(Exception):
+                await http_server.wait_closed()
+        if socks_server is not None:
+            socks_server.close()
+            with contextlib.suppress(Exception):
+                await socks_server.wait_closed()
+        await runtime.stop()
+        LOGGER.info("helper stopped")
 
 
 def main():
@@ -464,7 +702,19 @@ def main():
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
     config = load_config(args.config)
-    asyncio.run(main_async(config))
+    configure_runtime_logging(args.config, config)
+    for signum in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+        if signum is None:
+            continue
+        with contextlib.suppress(ValueError):
+            signal.signal(signum, handle_shutdown_signal)
+    try:
+        asyncio.run(main_async(config))
+    except KeyboardInterrupt:
+        LOGGER.info("helper interrupted by user")
+    except Exception:
+        LOGGER.exception("helper crashed")
+        raise
 
 
 if __name__ == "__main__":

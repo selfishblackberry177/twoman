@@ -18,10 +18,38 @@ TWOMAN_SERVER_PORT="${TWOMAN_SERVER_PORT:-22}"
 TWOMAN_SERVER_DIR="${TWOMAN_SERVER_DIR:-/opt/twoman}"
 TWOMAN_AGENT_PEER_ID="${TWOMAN_AGENT_PEER_ID:-agent-main}"
 TWOMAN_SERVER_PASSWORD="${TWOMAN_SERVER_PASSWORD:-}"
+TWOMAN_SERVER_SSH_KEY="${TWOMAN_SERVER_SSH_KEY:-}"
 TWOMAN_AGENT_SERVICE_NAME="${TWOMAN_AGENT_SERVICE_NAME:-twoman-agent.service}"
+TWOMAN_VERIFY_TLS="${TWOMAN_VERIFY_TLS:-true}"
+TWOMAN_HTTP2_CTL="${TWOMAN_HTTP2_CTL:-false}"
+TWOMAN_HTTP2_DATA="${TWOMAN_HTTP2_DATA:-false}"
+TWOMAN_TRANSPORT="${TWOMAN_TRANSPORT:-http}"
+TWOMAN_STREAMING_UP_LANES="${TWOMAN_STREAMING_UP_LANES:-}"
+TWOMAN_TRACE="${TWOMAN_TRACE:-0}"
+TWOMAN_IDLE_REPOLL_CTL="${TWOMAN_IDLE_REPOLL_CTL:-0.05}"
+TWOMAN_IDLE_REPOLL_DATA="${TWOMAN_IDLE_REPOLL_DATA:-0.1}"
+TWOMAN_DATA_UP_MAX_BATCH_BYTES="${TWOMAN_DATA_UP_MAX_BATCH_BYTES:-131072}"
+TWOMAN_DATA_UP_FLUSH_DELAY_SECONDS="${TWOMAN_DATA_UP_FLUSH_DELAY_SECONDS:-0.006}"
+TWOMAN_OPEN_CONNECT_TIMEOUT_SECONDS="${TWOMAN_OPEN_CONNECT_TIMEOUT_SECONDS:-12}"
+TWOMAN_PREFER_IPV4="${TWOMAN_PREFER_IPV4:-true}"
+TWOMAN_HAPPY_EYEBALLS_DELAY_SECONDS="${TWOMAN_HAPPY_EYEBALLS_DELAY_SECONDS:-0.25}"
+
+STREAMING_UP_JSON="[]"
+if [ -n "${TWOMAN_STREAMING_UP_LANES}" ]; then
+  STREAMING_UP_JSON="$(python3 - <<'PY'
+import json, os
+values=[item.strip() for item in os.environ["TWOMAN_STREAMING_UP_LANES"].split(",") if item.strip()]
+print(json.dumps(values))
+PY
+)"
+fi
 
 SSH_OPTS=(-p "${TWOMAN_SERVER_PORT}" -o StrictHostKeyChecking=no)
 SCP_OPTS=(-P "${TWOMAN_SERVER_PORT}" -o StrictHostKeyChecking=no)
+if [ -n "${TWOMAN_SERVER_SSH_KEY}" ]; then
+  SSH_OPTS+=(-i "${TWOMAN_SERVER_SSH_KEY}")
+  SCP_OPTS+=(-i "${TWOMAN_SERVER_SSH_KEY}")
+fi
 SCP_CMD=(scp "${SCP_OPTS[@]}")
 SSH_CMD=(ssh "${SSH_OPTS[@]}")
 if [ -n "${TWOMAN_SERVER_PASSWORD}" ]; then
@@ -34,6 +62,7 @@ echo "Creating remote directory..."
 
 echo "Uploading agent files..."
 "${SCP_CMD[@]}" \
+  requirements.txt \
   twoman_protocol.py \
   twoman_transport.py \
   hidden_server/agent.py \
@@ -45,15 +74,31 @@ echo "Uploading agent files..."
 
 CONFIG_JSON="$(cat <<EOF
 {
+  "transport": "${TWOMAN_TRANSPORT}",
   "broker_base_url": "${TWOMAN_BROKER_BASE_URL}",
   "agent_token": "${TWOMAN_AGENT_TOKEN}",
   "http_timeout_seconds": 30,
   "flush_delay_seconds": 0.01,
   "max_batch_bytes": 65536,
+  "verify_tls": ${TWOMAN_VERIFY_TLS},
   "peer_id": "${TWOMAN_AGENT_PEER_ID}",
+  "open_connect_timeout_seconds": ${TWOMAN_OPEN_CONNECT_TIMEOUT_SECONDS},
+  "prefer_ipv4": ${TWOMAN_PREFER_IPV4},
+  "happy_eyeballs_delay_seconds": ${TWOMAN_HAPPY_EYEBALLS_DELAY_SECONDS},
+  "upload_profiles": {
+    "data": {
+      "max_batch_bytes": ${TWOMAN_DATA_UP_MAX_BATCH_BYTES},
+      "flush_delay_seconds": ${TWOMAN_DATA_UP_FLUSH_DELAY_SECONDS}
+    }
+  },
+  "streaming_up_lanes": ${STREAMING_UP_JSON},
+  "idle_repoll_delay_seconds": {
+    "ctl": ${TWOMAN_IDLE_REPOLL_CTL},
+    "data": ${TWOMAN_IDLE_REPOLL_DATA}
+  },
   "http2_enabled": {
-    "ctl": true,
-    "data": false
+    "ctl": ${TWOMAN_HTTP2_CTL},
+    "data": ${TWOMAN_HTTP2_DATA}
   }
 }
 EOF
@@ -69,7 +114,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=${TWOMAN_SERVER_DIR}
 Environment=PYTHONUNBUFFERED=1
-Environment=TWOMAN_TRACE=0
+Environment=TWOMAN_TRACE=${TWOMAN_TRACE}
 ExecStart=/usr/bin/python3 ${TWOMAN_SERVER_DIR}/agent.py --config ${TWOMAN_SERVER_DIR}/config.json
 Restart=always
 RestartSec=2
@@ -103,6 +148,17 @@ ${WATCHDOG_SERVICE_CONTENT}
 EOF
 install -m 0644 '${TWOMAN_SERVER_DIR}/twoman-agent-watchdog.timer' /etc/systemd/system/twoman-agent-watchdog.timer
 chmod 755 '${TWOMAN_SERVER_DIR}/install_watchdog.sh' '${TWOMAN_SERVER_DIR}/agent_watchdog.py'
+if ! python3 -c 'import httpx, websockets' >/dev/null 2>&1; then
+  if python3 -m pip --version >/dev/null 2>&1; then
+    python3 -m pip install -r '${TWOMAN_SERVER_DIR}/requirements.txt'
+  elif command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y python3-httpx python3-websockets
+  else
+    echo 'unable to install httpx/websockets automatically: pip and apt-get are unavailable' >&2
+    exit 1
+  fi
+fi
 python3 -m py_compile '${TWOMAN_SERVER_DIR}/agent.py' '${TWOMAN_SERVER_DIR}/agent_watchdog.py'
 systemctl daemon-reload
 systemctl enable --now '${TWOMAN_AGENT_SERVICE_NAME}'

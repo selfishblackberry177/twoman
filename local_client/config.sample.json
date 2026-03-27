@@ -4,6 +4,7 @@
   "listen_host": "127.0.0.1",
   "http_listen_port": 18092,
   "socks_listen_port": 11092,
+  "log_path": "logs/helper.log",
   "http_timeout_seconds": 30,
   "flush_delay_seconds": 0.01,
   "max_batch_bytes": 65536,

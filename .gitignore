@@ -1,11 +1,13 @@
 __pycache__/
 *.py[cod]
+*.spec
 *.pid
 *.log
 *.sqlite3
 *.zip
 *.tar.gz
 *.tar
+node_modules/
 
 .DS_Store
 .env
@@ -26,4 +28,3 @@ host/storage/
 local_client/config.json
 hidden_server/config.json
 client/profiles.ini
-
