@@ -20,7 +20,7 @@ jobs:
           cache: pip
 
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt -r desktop_client/requirements.txt
 
       - name: Verify Python modules compile
         run: |
@@ -29,13 +29,27 @@ jobs:
             twoman_transport.py \
             local_client/helper.py \
             hidden_server/agent.py \
-            host/runtime/http_broker_daemon.py
+            host/runtime/http_broker_daemon.py \
+            desktop_client/models.py \
+            desktop_client/runtime.py \
+            desktop_client/controller.py \
+            desktop_client/socks_gateway.py \
+            desktop_client/tui.py
 
       - name: Run bridge backend smoke test
         run: bash tests/run_e2e.sh
 
       - name: Run node backend smoke test
         run: bash tests/run_e2e_node_http.sh
+
+      - name: Run desktop TUI tests
+        run: python3 -m unittest tests/test_desktop_client_tui.py
+
+      - name: Run desktop client end-to-end test
+        run: bash tests/run_desktop_client_e2e.sh
+
+      - name: Build frozen Linux desktop client
+        run: ./desktop_client/build_linux.sh
 
   android-build:
     runs-on: ubuntu-latest

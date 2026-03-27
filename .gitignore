@@ -8,6 +8,8 @@ __pycache__/
 *.tar.gz
 *.tar
 node_modules/
+desktop_client/build/
+desktop_client/dist/
 
 .DS_Store
 .env

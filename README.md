@@ -1,7 +1,7 @@
 # Twoman
 
 <p align="center">
-  <img src="android-client/assets/logo.png" alt="Twoman logo" width="160" />
+  <img src="docs/assets/logo-homepage.png" alt="Twoman logo" width="160" />
 </p>
 
 Twoman is a host-preserving relay for shared cPanel hosting and managed
@@ -40,6 +40,7 @@ What it is not:
 - `local_client/helper.py`: local HTTP + SOCKS5 helper
 - `hidden_server/agent.py`: hidden reverse agent
 - `android-client/`: Android client with saved profiles, share/import profile text, proxy mode, and VPN mode
+- `desktop_client/`: cross-platform desktop TUI with saved profiles, connect/disconnect, and authenticated external SOCKS sharing
 - `host/node_selector/broker.js`: CloudLinux Node selector broker for managed-host deployments
 - `host/runtime/http_broker_daemon.py`: asyncio broker for bridge-style cPanel deployments
 - `host/app/bridge_runtime.php`: PHP bootstrap that starts and supervises the bridge broker
@@ -54,8 +55,9 @@ Backend families:
 - `backends/passenger_python`
 - `backends/passenger_node`
 
-Backend overview: [docs/BACKENDS.md](/home/shahab/dev/hobby/mintm/docs/BACKENDS.md)
-Android client notes: [android-client/README.md](/home/shahab/dev/hobby/mintm/android-client/README.md)
+Backend overview: [docs/BACKENDS.md](docs/BACKENDS.md)
+Android client notes: [android-client/README.md](android-client/README.md)
+Desktop client notes: [desktop_client/README.md](desktop_client/README.md)
 
 ## Architecture
 
@@ -70,7 +72,7 @@ Key design points:
 - the broker assigns agent-side stream IDs and scopes helper streams by session
 - public authentication uses bearer tokens in `X-Relay-Token`
 
-More detail: [docs/ARCHITECTURE.md](/home/shahab/dev/hobby/mintm/docs/ARCHITECTURE.md)
+More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ## Backend Strategy
 
@@ -97,7 +99,7 @@ Twoman now ships with repo-level scripts for each side:
 - `scripts/start_client.sh`: writes `local_client/config.json` if needed and starts the local helper in the foreground
 
 Manual fallback:
-- [docs/MANUAL_DEPLOY.md](/home/shahab/dev/hobby/mintm/docs/MANUAL_DEPLOY.md)
+- [docs/MANUAL_DEPLOY.md](docs/MANUAL_DEPLOY.md)
 
 ### 1. Deploy the cPanel host
 
