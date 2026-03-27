@@ -35,6 +35,7 @@ What it is not:
 - `twoman_transport.py`: shared public-leg transport
 - `local_client/helper.py`: local HTTP + SOCKS5 helper
 - `hidden_server/agent.py`: hidden reverse agent
+- `android-client/`: Android client with saved profiles, share/import profile text, proxy mode, and VPN mode
 - `host/node_selector/broker.js`: CloudLinux Node selector broker for managed-host deployments
 - `host/runtime/http_broker_daemon.py`: asyncio broker for bridge-style cPanel deployments
 - `host/app/bridge_runtime.php`: PHP bootstrap that starts and supervises the bridge broker
@@ -50,6 +51,7 @@ Backend families:
 - `backends/passenger_node`
 
 Backend overview: [docs/BACKENDS.md](/home/shahab/dev/hobby/mintm/docs/BACKENDS.md)
+Android client notes: [android-client/README.md](/home/shahab/dev/hobby/mintm/android-client/README.md)
 
 ## Architecture
 
