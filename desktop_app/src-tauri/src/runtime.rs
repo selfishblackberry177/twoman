@@ -12,20 +12,21 @@ use std::{
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use serde_json::json;
 use crate::{
     models::{
         ClientProfile, ConnectionMode, ConnectionPhase, ConnectionStatus, DesktopSnapshot,
         PlatformInfo, ShareLogTail, ShareStatus, SharedProxy, SharedProxyProtocol,
     },
     storage::{
-        helper_config_path, helper_log_path, helper_pid_path, load_profiles, load_settings, load_shares,
-        normalize_mode_for_platform, normalize_settings, read_log_tail, save_profiles, save_settings,
-        save_shares, share_config_path, share_log_path, share_pid_path, tunnel_config_path,
-        tunnel_log_path, tunnel_pid_path, tunnel_work_dir, validate_profile, validate_share, AppPaths,
+        helper_config_path, helper_log_path, helper_pid_path, load_profiles, load_settings,
+        load_shares, normalize_mode_for_platform, normalize_settings, read_log_tail, save_profiles,
+        save_settings, save_shares, share_config_path, share_log_path, share_pid_path,
+        tunnel_config_path, tunnel_log_path, tunnel_pid_path, tunnel_work_dir, validate_profile,
+        validate_share, AppPaths,
     },
     system_proxy::SystemProxyManager,
 };
+use serde_json::json;
 
 const PORT_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
 const PORT_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -109,7 +110,10 @@ impl DesktopRuntime {
         profiles.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
 
         let helper_log_path = helper_log_path(&self.paths);
-        let mut state = self.inner.lock().map_err(|_| "runtime lock poisoned".to_string())?;
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?;
         self.refresh_locked(&mut state)?;
 
         let connection = if let Some(helper) = state.helper.as_ref() {
@@ -218,7 +222,10 @@ impl DesktopRuntime {
     }
 
     pub fn delete_profile(&self, profile_id: &str) -> Result<(), String> {
-        let mut state = self.inner.lock().map_err(|_| "runtime lock poisoned".to_string())?;
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?;
         if state
             .helper
             .as_ref()
@@ -245,7 +252,10 @@ impl DesktopRuntime {
     }
 
     pub fn delete_share(&self, share_id: &str) -> Result<(), String> {
-        let mut state = self.inner.lock().map_err(|_| "runtime lock poisoned".to_string())?;
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?;
         if state.shares.contains_key(share_id) {
             self.stop_share_locked(&mut state, share_id)?;
         }
@@ -290,7 +300,10 @@ impl DesktopRuntime {
             .ok_or_else(|| "selected profile is missing".to_string())?;
         validate_profile(&profile)?;
 
-        let mut state = self.inner.lock().map_err(|_| "runtime lock poisoned".to_string())?;
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?;
         self.disconnect_locked(&mut state)?;
         state.phase = ConnectionPhase::Connecting;
         state.message = format!("Starting {}", profile.name);
@@ -318,7 +331,7 @@ impl DesktopRuntime {
                 SystemProxyManager::enable(&self.paths, helper.http_port)?;
             }
             let tunnel = if matches!(settings.connection_mode, ConnectionMode::Tunnel) {
-                Some(self.spawn_tunnel(helper.socks_port)?)
+                Some(self.spawn_tunnel(&profile, helper.socks_port)?)
             } else {
                 None
             };
@@ -370,7 +383,10 @@ impl DesktopRuntime {
     }
 
     pub fn disconnect(&self) -> Result<(), String> {
-        let mut state = self.inner.lock().map_err(|_| "runtime lock poisoned".to_string())?;
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?;
         self.disconnect_locked(&mut state)
     }
 
@@ -382,7 +398,10 @@ impl DesktopRuntime {
             .ok_or_else(|| "share not found".to_string())?;
         validate_share(&share)?;
 
-        let mut state = self.inner.lock().map_err(|_| "runtime lock poisoned".to_string())?;
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?;
         self.refresh_locked(&mut state)?;
         let helper = state
             .helper
@@ -409,7 +428,10 @@ impl DesktopRuntime {
     }
 
     pub fn stop_share(&self, share_id: &str) -> Result<(), String> {
-        let mut state = self.inner.lock().map_err(|_| "runtime lock poisoned".to_string())?;
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_string())?;
         self.stop_share_locked(&mut state, share_id)
     }
 
@@ -485,11 +507,13 @@ impl DesktopRuntime {
         let stale_share_ids = state
             .shares
             .iter_mut()
-            .filter_map(|(share_id, runtime_share)| match runtime_share.child.try_wait() {
-                Ok(Some(_)) => Some(share_id.clone()),
-                Ok(None) => None,
-                Err(_) => Some(share_id.clone()),
-            })
+            .filter_map(
+                |(share_id, runtime_share)| match runtime_share.child.try_wait() {
+                    Ok(Some(_)) => Some(share_id.clone()),
+                    Ok(None) => None,
+                    Err(_) => Some(share_id.clone()),
+                },
+            )
             .collect::<Vec<_>>();
         for share_id in stale_share_ids {
             state.shares.remove(&share_id);
@@ -523,10 +547,18 @@ impl DesktopRuntime {
                 wait_for_port_state("127.0.0.1", helper.socks_port, false, PORT_TEARDOWN_TIMEOUT);
             if !http_cleared || !socks_cleared {
                 kill_twoman_port_owners(&[helper.http_port, helper.socks_port]);
-                http_cleared =
-                    wait_for_port_state("127.0.0.1", helper.http_port, false, PORT_TEARDOWN_TIMEOUT);
-                socks_cleared =
-                    wait_for_port_state("127.0.0.1", helper.socks_port, false, PORT_TEARDOWN_TIMEOUT);
+                http_cleared = wait_for_port_state(
+                    "127.0.0.1",
+                    helper.http_port,
+                    false,
+                    PORT_TEARDOWN_TIMEOUT,
+                );
+                socks_cleared = wait_for_port_state(
+                    "127.0.0.1",
+                    helper.socks_port,
+                    false,
+                    PORT_TEARDOWN_TIMEOUT,
+                );
             }
             if http_cleared && socks_cleared {
                 let _ = fs::remove_file(&helper.pid_path);
@@ -553,12 +585,20 @@ impl DesktopRuntime {
         };
         terminate_child(&mut share.child);
         terminate_pid_file(&share.pid_path);
-        let mut share_cleared =
-            wait_for_port_state(&share.listen_host, share.listen_port, false, PORT_TEARDOWN_TIMEOUT);
+        let mut share_cleared = wait_for_port_state(
+            &share.listen_host,
+            share.listen_port,
+            false,
+            PORT_TEARDOWN_TIMEOUT,
+        );
         if !share_cleared {
             kill_twoman_port_owners(&[share.listen_port]);
-            share_cleared =
-                wait_for_port_state(&share.listen_host, share.listen_port, false, PORT_TEARDOWN_TIMEOUT);
+            share_cleared = wait_for_port_state(
+                &share.listen_host,
+                share.listen_port,
+                false,
+                PORT_TEARDOWN_TIMEOUT,
+            );
         }
         if share_cleared {
             let _ = fs::remove_file(&share.pid_path);
@@ -566,7 +606,11 @@ impl DesktopRuntime {
         Ok(())
     }
 
-    fn spawn_helper(&self, profile: &ClientProfile, mode: ConnectionMode) -> Result<SpawnedProcess, String> {
+    fn spawn_helper(
+        &self,
+        profile: &ClientProfile,
+        mode: ConnectionMode,
+    ) -> Result<SpawnedProcess, String> {
         kill_twoman_port_owners(&[profile.http_port, profile.socks_port]);
         let helper_ports = resolve_helper_ports(profile.http_port, profile.socks_port)
             .ok_or_else(|| "could not find a free local SOCKS/HTTP port pair".to_string())?;
@@ -618,7 +662,12 @@ impl DesktopRuntime {
         )?;
 
         if !wait_for_port_state("127.0.0.1", helper_ports.http_port, true, PORT_WAIT_TIMEOUT)
-            || !wait_for_port_state("127.0.0.1", helper_ports.socks_port, true, PORT_WAIT_TIMEOUT)
+            || !wait_for_port_state(
+                "127.0.0.1",
+                helper_ports.socks_port,
+                true,
+                PORT_WAIT_TIMEOUT,
+            )
         {
             terminate_child(&mut child);
             return Err(format!(
@@ -642,11 +691,28 @@ impl DesktopRuntime {
         })
     }
 
-    fn spawn_tunnel(&self, helper_socks_port: u16) -> Result<SpawnedProcess, String> {
+    fn spawn_tunnel(
+        &self,
+        profile: &ClientProfile,
+        helper_socks_port: u16,
+    ) -> Result<SpawnedProcess, String> {
         let log_path = tunnel_log_path(&self.paths);
         let config_path = tunnel_config_path(&self.paths);
         let pid_path = tunnel_pid_path(&self.paths);
         let work_dir = tunnel_work_dir(&self.paths);
+        let mut route_exclude_address = vec![
+            "127.0.0.0/8".to_string(),
+            "10.0.0.0/8".to_string(),
+            "100.64.0.0/10".to_string(),
+            "169.254.0.0/16".to_string(),
+            "172.16.0.0/12".to_string(),
+            "192.168.0.0/16".to_string(),
+            "224.0.0.0/4".to_string(),
+            "::1/128".to_string(),
+            "fc00::/7".to_string(),
+            "fe80::/10".to_string(),
+        ];
+        route_exclude_address.extend(resolve_profile_bypass_cidrs(profile)?);
         terminate_pid_file(&pid_path);
         let _ = fs::remove_file(&pid_path);
         fs::create_dir_all(&work_dir)
@@ -661,23 +727,11 @@ impl DesktopRuntime {
                 "dns": {
                     "servers": [
                         {
-                            "type": "https",
-                            "tag": "remote",
-                            "server": "1.1.1.1",
-                            "server_port": 443,
-                            "path": "/dns-query",
-                            "tls": {
-                                "enabled": true,
-                                "server_name": "cloudflare-dns.com",
-                            },
-                            "detour": "proxy",
-                        },
-                        {
                             "type": "local",
                             "tag": "local",
                         }
                     ],
-                    "final": "remote",
+                    "final": "local",
                     "strategy": "prefer_ipv4",
                 },
                 "inbounds": [
@@ -694,18 +748,7 @@ impl DesktopRuntime {
                         "stack": "mixed",
                         "sniff": true,
                         "sniff_override_destination": true,
-                        "route_exclude_address": [
-                            "127.0.0.0/8",
-                            "10.0.0.0/8",
-                            "100.64.0.0/10",
-                            "169.254.0.0/16",
-                            "172.16.0.0/12",
-                            "192.168.0.0/16",
-                            "224.0.0.0/4",
-                            "::1/128",
-                            "fc00::/7",
-                            "fe80::/10",
-                        ],
+                        "route_exclude_address": route_exclude_address,
                     }
                 ],
                 "outbounds": [
@@ -740,6 +783,10 @@ impl DesktopRuntime {
                             "action": "hijack-dns",
                         },
                         {
+                            "network": "udp",
+                            "action": "reject",
+                        },
+                        {
                             "ip_is_private": true,
                             "outbound": "direct",
                         }
@@ -760,10 +807,7 @@ impl DesktopRuntime {
         if !wait_for_log_marker(
             &mut child,
             &log_path,
-            &[
-                "sing-box started",
-                "started at",
-            ],
+            &["sing-box started", "started at"],
             TUNNEL_WAIT_TIMEOUT,
         ) {
             terminate_child(&mut child);
@@ -820,7 +864,14 @@ impl DesktopRuntime {
             self.runtime_program_kind("gateway", &config_path)?,
             &log_path,
         )?;
-        if !wait_for_listener_start(&mut child, &log_path, &share.listen_host, share.listen_port, "gateway started", PORT_WAIT_TIMEOUT) {
+        if !wait_for_listener_start(
+            &mut child,
+            &log_path,
+            &share.listen_host,
+            share.listen_port,
+            "gateway started",
+            PORT_WAIT_TIMEOUT,
+        ) {
             terminate_child(&mut child);
             terminate_pid_file(&pid_path);
             return Err(format!(
@@ -846,11 +897,21 @@ impl DesktopRuntime {
             _ => return Err("unknown runtime kind".into()),
         };
         if let Ok(env_bin) = std::env::var(env_var) {
-            return Ok(program_spec_for_kind(kind, PathBuf::from(env_bin), config_path, &self.paths));
+            return Ok(program_spec_for_kind(
+                kind,
+                PathBuf::from(env_bin),
+                config_path,
+                &self.paths,
+            ));
         }
 
         if let Some(sidecar) = self.find_sidecar(kind) {
-            return Ok(program_spec_for_kind(kind, sidecar, config_path, &self.paths));
+            return Ok(program_spec_for_kind(
+                kind,
+                sidecar,
+                config_path,
+                &self.paths,
+            ));
         }
 
         runtime_program_from_source(kind, config_path)
@@ -860,13 +921,27 @@ impl DesktopRuntime {
         let executable_name = sidecar_name(kind);
         let mut candidates = Vec::new();
         if let Some(resource_dir) = &self.resource_dir {
-            candidates.push(resource_dir.join(platform_sidecar_folder()).join(&executable_name));
+            candidates.push(
+                resource_dir
+                    .join(platform_sidecar_folder())
+                    .join(&executable_name),
+            );
             candidates.push(resource_dir.join(&executable_name));
-            candidates.push(resource_dir.join("sidecars").join(platform_sidecar_folder()).join(&executable_name));
+            candidates.push(
+                resource_dir
+                    .join("sidecars")
+                    .join(platform_sidecar_folder())
+                    .join(&executable_name),
+            );
         }
         if let Ok(current_exe) = std::env::current_exe() {
             if let Some(parent) = current_exe.parent() {
-                candidates.push(parent.join("sidecars").join(platform_sidecar_folder()).join(&executable_name));
+                candidates.push(
+                    parent
+                        .join("sidecars")
+                        .join(platform_sidecar_folder())
+                        .join(&executable_name),
+                );
                 candidates.push(parent.join(&executable_name));
             }
         }
@@ -905,7 +980,11 @@ fn program_spec_for_kind(
     }
 }
 
-fn tunnel_program_spec(executable: PathBuf, config_path: &Path, working_dir: PathBuf) -> ProgramSpec {
+fn tunnel_program_spec(
+    executable: PathBuf,
+    config_path: &Path,
+    working_dir: PathBuf,
+) -> ProgramSpec {
     ProgramSpec {
         executable,
         args: vec![
@@ -938,15 +1017,12 @@ fn runtime_program_from_source(kind: &str, config_path: &Path) -> Result<Program
                 .join(sidecar_name("tunnel"));
             if sidecar_path.exists() {
                 let working_dir = repo_root.join("desktop_app/src-tauri/target/tunnel-runtime");
-                fs::create_dir_all(&working_dir)
-                    .map_err(|error| format!("failed to create {}: {error}", working_dir.display()))?;
-                return Ok(tunnel_program_spec(
-                    sidecar_path,
-                    config_path,
-                    working_dir,
-                ));
+                fs::create_dir_all(&working_dir).map_err(|error| {
+                    format!("failed to create {}: {error}", working_dir.display())
+                })?;
+                return Ok(tunnel_program_spec(sidecar_path, config_path, working_dir));
             }
-            return Err("no source-mode tunnel runtime is available; build or bundle the Windows tunnel sidecar".into())
+            return Err("no source-mode tunnel runtime is available; build or bundle the Windows tunnel sidecar".into());
         }
         _ => return Err("unknown runtime kind".into()),
     };
@@ -961,7 +1037,76 @@ fn runtime_program_from_source(kind: &str, config_path: &Path) -> Result<Program
         });
     }
 
-    Err(format!("no runtime binary or source script found for {kind}"))
+    Err(format!(
+        "no runtime binary or source script found for {kind}"
+    ))
+}
+
+fn resolve_profile_bypass_cidrs(profile: &ClientProfile) -> Result<Vec<String>, String> {
+    let (host, port) = parse_profile_upstream_host_port(&profile.broker_base_url)?;
+    let addresses = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|error| format!("failed to resolve tunnel bypass host {host}:{port}: {error}"))?;
+    let mut cidrs = Vec::new();
+    for address in addresses {
+        let cidr = match address.ip() {
+            std::net::IpAddr::V4(ip) => format!("{ip}/32"),
+            std::net::IpAddr::V6(ip) => format!("{ip}/128"),
+        };
+        if !cidrs.contains(&cidr) {
+            cidrs.push(cidr);
+        }
+    }
+    if cidrs.is_empty() {
+        return Err(format!(
+            "tunnel bypass resolution returned no addresses for {}",
+            profile.broker_base_url
+        ));
+    }
+    Ok(cidrs)
+}
+
+fn parse_profile_upstream_host_port(base_url: &str) -> Result<(String, u16), String> {
+    let (scheme, remainder) = base_url
+        .split_once("://")
+        .ok_or_else(|| format!("invalid broker_base_url: {base_url}"))?;
+    let authority = remainder
+        .split('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("invalid broker_base_url: {base_url}"))?;
+    let default_port = match scheme.to_ascii_lowercase().as_str() {
+        "http" => 80,
+        "https" => 443,
+        other => return Err(format!("unsupported broker scheme {other} in {base_url}")),
+    };
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, suffix) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("invalid IPv6 broker address in {base_url}"))?;
+        let port = suffix
+            .strip_prefix(':')
+            .map(|value| {
+                value
+                    .parse::<u16>()
+                    .map_err(|error| format!("invalid broker port in {base_url}: {error}"))
+            })
+            .transpose()?
+            .unwrap_or(default_port);
+        return Ok((host.to_string(), port));
+    }
+
+    if let Some((host, port_text)) = authority.rsplit_once(':') {
+        if !host.contains(':') {
+            let port = port_text
+                .parse::<u16>()
+                .map_err(|error| format!("invalid broker port in {base_url}: {error}"))?;
+            return Ok((host.to_string(), port));
+        }
+    }
+
+    Ok((authority.to_string(), default_port))
 }
 
 fn sidecar_name(kind: &str) -> String {
@@ -1030,7 +1175,10 @@ struct HelperPorts {
     used_fallback: bool,
 }
 
-fn resolve_helper_ports(preferred_http_port: u16, preferred_socks_port: u16) -> Option<HelperPorts> {
+fn resolve_helper_ports(
+    preferred_http_port: u16,
+    preferred_socks_port: u16,
+) -> Option<HelperPorts> {
     for offset in 0..=64u16 {
         let http_port = preferred_http_port.checked_add(offset)?;
         let socks_port = preferred_socks_port.checked_add(offset)?;
@@ -1328,7 +1476,10 @@ fn upsert_by_id<T, F>(items: &mut Vec<T>, value: T, id_fn: F)
 where
     F: Fn(&T) -> &str,
 {
-    if let Some(index) = items.iter().position(|candidate| id_fn(candidate) == id_fn(&value)) {
+    if let Some(index) = items
+        .iter()
+        .position(|candidate| id_fn(candidate) == id_fn(&value))
+    {
         items[index] = value;
     } else {
         items.push(value);

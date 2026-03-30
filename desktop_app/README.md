@@ -134,7 +134,7 @@ That script:
 - copies the current Windows sidecars
 - writes `portable-data/README.txt`
 - writes the `twoman-portable` marker
-- rebuilds `private_handoff/desktop_app/windows/Twoman_0.1.0_x64-portable.zip`
+- rebuilds `private_handoff/desktop_app/windows/Twoman_<version>_x64-portable.zip`
 
 Regenerate the Windows icon set after changing `src/assets/logo.png`:
 

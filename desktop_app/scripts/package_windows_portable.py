@@ -8,12 +8,15 @@ app requires to keep state beside the executable.
 
 from __future__ import annotations
 
+import json
 import shutil
 import zipfile
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+APP_ROOT = REPO_ROOT / "desktop_app"
+TAURI_CONFIG_PATH = APP_ROOT / "src-tauri/tauri.conf.json"
 WINDOWS_BUILD_ROOT = Path(
     "/mnt/c/Users/Shaha/AppData/Local/Temp/mintm-win-build/desktop_app/src-tauri/target/release"
 )
@@ -32,6 +35,21 @@ HANDOFF_ROOT = REPO_ROOT / "private_handoff/desktop_app/windows"
 PORTABLE_ROOT = HANDOFF_ROOT / "portable-ui/Twoman"
 PORTABLE_DATA_ROOT = PORTABLE_ROOT / "portable-data"
 SIDECAR_ROOT = PORTABLE_ROOT / "sidecars/windows"
+
+
+def load_app_version() -> str:
+    config = json.loads(TAURI_CONFIG_PATH.read_text(encoding="utf-8"))
+    version = str(config.get("version", "")).strip()
+    if not version:
+        raise ValueError(f"missing version in {TAURI_CONFIG_PATH}")
+    return version
+
+
+APP_VERSION = load_app_version()
+
+
+def windows_artifact_name(suffix: str) -> str:
+    return f"Twoman_{APP_VERSION}_x64{suffix}"
 
 
 def copy_required_file(source: Path, destination: Path) -> None:
@@ -70,7 +88,7 @@ def write_portable_markers() -> None:
 
 
 def build_zip() -> Path:
-    zip_path = HANDOFF_ROOT / "Twoman_0.1.0_x64-portable.zip"
+    zip_path = HANDOFF_ROOT / windows_artifact_name("-portable.zip")
     if zip_path.exists():
         zip_path.unlink()
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -87,12 +105,12 @@ def main() -> None:
         PORTABLE_ROOT / "Twoman.exe",
     )
     copy_required_file(
-        WINDOWS_BUNDLE_ROOT / "nsis/Twoman_0.1.0_x64-setup.exe",
-        HANDOFF_ROOT / "Twoman_0.1.0_x64-setup.exe",
+        WINDOWS_BUNDLE_ROOT / f"nsis/{windows_artifact_name('-setup.exe')}",
+        HANDOFF_ROOT / windows_artifact_name("-setup.exe"),
     )
     copy_required_file(
-        WINDOWS_BUNDLE_ROOT / "msi/Twoman_0.1.0_x64_en-US.msi",
-        HANDOFF_ROOT / "Twoman_0.1.0_x64_en-US.msi",
+        WINDOWS_BUNDLE_ROOT / f"msi/{windows_artifact_name('_en-US.msi')}",
+        HANDOFF_ROOT / windows_artifact_name("_en-US.msi"),
     )
     copy_required_file(
         resolve_sidecar("twoman-helper.exe"),

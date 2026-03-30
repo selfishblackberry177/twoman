@@ -18,6 +18,7 @@ import {
   Trash2,
   Wifi,
   WifiOff,
+  X,
 } from "lucide-react";
 
 import logo from "@/assets/logo.png";
@@ -133,6 +134,7 @@ function formatShareAddress(protocol: SharedProxyProtocol, address: string) {
 function App() {
   const [snapshot, setSnapshot] = useState<DesktopSnapshot | null>(null);
   const [error, setError] = useState("");
+  const [errorVisible, setErrorVisible] = useState(false);
   const [busy, setBusy] = useState(false);
   const [activeShareAction, setActiveShareAction] = useState<{
     action: "start" | "stop";
@@ -144,13 +146,30 @@ function App() {
   const [shareDialog, setShareDialog] = useState<ShareDialogState>({ open: false });
   const [activeLogTarget, setActiveLogTarget] = useState<"helper" | "tunnel" | string>("helper");
 
+  function clearError() {
+    setErrorVisible(false);
+    setError("");
+  }
+
+  function showError(message: string) {
+    setError(message);
+    setErrorVisible(true);
+  }
+
+  function dismissError() {
+    const activeError = error;
+    setErrorVisible(false);
+    window.setTimeout(() => {
+      setError((current) => (current === activeError ? "" : current));
+    }, 220);
+  }
+
   async function refreshState() {
     try {
       const nextSnapshot = await desktopApi.loadSnapshot();
       setSnapshot(nextSnapshot);
-      setError("");
     } catch (nextError) {
-      setError(normalizeError(nextError));
+      showError(normalizeError(nextError));
     }
   }
 
@@ -161,6 +180,19 @@ function App() {
     }, 1500);
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (!error) {
+      return;
+    }
+    setErrorVisible(true);
+    const hideTimer = window.setTimeout(() => setErrorVisible(false), 4400);
+    const clearTimer = window.setTimeout(() => setError(""), 4680);
+    return () => {
+      window.clearTimeout(hideTimer);
+      window.clearTimeout(clearTimer);
+    };
+  }, [error]);
 
   const selectedProfile = useMemo(() => {
     if (!snapshot) {
@@ -192,9 +224,9 @@ function App() {
     try {
       const nextSnapshot = await action();
       setSnapshot(nextSnapshot);
-      setError("");
+      clearError();
     } catch (nextError) {
-      setError(normalizeError(nextError));
+      showError(normalizeError(nextError));
       try {
         const latestSnapshot = await desktopApi.loadSnapshot();
         setSnapshot(latestSnapshot);
@@ -219,10 +251,10 @@ function App() {
           ? await desktopApi.startShare(shareId)
           : await desktopApi.stopShare(shareId);
       setSnapshot(nextSnapshot);
-      setError("");
+      clearError();
     } catch (nextError) {
       const message = normalizeError(nextError);
-      setError(message);
+      showError(message);
       setShareErrors((current) => ({ ...current, [shareId]: message }));
     } finally {
       setActiveShareAction(null);
@@ -234,10 +266,10 @@ function App() {
     try {
       const nextSnapshot = await desktopApi.saveProfile(draft);
       setSnapshot(nextSnapshot);
-      setError("");
+      clearError();
       setProfileDialog({ open: false });
     } catch (nextError) {
-      setError(normalizeError(nextError));
+      showError(normalizeError(nextError));
     } finally {
       setBusy(false);
     }
@@ -248,10 +280,10 @@ function App() {
     try {
       const nextSnapshot = await desktopApi.saveShare(draft);
       setSnapshot(nextSnapshot);
-      setError("");
+      clearError();
       setShareDialog({ open: false });
     } catch (nextError) {
-      setError(normalizeError(nextError));
+      showError(normalizeError(nextError));
     } finally {
       setBusy(false);
     }
@@ -284,15 +316,48 @@ function App() {
   async function handleCopy(text: string) {
     try {
       await navigator.clipboard.writeText(text);
-      setError("");
+      clearError();
     } catch (nextError) {
-      setError(normalizeError(nextError));
+      showError(normalizeError(nextError));
     }
   }
 
   return (
     <TooltipProvider>
       <main className="app-shell">
+        {error ? (
+          <div className="pointer-events-none fixed inset-x-0 top-4 z-50 flex justify-center px-4">
+            <div
+              aria-live="polite"
+              className={cn(
+                "pointer-events-auto w-full max-w-[720px] rounded-[22px] border border-rose-300/28 bg-[#1a1014]/96 px-4 py-3 text-left shadow-[0_22px_50px_rgba(255,122,157,0.2)] backdrop-blur-xl transition-[transform,opacity] duration-200 ease-out",
+                errorVisible ? "translate-y-0 opacity-100" : "-translate-y-4 opacity-0",
+              )}
+              role="status"
+            >
+              <div className="flex items-start gap-3">
+                <div className="mt-0.5 rounded-full border border-rose-200/18 bg-rose-300/12 p-1.5">
+                  <AlertCircle className="h-4 w-4 text-rose-100" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-[11px] font-medium uppercase tracking-[0.28em] text-rose-100/70">
+                    Needs attention
+                  </p>
+                  <p className="mt-1 whitespace-pre-wrap text-sm text-rose-50/92">{error}</p>
+                </div>
+                <button
+                  className="rounded-full border border-white/10 bg-white/4 p-1.5 text-white/58 transition-colors duration-150 hover:bg-white/10 hover:text-white"
+                  onClick={dismissError}
+                  type="button"
+                >
+                  <X className="h-4 w-4" />
+                  <span className="sr-only">Dismiss</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
         <div className="app-frame">
           <aside className="app-sidebar overflow-hidden">
             <div className="flex h-full min-h-0 flex-col gap-3 overflow-hidden">
@@ -333,15 +398,6 @@ function App() {
                   </div>
                 </CardContent>
               </Card>
-
-              {error ? (
-                <Card className="panel-shell shrink-0 border-rose-400/30 bg-rose-400/6">
-                  <CardContent className="flex items-start gap-3 p-3.5">
-                    <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-200" />
-                    <p className="whitespace-pre-wrap text-sm text-rose-50/92">{error}</p>
-                  </CardContent>
-                </Card>
-              ) : null}
 
               <Card className="panel-shell min-h-0 flex-1">
                 <CardHeader className="pb-3">
@@ -854,7 +910,7 @@ function App() {
               setImportDialog({ open: false });
               void runAction(() => desktopApi.saveProfile(imported));
             } catch (nextError) {
-              setError(normalizeError(nextError));
+              showError(normalizeError(nextError));
             }
           }}
           state={importDialog}
