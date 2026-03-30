@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum ConnectionMode {
     Proxy,
     System,
+    Tunnel,
 }
 
 impl Default for ConnectionMode {
@@ -83,6 +84,7 @@ pub struct PersistedSettings {
 pub struct PlatformInfo {
     pub os: String,
     pub system_mode_supported: bool,
+    pub tunnel_mode_supported: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,9 +94,12 @@ pub struct ConnectionStatus {
     pub mode: ConnectionMode,
     pub active_profile_id: Option<String>,
     pub helper_pid: Option<u32>,
+    pub tunnel_pid: Option<u32>,
     pub http_port: Option<u16>,
     pub socks_port: Option<u16>,
     pub system_proxy_enabled: bool,
+    pub tunnel_active: bool,
+    pub tunnel_interface_name: Option<String>,
     pub message: String,
 }
 
@@ -128,6 +133,7 @@ pub struct DesktopSnapshot {
     pub connection: ConnectionStatus,
     pub share_statuses: Vec<ShareStatus>,
     pub helper_log_tail: String,
+    pub tunnel_log_tail: String,
     pub share_log_tails: Vec<ShareLogTail>,
     pub logs_dir: String,
     pub config_dir: String,

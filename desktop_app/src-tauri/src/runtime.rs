@@ -21,7 +21,8 @@ use crate::{
     storage::{
         helper_config_path, helper_log_path, helper_pid_path, load_profiles, load_settings, load_shares,
         normalize_mode_for_platform, normalize_settings, read_log_tail, save_profiles, save_settings,
-        save_shares, share_config_path, share_log_path, share_pid_path, validate_profile, validate_share, AppPaths,
+        save_shares, share_config_path, share_log_path, share_pid_path, tunnel_config_path,
+        tunnel_log_path, tunnel_pid_path, tunnel_work_dir, validate_profile, validate_share, AppPaths,
     },
     system_proxy::SystemProxyManager,
 };
@@ -29,6 +30,8 @@ use crate::{
 const PORT_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
 const PORT_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const LOG_TAIL_LINES: usize = 40;
+const TUNNEL_WAIT_TIMEOUT: Duration = Duration::from_secs(18);
+const TUNNEL_INTERFACE_NAME: &str = "Twoman Tunnel";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -45,6 +48,14 @@ struct ManagedHelper {
 }
 
 #[derive(Debug)]
+struct ManagedTunnel {
+    child: Child,
+    log_path: PathBuf,
+    pid_path: PathBuf,
+    interface_name: String,
+}
+
+#[derive(Debug)]
 struct ManagedShare {
     child: Child,
     listen_host: String,
@@ -57,6 +68,7 @@ struct RuntimeState {
     phase: ConnectionPhase,
     message: String,
     helper: Option<ManagedHelper>,
+    tunnel: Option<ManagedTunnel>,
     shares: HashMap<String, ManagedShare>,
 }
 
@@ -66,6 +78,7 @@ impl Default for RuntimeState {
             phase: ConnectionPhase::Disconnected,
             message: String::new(),
             helper: None,
+            tunnel: None,
             shares: HashMap::new(),
         }
     }
@@ -105,9 +118,15 @@ impl DesktopRuntime {
                 mode: helper.mode.clone(),
                 active_profile_id: Some(helper.profile_id.clone()),
                 helper_pid: Some(helper.child.id()),
+                tunnel_pid: state.tunnel.as_ref().map(|tunnel| tunnel.child.id()),
                 http_port: Some(helper.http_port),
                 socks_port: Some(helper.socks_port),
                 system_proxy_enabled: helper.system_proxy_enabled,
+                tunnel_active: state.tunnel.is_some(),
+                tunnel_interface_name: state
+                    .tunnel
+                    .as_ref()
+                    .map(|tunnel| tunnel.interface_name.clone()),
                 message: state.message.clone(),
             }
         } else {
@@ -116,9 +135,12 @@ impl DesktopRuntime {
                 mode: settings.connection_mode.clone(),
                 active_profile_id: None,
                 helper_pid: None,
+                tunnel_pid: None,
                 http_port: None,
                 socks_port: None,
                 system_proxy_enabled: false,
+                tunnel_active: false,
+                tunnel_interface_name: None,
                 message: state.message.clone(),
             }
         };
@@ -161,9 +183,11 @@ impl DesktopRuntime {
         let platform = PlatformInfo {
             os: std::env::consts::OS.to_string(),
             system_mode_supported: cfg!(windows),
+            tunnel_mode_supported: cfg!(windows),
         };
 
         let helper_tail = read_log_tail(&helper_log_path, LOG_TAIL_LINES);
+        let tunnel_tail = read_log_tail(&tunnel_log_path(&self.paths), LOG_TAIL_LINES);
         Ok(DesktopSnapshot {
             platform,
             selected_profile_id: settings.selected_profile_id,
@@ -173,6 +197,7 @@ impl DesktopRuntime {
             connection,
             share_statuses,
             helper_log_tail: helper_tail,
+            tunnel_log_tail: tunnel_tail,
             share_log_tails,
             logs_dir: self.paths.logs_dir.display().to_string(),
             config_dir: self.paths.config_dir.display().to_string(),
@@ -270,10 +295,23 @@ impl DesktopRuntime {
         state.phase = ConnectionPhase::Connecting;
         state.message = format!("Starting {}", profile.name);
 
+        if matches!(settings.connection_mode, ConnectionMode::Tunnel) && !windows_supports_tunnel() {
+            state.phase = ConnectionPhase::Error;
+            state.message =
+                "Tunnel mode requires Administrator on Windows. Reopen Twoman as Administrator to create the TUN interface."
+                    .into();
+            return Err(state.message.clone());
+        }
+
         let helper = self.spawn_helper(&profile, settings.connection_mode.clone())?;
         if matches!(settings.connection_mode, ConnectionMode::System) {
             SystemProxyManager::enable(&self.paths, helper.http_port)?;
         }
+        let tunnel = if matches!(settings.connection_mode, ConnectionMode::Tunnel) {
+            Some(self.spawn_tunnel(helper.socks_port)?)
+        } else {
+            None
+        };
 
         let connected_message = if helper.used_fallback_ports {
             format!("Connected via {} on alternate local ports", profile.name)
@@ -290,6 +328,12 @@ impl DesktopRuntime {
             log_path: helper.log_path,
             pid_path: helper.pid_path,
             system_proxy_enabled: matches!(settings.connection_mode, ConnectionMode::System),
+        });
+        state.tunnel = tunnel.map(|runtime_tunnel| ManagedTunnel {
+            child: runtime_tunnel.child,
+            log_path: runtime_tunnel.log_path,
+            pid_path: runtime_tunnel.pid_path,
+            interface_name: TUNNEL_INTERFACE_NAME.to_string(),
         });
         state.phase = ConnectionPhase::Connected;
         state.message = connected_message;
@@ -357,6 +401,10 @@ impl DesktopRuntime {
 
         if helper_died.is_some() {
             self.stop_all_shares_locked(state)?;
+            if let Some(mut tunnel) = state.tunnel.take() {
+                terminate_child(&mut tunnel.child);
+                let _ = fs::remove_file(&tunnel.pid_path);
+            }
             if let Some(helper) = state.helper.take() {
                 if helper.system_proxy_enabled {
                     let _ = SystemProxyManager::disable(&self.paths);
@@ -367,6 +415,41 @@ impl DesktopRuntime {
                     .last()
                     .unwrap_or("Helper exited unexpectedly")
                     .to_string();
+            }
+        }
+
+        let tunnel_died = if let Some(tunnel) = state.tunnel.as_mut() {
+            match tunnel.child.try_wait() {
+                Ok(Some(status)) => Some(status.code().unwrap_or(-1)),
+                Ok(None) => None,
+                Err(error) => {
+                    state.phase = ConnectionPhase::Error;
+                    state.message = format!("failed to inspect tunnel: {error}");
+                    Some(-1)
+                }
+            }
+        } else {
+            None
+        };
+
+        if tunnel_died.is_some() {
+            self.stop_all_shares_locked(state)?;
+            if let Some(mut tunnel) = state.tunnel.take() {
+                terminate_child(&mut tunnel.child);
+                let _ = fs::remove_file(&tunnel.pid_path);
+                state.phase = ConnectionPhase::Error;
+                state.message = read_log_tail(&tunnel.log_path, LOG_TAIL_LINES)
+                    .lines()
+                    .last()
+                    .unwrap_or("Tunnel exited unexpectedly")
+                    .to_string();
+            }
+            if let Some(mut helper) = state.helper.take() {
+                if helper.system_proxy_enabled {
+                    let _ = SystemProxyManager::disable(&self.paths);
+                }
+                terminate_child(&mut helper.child);
+                let _ = fs::remove_file(&helper.pid_path);
             }
         }
 
@@ -394,6 +477,11 @@ impl DesktopRuntime {
         state.phase = ConnectionPhase::Disconnecting;
         state.message = "Disconnecting".into();
         self.stop_all_shares_locked(state)?;
+        if let Some(mut tunnel) = state.tunnel.take() {
+            terminate_child(&mut tunnel.child);
+            terminate_pid_file(&tunnel.pid_path);
+            let _ = fs::remove_file(&tunnel.pid_path);
+        }
         if let Some(mut helper) = state.helper.take() {
             if helper.system_proxy_enabled {
                 let _ = SystemProxyManager::disable(&self.paths);
@@ -509,6 +597,7 @@ impl DesktopRuntime {
                 match mode {
                     ConnectionMode::Proxy => "proxy",
                     ConnectionMode::System => "system",
+                    ConnectionMode::Tunnel => "tunnel",
                 },
                 read_log_tail(&log_path, LOG_TAIL_LINES)
             ));
@@ -521,6 +610,149 @@ impl DesktopRuntime {
             http_port: helper_ports.http_port,
             socks_port: helper_ports.socks_port,
             used_fallback_ports: helper_ports.used_fallback,
+        })
+    }
+
+    fn spawn_tunnel(&self, helper_socks_port: u16) -> Result<SpawnedProcess, String> {
+        let log_path = tunnel_log_path(&self.paths);
+        let config_path = tunnel_config_path(&self.paths);
+        let pid_path = tunnel_pid_path(&self.paths);
+        let work_dir = tunnel_work_dir(&self.paths);
+        terminate_pid_file(&pid_path);
+        let _ = fs::remove_file(&pid_path);
+        fs::create_dir_all(&work_dir)
+            .map_err(|error| format!("failed to create {}: {error}", work_dir.display()))?;
+        fs::write(
+            &config_path,
+            serde_json::to_vec_pretty(&json!({
+                "log": {
+                    "level": "info",
+                    "timestamp": true,
+                },
+                "dns": {
+                    "servers": [
+                        {
+                            "type": "https",
+                            "tag": "remote",
+                            "server": "1.1.1.1",
+                            "server_port": 443,
+                            "path": "/dns-query",
+                            "tls": {
+                                "enabled": true,
+                                "server_name": "cloudflare-dns.com",
+                            },
+                            "strategy": "prefer_ipv4",
+                            "detour": "proxy",
+                        },
+                        {
+                            "type": "local",
+                            "tag": "local",
+                        }
+                    ],
+                    "final": "remote",
+                    "strategy": "prefer_ipv4",
+                },
+                "inbounds": [
+                    {
+                        "type": "tun",
+                        "tag": "tun-in",
+                        "interface_name": TUNNEL_INTERFACE_NAME,
+                        "address": [
+                            "172.19.0.1/30",
+                            "fdfe:dcba:9876::1/126",
+                        ],
+                        "auto_route": true,
+                        "strict_route": true,
+                        "stack": "mixed",
+                        "sniff": true,
+                        "sniff_override_destination": true,
+                        "route_exclude_address": [
+                            "127.0.0.0/8",
+                            "10.0.0.0/8",
+                            "100.64.0.0/10",
+                            "169.254.0.0/16",
+                            "172.16.0.0/12",
+                            "192.168.0.0/16",
+                            "224.0.0.0/4",
+                            "::1/128",
+                            "fc00::/7",
+                            "fe80::/10",
+                        ],
+                    }
+                ],
+                "outbounds": [
+                    {
+                        "type": "socks",
+                        "tag": "proxy",
+                        "server": "127.0.0.1",
+                        "server_port": helper_socks_port,
+                        "version": "5",
+                    },
+                    {
+                        "type": "direct",
+                        "tag": "direct",
+                    }
+                ],
+                "route": {
+                    "rules": [
+                        {
+                            "action": "sniff",
+                        },
+                        {
+                            "type": "logical",
+                            "mode": "or",
+                            "rules": [
+                                {
+                                    "protocol": "dns",
+                                },
+                                {
+                                    "port": 53,
+                                }
+                            ],
+                            "action": "hijack-dns",
+                        },
+                        {
+                            "ip_is_private": true,
+                            "outbound": "direct",
+                        }
+                    ],
+                    "final": "proxy",
+                    "auto_detect_interface": true,
+                    "default_domain_resolver": "local",
+                }
+            }))
+            .map_err(|error| format!("failed to serialize tunnel config: {error}"))?,
+        )
+        .map_err(|error| format!("failed to write tunnel config: {error}"))?;
+
+        let mut child = spawn_runtime_command(
+            self.runtime_program_kind("tunnel", &config_path)?,
+            &log_path,
+        )?;
+        if !wait_for_log_marker(
+            &mut child,
+            &log_path,
+            &[
+                "sing-box started",
+                "started at",
+            ],
+            TUNNEL_WAIT_TIMEOUT,
+        ) {
+            terminate_child(&mut child);
+            terminate_pid_file(&pid_path);
+            return Err(format!(
+                "tunnel failed to start\n{}\nTunnel mode uses a Windows TUN adapter and may require Administrator approval the first time it installs or opens the adapter.",
+                read_log_tail(&log_path, LOG_TAIL_LINES)
+            ));
+        }
+
+        Ok(SpawnedProcess {
+            child,
+            log_path,
+            pid_path,
+            http_port: 0,
+            socks_port: 0,
+            used_fallback_ports: false,
         })
     }
 
@@ -582,22 +814,15 @@ impl DesktopRuntime {
         let env_var = match kind {
             "helper" => "TWOMAN_HELPER_BIN",
             "gateway" => "TWOMAN_GATEWAY_BIN",
+            "tunnel" => "TWOMAN_TUNNEL_BIN",
             _ => return Err("unknown runtime kind".into()),
         };
         if let Ok(env_bin) = std::env::var(env_var) {
-            return Ok(ProgramSpec {
-                executable: PathBuf::from(env_bin),
-                args: vec!["--config".into(), config_path.display().to_string()],
-                working_dir: None,
-            });
+            return Ok(program_spec_for_kind(kind, PathBuf::from(env_bin), config_path, &self.paths));
         }
 
         if let Some(sidecar) = self.find_sidecar(kind) {
-            return Ok(ProgramSpec {
-                executable: sidecar,
-                args: vec!["--config".into(), config_path.display().to_string()],
-                working_dir: None,
-            });
+            return Ok(program_spec_for_kind(kind, sidecar, config_path, &self.paths));
         }
 
         runtime_program_from_source(kind, config_path)
@@ -636,6 +861,37 @@ struct ProgramSpec {
     working_dir: Option<PathBuf>,
 }
 
+fn program_spec_for_kind(
+    kind: &str,
+    executable: PathBuf,
+    config_path: &Path,
+    paths: &AppPaths,
+) -> ProgramSpec {
+    match kind {
+        "tunnel" => tunnel_program_spec(executable, config_path, tunnel_work_dir(paths)),
+        _ => ProgramSpec {
+            executable,
+            args: vec!["--config".into(), config_path.display().to_string()],
+            working_dir: None,
+        },
+    }
+}
+
+fn tunnel_program_spec(executable: PathBuf, config_path: &Path, working_dir: PathBuf) -> ProgramSpec {
+    ProgramSpec {
+        executable,
+        args: vec![
+            "run".into(),
+            "-c".into(),
+            config_path.display().to_string(),
+            "-D".into(),
+            working_dir.display().to_string(),
+            "--disable-color".into(),
+        ],
+        working_dir: None,
+    }
+}
+
 fn runtime_program_from_source(kind: &str, config_path: &Path) -> Result<ProgramSpec, String> {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -647,6 +903,23 @@ fn runtime_program_from_source(kind: &str, config_path: &Path) -> Result<Program
             repo_root.join("desktop_client/socks_gateway.py"),
             python_launcher(),
         ),
+        "tunnel" => {
+            let sidecar_path = repo_root
+                .join("desktop_app/src-tauri/resources/sidecars")
+                .join(platform_sidecar_folder())
+                .join(sidecar_name("tunnel"));
+            if sidecar_path.exists() {
+                let working_dir = repo_root.join("desktop_app/src-tauri/target/tunnel-runtime");
+                fs::create_dir_all(&working_dir)
+                    .map_err(|error| format!("failed to create {}: {error}", working_dir.display()))?;
+                return Ok(tunnel_program_spec(
+                    sidecar_path,
+                    config_path,
+                    working_dir,
+                ));
+            }
+            return Err("no source-mode tunnel runtime is available; build or bundle the Windows tunnel sidecar".into())
+        }
         _ => return Err("unknown runtime kind".into()),
     };
     if script_path.exists() {
@@ -807,6 +1080,27 @@ fn wait_for_listener_start(
     false
 }
 
+fn wait_for_log_marker(
+    child: &mut Child,
+    log_path: &Path,
+    markers: &[&str],
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return false,
+            Ok(None) => {}
+        }
+        let tail = read_log_tail(log_path, 12);
+        if markers.iter().any(|marker| tail.contains(marker)) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+    false
+}
+
 fn port_bound(host: &str, port: u16) -> bool {
     let bind_host = if host == "0.0.0.0" || host == "::" {
         "127.0.0.1"
@@ -944,6 +1238,33 @@ fn terminate_pid(pid: u32) {
     command.stderr(Stdio::null());
     command.creation_flags(CREATE_NO_WINDOW);
     let _ = command.status();
+}
+
+#[cfg(windows)]
+fn windows_supports_tunnel() -> bool {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[bool]([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+#[cfg(not(windows))]
+fn windows_supports_tunnel() -> bool {
+    false
 }
 
 #[cfg(not(windows))]

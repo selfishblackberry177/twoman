@@ -12,6 +12,7 @@ What it does:
 - profile import/export text compatible with the Android client
 - `Proxy` mode for local SOCKS + HTTP listeners
 - `System proxy` mode on Windows, implemented as Windows system proxy management
+- `Tunnel` mode on Windows, implemented as a TUN sidecar routed into the local Twoman SOCKS helper
 - authenticated public SOCKS and HTTP proxies that forward into the local Twoman helper
 - copyable helper/share logs inside the app
 
@@ -57,7 +58,14 @@ For the current live method, the user-facing fields are:
 - start the Twoman local helper
 - point the current user’s Windows system HTTP/HTTPS proxy settings at the helper’s local HTTP port
 
-It is not a kernel VPN.
+`Tunnel` mode on Windows means:
+- start the Twoman local helper
+- start a bundled `sing-box` TUN sidecar
+- route Windows traffic through a real TUN interface into the helper’s local SOCKS port
+- hijack DNS into the tunnel path while excluding private LAN ranges from capture
+
+This is a real system tunnel, not just Windows proxy settings.
+On Windows, creating the TUN interface requires Administrator privileges.
 
 ## Sidecar Builds
 
@@ -79,6 +87,9 @@ The sidecars are written to:
 - `src-tauri/resources/sidecars/linux/`
 - `src-tauri/resources/sidecars/windows/`
 
+On Windows, the sidecar build also downloads the pinned `sing-box` release for
+the TUN runtime and stages it as `twoman-tunnel.exe`.
+
 ## Portable Windows Build
 
 Portable Windows distribution should be shipped as a folder or zip, not just the installer.
@@ -87,6 +98,7 @@ Portable layout:
 - `Twoman.exe`
 - `sidecars/windows/twoman-helper.exe`
 - `sidecars/windows/twoman-gateway.exe`
+- `sidecars/windows/twoman-tunnel.exe`
 - `portable-data/`
 - `twoman-portable`
 
@@ -107,7 +119,9 @@ Portable data paths:
 - `portable-data/config/shares.json`
 - `portable-data/config/settings.json`
 - `portable-data/runtime/helper.json`
+- `portable-data/runtime/tunnel.json`
 - `portable-data/twoman-logs/helper.log`
+- `portable-data/twoman-logs/tunnel.log`
 
 Package the portable handoff after a Windows build:
 
@@ -160,14 +174,30 @@ That test covers:
 - authenticated shared HTTP proxy egress
 - disconnect
 
+Windows-only tunnel validation:
+
+```bash
+cd desktop_app/src-tauri
+TWOMAN_E2E_BROKER_BASE_URL='https://<public-host>/<path>' \
+TWOMAN_E2E_CLIENT_TOKEN='<client-token>' \
+TWOMAN_E2E_ENABLE_TUNNEL='true' \
+cargo test live_connect_tunnel_disconnect_flow -- --ignored --nocapture
+```
+
+That test covers:
+- baseline direct egress
+- tunnel connect
+- direct egress through the Windows tunnel
+- disconnect and route restoration
+
 ## Learning Notes
 
 The desktop app is intentionally split into:
 - a modern GUI shell
-- a separately managed tunnel runtime
+- separately managed helper/share/tunnel runtimes
 
 That keeps the UI replaceable without rewriting the helper protocol path each time.
 
 ## Why This Matters
 
-The previous Windows client kept failing because UI lifecycle and process lifecycle were tangled together inside one Python desktop shell. This Tauri app keeps the connection state machine in one place and treats helper/share processes as managed runtime components, which is the right production pattern for a desktop network client.
+The previous Windows client kept failing because UI lifecycle and process lifecycle were tangled together inside one Python desktop shell. This Tauri app keeps the connection state machine in one place and treats helper/share/tunnel processes as managed runtime components, which is the right production pattern for a desktop network client.

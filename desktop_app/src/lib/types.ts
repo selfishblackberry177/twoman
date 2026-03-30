@@ -1,4 +1,4 @@
-export type ConnectionMode = "proxy" | "system";
+export type ConnectionMode = "proxy" | "system" | "tunnel";
 export type SharedProxyProtocol = "socks" | "http";
 export type ConnectionPhase =
   | "disconnected"
@@ -40,6 +40,7 @@ export type SharedProxy = {
 export type PlatformInfo = {
   os: string;
   systemModeSupported: boolean;
+  tunnelModeSupported: boolean;
 };
 
 export type ConnectionStatus = {
@@ -47,9 +48,12 @@ export type ConnectionStatus = {
   mode: ConnectionMode;
   activeProfileId: string | null;
   helperPid: number | null;
+  tunnelPid: number | null;
   httpPort: number | null;
   socksPort: number | null;
   systemProxyEnabled: boolean;
+  tunnelActive: boolean;
+  tunnelInterfaceName: string | null;
   message: string;
 };
 
@@ -77,6 +81,7 @@ export type DesktopSnapshot = {
   connection: ConnectionStatus;
   shareStatuses: ShareStatus[];
   helperLogTail: string;
+  tunnelLogTail: string;
   shareLogTails: ShareLogTail[];
   logsDir: string;
   configDir: string;

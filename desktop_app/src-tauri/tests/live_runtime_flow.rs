@@ -85,6 +85,44 @@ fn curl_via_proxy(proxy: &str) -> String {
     panic!("curl failed for all probe urls via {proxy}");
 }
 
+fn curl_direct() -> String {
+    for url in ["https://api.ipify.org", "http://api.ipify.org"] {
+        let output = Command::new("curl")
+            .args(["--max-time", "45", url])
+            .output()
+            .expect("failed to run curl");
+        if output.status.success() {
+            let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !result.is_empty() {
+                return result;
+            }
+        }
+    }
+    panic!("direct curl failed for all probe urls");
+}
+
+#[cfg(windows)]
+fn windows_is_elevated() -> bool {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[bool]([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)",
+        ])
+        .output()
+        .expect("failed to run elevation probe");
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .eq_ignore_ascii_case("true")
+}
+
+#[cfg(not(windows))]
+fn windows_is_elevated() -> bool {
+    false
+}
+
 #[test]
 #[ignore = "requires live Twoman broker credentials"]
 fn live_connect_share_disconnect_flow() {
@@ -203,6 +241,80 @@ fn live_connect_share_disconnect_flow() {
     let reconnect_snapshot = runtime.snapshot().expect("reconnect snapshot failed");
     assert_eq!(reconnect_snapshot.connection.phase, ConnectionPhase::Connected);
     runtime.disconnect().expect("final disconnect failed");
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+#[ignore = "requires live Twoman broker credentials and Windows tunnel support"]
+fn live_connect_tunnel_disconnect_flow() {
+    if !cfg!(windows) {
+        eprintln!("skipping tunnel flow; Windows only");
+        return;
+    }
+    if !windows_is_elevated() {
+        eprintln!("skipping tunnel flow; requires Administrator on Windows");
+        return;
+    }
+    let enabled = env::var("TWOMAN_E2E_ENABLE_TUNNEL")
+        .ok()
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !enabled {
+        eprintln!("skipping tunnel flow; set TWOMAN_E2E_ENABLE_TUNNEL=true");
+        return;
+    }
+
+    let Some(profile) = live_profile() else {
+        eprintln!(
+            "skipping live flow; set TWOMAN_E2E_BROKER_BASE_URL and TWOMAN_E2E_CLIENT_TOKEN"
+        );
+        return;
+    };
+
+    let baseline_ip = curl_direct();
+    let paths = temp_paths();
+    let temp_root = paths
+        .config_dir
+        .parent()
+        .expect("temp config dir should have a parent")
+        .to_path_buf();
+    let runtime = DesktopRuntime::new(paths.clone(), None);
+    runtime.save_profile(profile.clone()).expect("save_profile failed");
+    runtime
+        .set_selected_profile(Some(profile.id.clone()))
+        .expect("set_selected_profile failed");
+    runtime
+        .set_mode(ConnectionMode::Tunnel)
+        .expect("set_mode failed");
+    runtime.connect().expect("connect failed");
+
+    let snapshot = runtime.snapshot().expect("snapshot failed after tunnel connect");
+    assert_eq!(snapshot.connection.phase, ConnectionPhase::Connected);
+    assert!(
+        snapshot.connection.tunnel_active,
+        "tunnel should report active after connect"
+    );
+
+    let tunneled_ip = curl_direct();
+    assert_ne!(
+        baseline_ip, tunneled_ip,
+        "tunnel mode should change direct egress IP"
+    );
+
+    runtime.disconnect().expect("disconnect failed");
+    let final_snapshot = runtime.snapshot().expect("snapshot failed after tunnel disconnect");
+    assert_eq!(final_snapshot.connection.phase, ConnectionPhase::Disconnected);
+    assert!(
+        !final_snapshot.connection.tunnel_active,
+        "tunnel should report inactive after disconnect"
+    );
+
+    let restored_ip = curl_direct();
+    assert_eq!(
+        baseline_ip, restored_ip,
+        "direct egress should restore after disconnect"
+    );
 
     let _ = fs::remove_dir_all(temp_root);
 }

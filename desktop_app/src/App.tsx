@@ -8,6 +8,7 @@ import {
   LaptopMinimalCheck,
   LoaderCircle,
   Logs,
+  Network,
   Pencil,
   PlugZap,
   Plus,
@@ -114,6 +115,17 @@ function shareProtocolLabel(protocol: SharedProxyProtocol) {
   return protocol === "http" ? "HTTP" : "SOCKS";
 }
 
+function connectionModeLabel(mode: ConnectionMode) {
+  switch (mode) {
+    case "system":
+      return "System proxy";
+    case "tunnel":
+      return "Tunnel";
+    default:
+      return "Proxy";
+  }
+}
+
 function formatShareAddress(protocol: SharedProxyProtocol, address: string) {
   return protocol === "http" ? `http://${address}` : address;
 }
@@ -130,7 +142,7 @@ function App() {
   const [profileDialog, setProfileDialog] = useState<ProfileDialogState>({ open: false });
   const [importDialog, setImportDialog] = useState<ImportDialogState>({ open: false });
   const [shareDialog, setShareDialog] = useState<ShareDialogState>({ open: false });
-  const [activeLogTarget, setActiveLogTarget] = useState<"helper" | string>("helper");
+  const [activeLogTarget, setActiveLogTarget] = useState<"helper" | "tunnel" | string>("helper");
 
   async function refreshState() {
     try {
@@ -169,6 +181,9 @@ function App() {
     }
     if (activeLogTarget === "helper") {
       return snapshot.helperLogTail;
+    }
+    if (activeLogTarget === "tunnel") {
+      return snapshot.tunnelLogTail;
     }
     return snapshot.shareLogTails.find((entry) => entry.shareId === activeLogTarget)?.tail ?? "";
   }, [activeLogTarget, snapshot]);
@@ -252,6 +267,9 @@ function App() {
       return;
     }
     if (mode === "system" && !snapshot.platform.systemModeSupported) {
+      return;
+    }
+    if (mode === "tunnel" && !snapshot.platform.tunnelModeSupported) {
       return;
     }
     await runAction(() => desktopApi.setConnectionMode(mode));
@@ -450,7 +468,7 @@ function App() {
                       Connect this device
                     </h2>
                     <p className="mt-1.5 text-sm text-white/56">
-                      Choose a route, then connect in proxy or system proxy mode.
+                      Choose a route, then connect in proxy, system proxy, or tunnel mode.
                     </p>
                   </div>
                   <div className="flex items-center gap-2 rounded-full border border-white/10 bg-[#0b0c0f] p-1">
@@ -467,6 +485,13 @@ function App() {
                       icon={<LaptopMinimalCheck className="h-4 w-4" />}
                       label="System proxy"
                       onClick={() => void handleModeChange("system")}
+                    />
+                    <ModeButton
+                      active={selectedMode === "tunnel"}
+                      disabled={busy || !snapshot?.platform.tunnelModeSupported}
+                      icon={<Network className="h-4 w-4" />}
+                      label="Tunnel"
+                      onClick={() => void handleModeChange("tunnel")}
                     />
                   </div>
                 </div>
@@ -521,14 +546,21 @@ function App() {
                         label="State"
                         value={phaseLabel(connection?.phase ?? "disconnected")}
                       />
-                      <DetailRow
-                        label="Mode"
-                        value={selectedMode === "proxy" ? "Proxy" : "System proxy"}
-                      />
+                      <DetailRow label="Mode" value={connectionModeLabel(selectedMode)} />
                       {selectedMode === "system" ? (
                         <DetailRow
                           label="Windows proxy"
                           value={connection?.systemProxyEnabled ? "On" : "Off"}
+                        />
+                      ) : null}
+                      {selectedMode === "tunnel" ? (
+                        <DetailRow
+                          label="Tunnel"
+                          value={
+                            connection?.tunnelActive
+                              ? connection.tunnelInterfaceName ?? "Active"
+                              : "Off"
+                          }
                         />
                       ) : null}
                       {connection?.phase === "error" && connection.message ? (
@@ -567,6 +599,17 @@ function App() {
                         <Logs className="h-4 w-4" />
                         Helper
                       </Button>
+                      {snapshot?.platform.tunnelModeSupported ? (
+                        <Button
+                          className="h-10 rounded-full"
+                          onClick={() => setActiveLogTarget("tunnel")}
+                          size="sm"
+                          variant={activeLogTarget === "tunnel" ? "secondary" : "outline"}
+                        >
+                          <Network className="h-4 w-4" />
+                          Tunnel
+                        </Button>
+                      ) : null}
                       {snapshot?.shareStatuses.map((shareStatus) => (
                         <Button
                           className="h-10 rounded-full"

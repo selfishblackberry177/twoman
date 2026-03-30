@@ -136,6 +136,22 @@ pub fn helper_pid_path(paths: &AppPaths) -> PathBuf {
     paths.runtime_dir.join("helper.pid")
 }
 
+pub fn tunnel_log_path(paths: &AppPaths) -> PathBuf {
+    paths.logs_dir.join("tunnel.log")
+}
+
+pub fn tunnel_config_path(paths: &AppPaths) -> PathBuf {
+    paths.runtime_dir.join("tunnel.json")
+}
+
+pub fn tunnel_pid_path(paths: &AppPaths) -> PathBuf {
+    paths.runtime_dir.join("tunnel.pid")
+}
+
+pub fn tunnel_work_dir(paths: &AppPaths) -> PathBuf {
+    paths.runtime_dir.join("tunnel-data")
+}
+
 pub fn share_config_path(paths: &AppPaths, share_id: &str) -> PathBuf {
     paths.runtime_dir.join(format!("share-{share_id}.json"))
 }

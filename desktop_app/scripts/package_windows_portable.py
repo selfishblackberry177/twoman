@@ -63,7 +63,7 @@ def write_portable_markers() -> None:
             "Twoman portable runtime data lives here.\n"
             "- config/: saved routes, shares, and settings\n"
             "- runtime/: generated helper/share configs\n"
-            "- twoman-logs/: helper and shared SOCKS logs\n"
+            "- twoman-logs/: helper, tunnel, and shared proxy logs\n"
         ),
         encoding="utf-8",
     )
@@ -101,6 +101,10 @@ def main() -> None:
     copy_required_file(
         resolve_sidecar("twoman-gateway.exe"),
         SIDECAR_ROOT / "twoman-gateway.exe",
+    )
+    copy_required_file(
+        resolve_sidecar("twoman-tunnel.exe"),
+        SIDECAR_ROOT / "twoman-tunnel.exe",
     )
     write_portable_markers()
     zip_path = build_zip()

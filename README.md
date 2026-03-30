@@ -40,7 +40,7 @@ What it is not:
 - `local_client/helper.py`: local HTTP + SOCKS5 helper
 - `hidden_server/agent.py`: hidden reverse agent
 - `android-client/`: Android client with saved profiles, share/import profile text, proxy mode, and VPN mode
-- `desktop_app/`: Tauri desktop GUI with saved profiles, Proxy/System proxy mode, and authenticated external SOCKS/HTTP sharing
+- `desktop_app/`: Tauri desktop GUI with saved profiles, Proxy/System proxy/Tunnel mode on Windows, and authenticated external SOCKS/HTTP sharing
 - `desktop_client/`: legacy Python desktop TUI and runtime utilities
 - `host/node_selector/broker.js`: CloudLinux Node selector broker for managed-host deployments
 - `host/runtime/http_broker_daemon.py`: asyncio broker for bridge-style cPanel deployments

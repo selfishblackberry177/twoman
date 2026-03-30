@@ -50,6 +50,7 @@ type MockState = {
   connection: ConnectionStatus;
   shareStatuses: ShareStatus[];
   helperLogTail: string;
+  tunnelLogTail: string;
   shareLogTails: Array<{ shareId: string; tail: string }>;
 };
 
@@ -102,9 +103,12 @@ const mockState: MockState = {
     mode: "proxy",
     activeProfileId: "profile-default",
     helperPid: 24816,
+    tunnelPid: null,
     httpPort: 28167,
     socksPort: 21167,
     systemProxyEnabled: false,
+    tunnelActive: false,
+    tunnelInterfaceName: null,
     message: "Connected via Default",
   },
   shareStatuses: [
@@ -129,6 +133,8 @@ const mockState: MockState = {
   ],
   helperLogTail:
     "[Desktop]\\n2026-03-29 16:02:11 INFO connect requested\\n[Helper]\\n2026-03-29 16:02:12 INFO helper started transport=http\\n2026-03-29 16:02:14 INFO proxy ready socks=21167 http=28167\\n",
+  tunnelLogTail:
+    "[Tunnel]\\n2026-03-29 16:02:14 INFO sing-box started\\n2026-03-29 16:02:14 INFO inbound/tun[tun-in]: started at Twoman Tunnel\\n",
   shareLogTails: [
     {
       shareId: "share-home",
@@ -147,6 +153,7 @@ function snapshotFromState(): DesktopSnapshot {
     platform: {
       os: "windows",
       systemModeSupported: true,
+      tunnelModeSupported: true,
     },
     selectedProfileId: mockState.selectedProfileId,
     connectionMode: mockState.connectionMode,
@@ -155,6 +162,7 @@ function snapshotFromState(): DesktopSnapshot {
     connection: mockState.connection,
     shareStatuses: mockState.shareStatuses,
     helperLogTail: mockState.helperLogTail,
+    tunnelLogTail: mockState.tunnelLogTail,
     shareLogTails: mockState.shareLogTails,
     logsDir: "C:\\Twoman\\portable-data\\twoman-logs",
     configDir: "C:\\Twoman\\portable-data\\config",
@@ -173,6 +181,10 @@ function updateConnection(phase: ConnectionPhase, message: string) {
     httpPort: activeProfile?.httpPort ?? null,
     message,
     systemProxyEnabled: mockState.connectionMode === "system" && phase === "connected",
+    tunnelActive: mockState.connectionMode === "tunnel" && phase === "connected",
+    tunnelPid: mockState.connectionMode === "tunnel" && phase === "connected" ? 24870 : null,
+    tunnelInterfaceName:
+      mockState.connectionMode === "tunnel" && phase === "connected" ? "Twoman Tunnel" : null,
   };
 }
 
@@ -239,7 +251,7 @@ export const mockDesktopApi = {
     updateConnection(
       mockState.connection.phase,
       mockState.connection.phase === "connected"
-        ? `Connected via ${mode === "proxy" ? "proxy mode" : "system mode"}`
+        ? `Connected via ${mode === "proxy" ? "proxy mode" : mode === "system" ? "system proxy" : "tunnel mode"}`
         : "Disconnected",
     );
     return snapshotFromState();
