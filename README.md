@@ -40,7 +40,8 @@ What it is not:
 - `local_client/helper.py`: local HTTP + SOCKS5 helper
 - `hidden_server/agent.py`: hidden reverse agent
 - `android-client/`: Android client with saved profiles, share/import profile text, proxy mode, and VPN mode
-- `desktop_client/`: cross-platform desktop TUI with saved profiles, connect/disconnect, and authenticated external SOCKS sharing
+- `desktop_app/`: Tauri desktop GUI with saved profiles, Proxy/System proxy mode, and authenticated external SOCKS/HTTP sharing
+- `desktop_client/`: legacy Python desktop TUI and runtime utilities
 - `host/node_selector/broker.js`: CloudLinux Node selector broker for managed-host deployments
 - `host/runtime/http_broker_daemon.py`: asyncio broker for bridge-style cPanel deployments
 - `host/app/bridge_runtime.php`: PHP bootstrap that starts and supervises the bridge broker
@@ -57,7 +58,12 @@ Backend families:
 
 Backend overview: [docs/BACKENDS.md](docs/BACKENDS.md)
 Android client notes: [android-client/README.md](android-client/README.md)
-Desktop client notes: [desktop_client/README.md](desktop_client/README.md)
+Desktop app notes: [desktop_app/README.md](desktop_app/README.md)
+Legacy TUI notes: [desktop_client/README.md](desktop_client/README.md)
+
+Portable Windows note:
+- the desktop app only uses app-local state if the packaged build includes `portable-data/` or `twoman-portable` beside `Twoman.exe`
+- the repo ships a portable packager at `desktop_app/scripts/package_windows_portable.py` so that layout is reproducible
 
 ## Architecture
 

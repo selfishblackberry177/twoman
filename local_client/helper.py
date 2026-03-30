@@ -56,6 +56,7 @@ TRACE_ENABLED = os.environ.get("TWOMAN_TRACE", "").strip().lower() in ("1", "tru
 LOGGER = logging.getLogger("twoman.helper")
 RUNTIME_LOG_PATH = ""
 FAULT_LOG_HANDLE = None
+PID_FILE_PATH = ""
 
 
 def trace(message):
@@ -107,16 +108,46 @@ def configure_runtime_logging(config_path, config):
     file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     LOGGER.addHandler(file_handler)
 
-    console_handler = logging.StreamHandler(sys.stderr)
-    console_handler.setLevel(logging.DEBUG if TRACE_ENABLED else logging.WARNING)
-    console_handler.setFormatter(logging.Formatter("[helper] %(levelname)s %(message)s"))
-    LOGGER.addHandler(console_handler)
+    if sys.stderr is not None:
+        console_handler = logging.StreamHandler(sys.stderr)
+        console_handler.setLevel(logging.DEBUG if TRACE_ENABLED else logging.WARNING)
+        console_handler.setFormatter(logging.Formatter("[helper] %(levelname)s %(message)s"))
+        LOGGER.addHandler(console_handler)
 
     FAULT_LOG_HANDLE = open(RUNTIME_LOG_PATH, "a", encoding="utf-8")
     faulthandler.enable(FAULT_LOG_HANDLE, all_threads=True)
     sys.excepthook = log_unhandled_exception
     threading.excepthook = log_thread_exception
     LOGGER.info("helper logging initialized log_path=%s", RUNTIME_LOG_PATH)
+
+
+def configure_pid_file(config_path, config):
+    global PID_FILE_PATH
+    configured_pid_file = str(config.get("pid_file", "")).strip()
+    if not configured_pid_file:
+        PID_FILE_PATH = ""
+        return
+    if os.path.isabs(configured_pid_file):
+        PID_FILE_PATH = configured_pid_file
+    else:
+        PID_FILE_PATH = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(config_path)), configured_pid_file))
+    pid_dir = os.path.dirname(PID_FILE_PATH)
+    if pid_dir:
+        os.makedirs(pid_dir, exist_ok=True)
+
+
+def write_pid_file():
+    if not PID_FILE_PATH:
+        return
+    with open(PID_FILE_PATH, "w", encoding="utf-8") as handle:
+        handle.write(str(os.getpid()))
+
+
+def remove_pid_file():
+    if not PID_FILE_PATH:
+        return
+    with contextlib.suppress(OSError):
+        os.remove(PID_FILE_PATH)
 
 
 def log_unhandled_exception(exc_type, exc_value, exc_traceback):
@@ -127,6 +158,8 @@ def log_unhandled_exception(exc_type, exc_value, exc_traceback):
 
 
 def log_thread_exception(args):
+    if is_benign_network_error(getattr(args, "exc_value", None)):
+        return
     LOGGER.critical(
         "unhandled helper thread exception thread=%s",
         getattr(args.thread, "name", "unknown"),
@@ -141,7 +174,37 @@ def log_asyncio_exception(loop, context):
     if exception is None:
         LOGGER.error("asyncio loop exception message=%s", message)
         return
+    if is_benign_network_error(exception):
+        return
     LOGGER.error("asyncio loop exception message=%s", message, exc_info=(type(exception), exception, exception.__traceback__))
+
+
+def is_benign_network_error(error):
+    if error is None:
+        return False
+    if isinstance(error, asyncio.CancelledError):
+        return True
+    if isinstance(error, asyncio.IncompleteReadError):
+        return True
+    if isinstance(error, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+        return True
+    if isinstance(error, OSError) and getattr(error, "winerror", None) in {64, 995, 10053, 10054}:
+        return True
+    nested = getattr(error, "__cause__", None) or getattr(error, "__context__", None)
+    if nested is not None and nested is not error:
+        return is_benign_network_error(nested)
+    return False
+
+
+async def close_writer_quietly(writer):
+    if writer.is_closing():
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+        return
+    with contextlib.suppress(Exception):
+        writer.close()
+    with contextlib.suppress(Exception):
+        await writer.wait_closed()
 
 
 def handle_shutdown_signal(signum, _frame):
@@ -566,8 +629,7 @@ async def relay_stream(runtime, stream, reader, writer, initial_payload=b"", con
             with contextlib.suppress(Exception):
                 await stream.finish()
         await runtime.release_stream(stream.stream_id)
-        writer.close()
-        await writer.wait_closed()
+        await close_writer_quietly(writer)
 
 
 async def handle_http(runtime, reader, writer):
@@ -576,8 +638,7 @@ async def handle_http(runtime, reader, writer):
         while not recv_until_headers(buffer) and len(buffer) < 65536:
             chunk = await reader.read(4096)
             if not chunk:
-                writer.close()
-                await writer.wait_closed()
+                await close_writer_quietly(writer)
                 return
             buffer += chunk
         request_line, headers, rest = parse_request_headers(buffer)
@@ -593,17 +654,23 @@ async def handle_http(runtime, reader, writer):
         stream = runtime.new_stream(host, port)
         await relay_stream(runtime, stream, reader, writer, initial_payload=initial_payload, connected_response=connected_response)
     except Exception as error:
+        if is_benign_network_error(error):
+            await close_writer_quietly(writer)
+            return
         LOGGER.warning("http proxy request failed error=%s", error)
         body = str(error).encode("utf-8", errors="replace")
-        writer.write(
-            b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: "
-            + str(len(body)).encode("ascii")
-            + b"\r\n\r\n"
-            + body
-        )
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
+        try:
+            writer.write(
+                b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: "
+                + str(len(body)).encode("ascii")
+                + b"\r\n\r\n"
+                + body
+            )
+            await writer.drain()
+        except Exception as write_error:
+            if not is_benign_network_error(write_error):
+                LOGGER.warning("http proxy error response failed error=%s", write_error)
+        await close_writer_quietly(writer)
 
 
 async def handle_socks(runtime, reader, writer):
@@ -639,14 +706,13 @@ async def handle_socks(runtime, reader, writer):
         await writer.drain()
         await relay_stream(runtime, stream, reader, writer, open_stream=False)
     except Exception as error:
-        LOGGER.warning("socks proxy request failed error=%s", error)
+        if not is_benign_network_error(error):
+            LOGGER.warning("socks proxy request failed error=%s", error)
         if stream is not None:
             with contextlib.suppress(Exception):
                 await stream.reset("socks failure")
             await runtime.release_stream(stream.stream_id)
-        with contextlib.suppress(Exception):
-            writer.close()
-            await writer.wait_closed()
+        await close_writer_quietly(writer)
 
 
 async def main_async(config):
@@ -703,18 +769,23 @@ def main():
     args = parser.parse_args()
     config = load_config(args.config)
     configure_runtime_logging(args.config, config)
+    configure_pid_file(args.config, config)
     for signum in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
         if signum is None:
             continue
         with contextlib.suppress(ValueError):
             signal.signal(signum, handle_shutdown_signal)
     try:
+        write_pid_file()
         asyncio.run(main_async(config))
     except KeyboardInterrupt:
         LOGGER.info("helper interrupted by user")
+        raise SystemExit(0)
     except Exception:
         LOGGER.exception("helper crashed")
-        raise
+        raise SystemExit(1)
+    finally:
+        remove_pid_file()
 
 
 if __name__ == "__main__":
