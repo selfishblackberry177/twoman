@@ -295,49 +295,78 @@ impl DesktopRuntime {
         state.phase = ConnectionPhase::Connecting;
         state.message = format!("Starting {}", profile.name);
 
-        if matches!(settings.connection_mode, ConnectionMode::Tunnel) && !windows_supports_tunnel() {
-            state.phase = ConnectionPhase::Error;
-            state.message =
-                "Tunnel mode requires Administrator on Windows. Reopen Twoman as Administrator to create the TUN interface."
-                    .into();
-            return Err(state.message.clone());
+        let connection_result = (|| -> Result<
+            (
+                SpawnedProcess,
+                Option<SpawnedProcess>,
+                String,
+                ConnectionMode,
+                String,
+            ),
+            String,
+        > {
+            if matches!(settings.connection_mode, ConnectionMode::Tunnel) && !windows_supports_tunnel()
+            {
+                return Err(
+                    "Tunnel mode requires Administrator on Windows. Reopen Twoman as Administrator to create the TUN interface."
+                        .into(),
+                );
+            }
+
+            let helper = self.spawn_helper(&profile, settings.connection_mode.clone())?;
+            if matches!(settings.connection_mode, ConnectionMode::System) {
+                SystemProxyManager::enable(&self.paths, helper.http_port)?;
+            }
+            let tunnel = if matches!(settings.connection_mode, ConnectionMode::Tunnel) {
+                Some(self.spawn_tunnel(helper.socks_port)?)
+            } else {
+                None
+            };
+
+            let connected_message = if helper.used_fallback_ports {
+                format!("Connected via {} on alternate local ports", profile.name)
+            } else {
+                format!("Connected via {}", profile.name)
+            };
+
+            Ok((
+                helper,
+                tunnel,
+                connected_message,
+                settings.connection_mode.clone(),
+                profile.id.clone(),
+            ))
+        })();
+
+        match connection_result {
+            Ok((helper, tunnel, connected_message, mode, profile_id)) => {
+                state.helper = Some(ManagedHelper {
+                    child: helper.child,
+                    profile_id,
+                    mode: mode.clone(),
+                    http_port: helper.http_port,
+                    socks_port: helper.socks_port,
+                    log_path: helper.log_path,
+                    pid_path: helper.pid_path,
+                    system_proxy_enabled: matches!(mode, ConnectionMode::System),
+                });
+                state.tunnel = tunnel.map(|runtime_tunnel| ManagedTunnel {
+                    child: runtime_tunnel.child,
+                    log_path: runtime_tunnel.log_path,
+                    pid_path: runtime_tunnel.pid_path,
+                    interface_name: TUNNEL_INTERFACE_NAME.to_string(),
+                });
+                state.phase = ConnectionPhase::Connected;
+                state.message = connected_message;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.disconnect_locked(&mut state);
+                state.phase = ConnectionPhase::Error;
+                state.message = error.clone();
+                Err(error)
+            }
         }
-
-        let helper = self.spawn_helper(&profile, settings.connection_mode.clone())?;
-        if matches!(settings.connection_mode, ConnectionMode::System) {
-            SystemProxyManager::enable(&self.paths, helper.http_port)?;
-        }
-        let tunnel = if matches!(settings.connection_mode, ConnectionMode::Tunnel) {
-            Some(self.spawn_tunnel(helper.socks_port)?)
-        } else {
-            None
-        };
-
-        let connected_message = if helper.used_fallback_ports {
-            format!("Connected via {} on alternate local ports", profile.name)
-        } else {
-            format!("Connected via {}", profile.name)
-        };
-
-        state.helper = Some(ManagedHelper {
-            child: helper.child,
-            profile_id: profile.id.clone(),
-            mode: settings.connection_mode.clone(),
-            http_port: helper.http_port,
-            socks_port: helper.socks_port,
-            log_path: helper.log_path,
-            pid_path: helper.pid_path,
-            system_proxy_enabled: matches!(settings.connection_mode, ConnectionMode::System),
-        });
-        state.tunnel = tunnel.map(|runtime_tunnel| ManagedTunnel {
-            child: runtime_tunnel.child,
-            log_path: runtime_tunnel.log_path,
-            pid_path: runtime_tunnel.pid_path,
-            interface_name: TUNNEL_INTERFACE_NAME.to_string(),
-        });
-        state.phase = ConnectionPhase::Connected;
-        state.message = connected_message;
-        Ok(())
     }
 
     pub fn disconnect(&self) -> Result<(), String> {
@@ -641,7 +670,6 @@ impl DesktopRuntime {
                                 "enabled": true,
                                 "server_name": "cloudflare-dns.com",
                             },
-                            "strategy": "prefer_ipv4",
                             "detour": "proxy",
                         },
                         {

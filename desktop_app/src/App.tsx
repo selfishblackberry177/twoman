@@ -195,6 +195,12 @@ function App() {
       setError("");
     } catch (nextError) {
       setError(normalizeError(nextError));
+      try {
+        const latestSnapshot = await desktopApi.loadSnapshot();
+        setSnapshot(latestSnapshot);
+      } catch {
+        // Keep the current UI state if the runtime snapshot cannot be refreshed.
+      }
     } finally {
       setBusy(false);
     }
