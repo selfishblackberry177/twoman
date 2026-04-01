@@ -255,7 +255,7 @@ run_admin_mode restart
 
 echo "Checking Node broker health..."
 sleep 3
-curl -sk "https://${TWOMAN_PUBLIC_HOST}${TWOMAN_NODE_APP_URI}/health" | python3 -c '
+curl -sk -H "Authorization: Bearer ${TWOMAN_CLIENT_TOKEN}" "https://${TWOMAN_PUBLIC_HOST}${TWOMAN_NODE_APP_URI}/health" | python3 -c '
 import json, sys
 payload = json.load(sys.stdin)
 if not payload.get("ok"):

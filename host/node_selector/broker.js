@@ -1201,6 +1201,11 @@ function connectionHeaders(req) {
   };
 }
 
+function isObserverAuthorized(req) {
+  const identity = connectionHeaders(req);
+  return state.auth("helper", identity.token) || state.auth("agent", identity.token);
+}
+
 async function handleConnectProbe(req, res, url) {
   const host = url.searchParams.get("host") || "";
   const port = Number(url.searchParams.get("port") || "0");
@@ -1335,23 +1340,44 @@ async function handleLaneDownStream(peer, lane, res) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
   const route = state.normalizePath(url.pathname);
+  const healthPublic = Boolean(loadedConfig.health_public);
   if (isHealthRoute(route)) {
+    if (!healthPublic && !isObserverAuthorized(req)) {
+      jsonResponse(res, 403, { error: "forbidden" });
+      return;
+    }
     jsonResponse(res, 200, state.stats());
     return;
   }
   if (route === "/pid") {
+    if (!healthPublic && !isObserverAuthorized(req)) {
+      jsonResponse(res, 403, { error: "forbidden" });
+      return;
+    }
     jsonResponse(res, 200, { pid: process.pid });
     return;
   }
   if (route === "/connect-probe") {
+    if (!healthPublic && !isObserverAuthorized(req)) {
+      jsonResponse(res, 403, { error: "forbidden" });
+      return;
+    }
     await handleConnectProbe(req, res, url);
     return;
   }
   if (route === "/stream") {
+    if (!healthPublic && !isObserverAuthorized(req)) {
+      jsonResponse(res, 403, { error: "forbidden" });
+      return;
+    }
     handleChunkStream(res);
     return;
   }
   if (route === "/upload_probe" && req.method === "POST") {
+    if (!healthPublic && !isObserverAuthorized(req)) {
+      jsonResponse(res, 403, { error: "forbidden" });
+      return;
+    }
     await handleUploadProbe(req, res);
     return;
   }

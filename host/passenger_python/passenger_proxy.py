@@ -2,6 +2,7 @@
 
 import contextlib
 import fcntl
+import json
 import os
 import signal
 import socket
@@ -38,6 +39,59 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+
+
+def _allowed_observer_tokens():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return set()
+    allowed = set()
+    for key in ("client_tokens", "agent_tokens"):
+        values = payload.get(key)
+        if not isinstance(values, list):
+            continue
+        for entry in values:
+            token = str(entry or "").strip()
+            if token:
+                allowed.add(token)
+    return allowed
+
+
+def _extract_bearer_token(environ):
+    authorization = str(environ.get("HTTP_AUTHORIZATION", "") or "").strip()
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return ""
+
+
+def _observer_path(environ):
+    path = str(environ.get("PATH_INFO", "") or "/")
+    normalized = "/" + path.lstrip("/")
+    return (
+        normalized.endswith("/health")
+        or normalized.endswith("/pid")
+        or normalized.endswith("/connect-probe")
+        or normalized.endswith("/stream")
+        or normalized.endswith("/upload_probe")
+    )
+
+
+def _probe_bearer_token():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return ""
+    for key in ("client_tokens", "agent_tokens"):
+        values = payload.get(key)
+        if isinstance(values, list):
+            for item in values:
+                token = str(item or "").strip()
+                if token:
+                    return token
+    return ""
 
 
 def daemon_script_path():
@@ -101,14 +155,18 @@ def ping_daemon(timeout_seconds=1.5):
     if not os.path.exists(SOCKET_PATH):
         return False
     try:
+        token = _probe_bearer_token()
+        headers = [
+            b"GET /health HTTP/1.1",
+            b"Host: localhost",
+        ]
+        if token:
+            headers.append(("Authorization: Bearer %s" % token).encode("ascii", "ignore"))
+        headers.extend([b"Connection: close", b"", b""])
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(timeout_seconds)
             client.connect(SOCKET_PATH)
-            client.sendall(
-                b"GET /health HTTP/1.1\r\n"
-                b"Host: localhost\r\n"
-                b"Connection: close\r\n\r\n"
-            )
+            client.sendall(b"\r\n".join(headers))
             chunks = []
             while True:
                 chunk = client.recv(8192)
@@ -340,6 +398,19 @@ class ProxyBodyIterator(object):
 
 def application(environ, start_response):
     try:
+        if _observer_path(environ):
+            token = _extract_bearer_token(environ)
+            if token not in _allowed_observer_tokens():
+                body = b'{"error":"forbidden"}'
+                start_response(
+                    "403 Forbidden",
+                    [
+                        ("Content-Type", "application/json"),
+                        ("Content-Length", str(len(body))),
+                        ("Cache-Control", "no-store"),
+                    ],
+                )
+                return [body]
         client, response_file = send_request_to_daemon(environ)
         status, headers, header_map = parse_response_headers(response_file)
         iterator = ProxyBodyIterator(client, response_file, header_map)

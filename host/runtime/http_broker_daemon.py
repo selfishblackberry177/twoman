@@ -629,6 +629,14 @@ class AsyncBrokerServer(object):
                 self.config.get("base_uri") or self.config.get("route_base_path"),
             )
             if is_health_path(request_path, self.config.get("health_template")):
+                identity = extract_connection_identity(headers, self.config)
+                token = identity["token"]
+                health_public = bool(self.config.get("health_public", False))
+                if not health_public and not (
+                    await self.state.auth("helper", token) or await self.state.auth("agent", token)
+                ):
+                    await self._send_json(writer, 403, {"error": "forbidden"})
+                    return
                 await self._send_json(writer, 200, {"ok": True, "stats": await self.state.stats()})
                 return
 

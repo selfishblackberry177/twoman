@@ -176,7 +176,10 @@ HELPER_SOCKS_PORT="$(read_listen_port "$TMP_DIR/helper-listen-state.json" socks_
 wait_for_port 127.0.0.1 "$HELPER_HTTP_PORT" http-helper
 wait_for_port 127.0.0.1 "$HELPER_SOCKS_PORT" socks-helper
 
-curl --fail --silent --show-error "http://127.0.0.1:18093/api/v1/telemetry/health" > "$TMP_DIR/health.json"
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer test-client-token" \
+  "http://127.0.0.1:18093/api/v1/telemetry/health" \
+  > "$TMP_DIR/health.json"
 
 python3 - "$TMP_DIR/health.json" <<'PY'
 import json, sys

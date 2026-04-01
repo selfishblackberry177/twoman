@@ -671,6 +671,11 @@ def application(environ, start_response):
     path = normalize_path(raw_path)
 
     if is_health_path(path, _CONFIG.get("health_template")):
+        identity = extract_connection_identity(headers, _CONFIG)
+        token = identity["token"]
+        health_public = bool(_CONFIG.get("health_public", False))
+        if not health_public and not (_STATE.auth("helper", token) or _STATE.auth("agent", token)):
+            return json_response(start_response, 403, {"error": "forbidden"})
         return json_response(start_response, 200, _STATE.stats())
 
     route = parse_lane_path(path, _CONFIG.get("route_template"))
