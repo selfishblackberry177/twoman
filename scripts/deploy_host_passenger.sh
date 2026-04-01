@@ -89,6 +89,8 @@ require_env TWOMAN_PUBLIC_ORIGIN
 require_env TWOMAN_CLIENT_TOKEN
 require_env TWOMAN_AGENT_TOKEN
 
+TWOMAN_CAMOUFLAGE_SITE_ENABLED="${TWOMAN_CAMOUFLAGE_SITE_ENABLED:-false}"
+TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID="${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID:-}"
 TWOMAN_PUBLIC_BASE_PATH="${TWOMAN_PUBLIC_BASE_PATH:-/twoman}"
 TWOMAN_APP_NAME="${TWOMAN_APP_NAME:-twoman_py}"
 TWOMAN_APP_ROOT="${TWOMAN_APP_ROOT:-${TWOMAN_CPANEL_HOME}/twoman_passenger}"
@@ -96,6 +98,42 @@ if [ -z "${TWOMAN_ROUTE_TEMPLATE:-}" ]; then
   TWOMAN_ROUTE_TEMPLATE='/{lane}/{direction}'
 fi
 TWOMAN_HEALTH_TEMPLATE="${TWOMAN_HEALTH_TEMPLATE:-/health}"
+
+CAMOUFLAGE_MANIFEST_PATH=""
+cleanup() {
+  if [ -n "${CAMOUFLAGE_MANIFEST_PATH:-}" ] && [ -f "${CAMOUFLAGE_MANIFEST_PATH}" ]; then
+    rm -f "${CAMOUFLAGE_MANIFEST_PATH}"
+  fi
+}
+trap cleanup EXIT
+
+json_get() {
+  local json_path="$1"
+  local field_name="$2"
+  python3 - <<'PY' "${json_path}" "${field_name}"
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+print(payload[sys.argv[2]])
+PY
+}
+
+if [ "${TWOMAN_CAMOUFLAGE_SITE_ENABLED}" = "true" ]; then
+  if [ -z "${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID}" ]; then
+    TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID="$(python3 - <<'PY'
+import secrets
+print(secrets.token_hex(6))
+PY
+)"
+  fi
+  CAMOUFLAGE_MANIFEST_PATH="$(mktemp)"
+  python3 scripts/generate_camouflage_site.py --deployment-id "${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID}" > "${CAMOUFLAGE_MANIFEST_PATH}"
+  if [ -z "${TWOMAN_PUBLIC_BASE_PATH:-}" ] || [ "${TWOMAN_PUBLIC_BASE_PATH}" = "/twoman" ]; then
+    TWOMAN_PUBLIC_BASE_PATH="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "passenger_base_path")"
+  fi
+fi
 
 APP_RELATIVE="${TWOMAN_APP_ROOT#${TWOMAN_CPANEL_HOME}/}"
 REMOTE_TMP_DIR="${TWOMAN_APP_ROOT}/tmp"
@@ -127,6 +165,12 @@ EOF
 )"
 
 echo "Uploading Passenger host app files..."
+if [ -n "${CAMOUFLAGE_MANIFEST_PATH}" ]; then
+  CAMOUFLAGE_SITE_SLUG="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "site_slug")"
+  CAMOUFLAGE_SITE_HTML="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "landing_html")"
+  ensure_remote_dir "public_html/${CAMOUFLAGE_SITE_SLUG}"
+  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "index.html" "${CAMOUFLAGE_SITE_HTML}"
+fi
 ensure_remote_dir "${APP_RELATIVE}"
 ensure_remote_dir "${APP_RELATIVE}/tmp"
 ensure_remote_dir "${APP_RELATIVE}/logs"
@@ -163,8 +207,21 @@ echo "Passenger register response: ${register_result}"
 
 echo "Checking Passenger broker health..."
 sleep 3
-health_result="$(curl -sk -H "Authorization: Bearer ${TWOMAN_CLIENT_TOKEN}" \
-  "${TWOMAN_PUBLIC_ORIGIN}${TWOMAN_PUBLIC_BASE_PATH}${TWOMAN_HEALTH_TEMPLATE}")"
+health_url="${TWOMAN_PUBLIC_ORIGIN}${TWOMAN_PUBLIC_BASE_PATH}${TWOMAN_HEALTH_TEMPLATE}"
+health_result=""
+for _ in $(seq 1 20); do
+  health_result="$(curl -sk -H "Authorization: Bearer ${TWOMAN_CLIENT_TOKEN}" "${health_url}" || true)"
+  if printf "%s" "${health_result}" | python3 - <<'PY' >/dev/null 2>&1
+import json
+import sys
+payload = json.loads(sys.stdin.read())
+assert payload.get("ok")
+PY
+  then
+    break
+  fi
+  sleep 1
+done
 echo "${health_result}" | python3 - <<'PY'
 import json,sys
 data=json.load(sys.stdin)
@@ -179,5 +236,9 @@ print(json.dumps({
     "log_paths": stats.get("log_paths"),
 }))
 PY
+if [ -n "${CAMOUFLAGE_MANIFEST_PATH}" ]; then
+  echo "Camouflage site: ${TWOMAN_PUBLIC_ORIGIN}/$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "site_slug")/"
+fi
+echo "Passenger base path: ${TWOMAN_PUBLIC_ORIGIN}${TWOMAN_PUBLIC_BASE_PATH}"
 echo
 echo "Passenger host deployment complete."

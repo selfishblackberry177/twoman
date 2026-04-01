@@ -92,9 +92,14 @@ require_env TWOMAN_PUBLIC_HOST
 require_env TWOMAN_CLIENT_TOKEN
 require_env TWOMAN_AGENT_TOKEN
 
+TWOMAN_CAMOUFLAGE_SITE_ENABLED="${TWOMAN_CAMOUFLAGE_SITE_ENABLED:-false}"
+TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID="${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID:-}"
 TWOMAN_NODE_BUNDLE_PATH="$(mktemp)"
 cleanup() {
   rm -f "${TWOMAN_NODE_BUNDLE_PATH}"
+  if [ -n "${CAMOUFLAGE_MANIFEST_PATH:-}" ] && [ -f "${CAMOUFLAGE_MANIFEST_PATH}" ]; then
+    rm -f "${CAMOUFLAGE_MANIFEST_PATH}"
+  fi
 }
 trap cleanup EXIT
 npx --yes esbuild host/node_selector/broker.js \
@@ -115,9 +120,44 @@ TWOMAN_DOWN_WAIT_CTL_MS="${TWOMAN_DOWN_WAIT_CTL_MS:-1000}"
 TWOMAN_DOWN_WAIT_DATA_MS="${TWOMAN_DOWN_WAIT_DATA_MS:-1000}"
 TWOMAN_STREAMING_DATA_DOWN_HELPER="${TWOMAN_STREAMING_DATA_DOWN_HELPER:-false}"
 
+json_get() {
+  local json_path="$1"
+  local field_name="$2"
+  python3 - <<'PY' "${json_path}" "${field_name}"
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+print(payload[sys.argv[2]])
+PY
+}
+
+CAMOUFLAGE_MANIFEST_PATH=""
+if [ "${TWOMAN_CAMOUFLAGE_SITE_ENABLED}" = "true" ]; then
+  if [ -z "${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID}" ]; then
+    TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID="$(python3 - <<'PY'
+import secrets
+print(secrets.token_hex(6))
+PY
+)"
+  fi
+  CAMOUFLAGE_MANIFEST_PATH="$(mktemp)"
+  python3 scripts/generate_camouflage_site.py --deployment-id "${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID}" > "${CAMOUFLAGE_MANIFEST_PATH}"
+  if [ -z "${TWOMAN_NODE_APP_URI:-}" ] || [ "${TWOMAN_NODE_APP_URI}" = "/twoman-node" ]; then
+    TWOMAN_NODE_APP_URI="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "node_base_path")"
+  fi
+fi
+
 APP_RELATIVE="${TWOMAN_NODE_APP_ROOT#${TWOMAN_CPANEL_HOME}/}"
 ensure_remote_dir "${APP_RELATIVE}"
 ensure_remote_dir "logs"
+if [ -n "${CAMOUFLAGE_MANIFEST_PATH}" ]; then
+  CAMOUFLAGE_SITE_SLUG="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "site_slug")"
+  CAMOUFLAGE_SITE_HTML="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "landing_html")"
+  ensure_remote_dir "public_html/${CAMOUFLAGE_SITE_SLUG}"
+  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "index.html" "${CAMOUFLAGE_SITE_HTML}"
+fi
 
 CONFIG_JSON="$(cat <<EOF
 {
@@ -211,5 +251,9 @@ if not payload.get("ok"):
 print(json.dumps(payload, indent=2))
 '
 delete_remote_file "${TWOMAN_CPANEL_HOME}/public_html" "${TWOMAN_ADMIN_SCRIPT_NAME}"
+if [ -n "${CAMOUFLAGE_MANIFEST_PATH}" ]; then
+  echo "Camouflage site: https://${TWOMAN_PUBLIC_HOST}/$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "site_slug")/"
+fi
+echo "Node base path: https://${TWOMAN_PUBLIC_HOST}${TWOMAN_NODE_APP_URI}"
 echo
 echo "Node selector host deployment complete."
