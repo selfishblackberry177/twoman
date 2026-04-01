@@ -94,6 +94,8 @@ require_env TWOMAN_AGENT_TOKEN
 
 TWOMAN_CAMOUFLAGE_SITE_ENABLED="${TWOMAN_CAMOUFLAGE_SITE_ENABLED:-false}"
 TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID="${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID:-}"
+TWOMAN_CAMOUFLAGE_SITE_NAME="${TWOMAN_CAMOUFLAGE_SITE_NAME:-}"
+TWOMAN_CAMOUFLAGE_SITE_ROOT_INDEX="${TWOMAN_CAMOUFLAGE_SITE_ROOT_INDEX:-true}"
 TWOMAN_NODE_BUNDLE_PATH="$(mktemp)"
 cleanup() {
   rm -f "${TWOMAN_NODE_BUNDLE_PATH}"
@@ -143,7 +145,14 @@ PY
 )"
   fi
   CAMOUFLAGE_MANIFEST_PATH="$(mktemp)"
-  python3 scripts/generate_camouflage_site.py --deployment-id "${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID}" > "${CAMOUFLAGE_MANIFEST_PATH}"
+  if [ -n "${TWOMAN_CAMOUFLAGE_SITE_NAME}" ]; then
+    python3 scripts/generate_camouflage_site.py \
+      --deployment-id "${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID}" \
+      --site-name "${TWOMAN_CAMOUFLAGE_SITE_NAME}" > "${CAMOUFLAGE_MANIFEST_PATH}"
+  else
+    python3 scripts/generate_camouflage_site.py \
+      --deployment-id "${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID}" > "${CAMOUFLAGE_MANIFEST_PATH}"
+  fi
   if [ -z "${TWOMAN_NODE_APP_URI:-}" ] || [ "${TWOMAN_NODE_APP_URI}" = "/twoman-node" ]; then
     TWOMAN_NODE_APP_URI="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "node_base_path")"
   fi
@@ -157,6 +166,9 @@ if [ -n "${CAMOUFLAGE_MANIFEST_PATH}" ]; then
   CAMOUFLAGE_SITE_HTML="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "landing_html")"
   ensure_remote_dir "public_html/${CAMOUFLAGE_SITE_SLUG}"
   upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "index.html" "${CAMOUFLAGE_SITE_HTML}"
+  if [ "${TWOMAN_CAMOUFLAGE_SITE_ROOT_INDEX}" = "true" ]; then
+    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "index.html" "${CAMOUFLAGE_SITE_HTML}"
+  fi
 fi
 
 CONFIG_JSON="$(cat <<EOF
@@ -252,6 +264,9 @@ print(json.dumps(payload, indent=2))
 '
 delete_remote_file "${TWOMAN_CPANEL_HOME}/public_html" "${TWOMAN_ADMIN_SCRIPT_NAME}"
 if [ -n "${CAMOUFLAGE_MANIFEST_PATH}" ]; then
+  if [ "${TWOMAN_CAMOUFLAGE_SITE_ROOT_INDEX}" = "true" ]; then
+    echo "Camouflage root page: https://${TWOMAN_PUBLIC_HOST}/"
+  fi
   echo "Camouflage site: https://${TWOMAN_PUBLIC_HOST}/$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "site_slug")/"
 fi
 echo "Node base path: https://${TWOMAN_PUBLIC_HOST}${TWOMAN_NODE_APP_URI}"

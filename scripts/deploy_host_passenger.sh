@@ -91,6 +91,8 @@ require_env TWOMAN_AGENT_TOKEN
 
 TWOMAN_CAMOUFLAGE_SITE_ENABLED="${TWOMAN_CAMOUFLAGE_SITE_ENABLED:-false}"
 TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID="${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID:-}"
+TWOMAN_CAMOUFLAGE_SITE_NAME="${TWOMAN_CAMOUFLAGE_SITE_NAME:-}"
+TWOMAN_CAMOUFLAGE_SITE_ROOT_INDEX="${TWOMAN_CAMOUFLAGE_SITE_ROOT_INDEX:-true}"
 TWOMAN_PUBLIC_BASE_PATH="${TWOMAN_PUBLIC_BASE_PATH:-/twoman}"
 TWOMAN_APP_NAME="${TWOMAN_APP_NAME:-twoman_py}"
 TWOMAN_APP_ROOT="${TWOMAN_APP_ROOT:-${TWOMAN_CPANEL_HOME}/twoman_passenger}"
@@ -129,7 +131,14 @@ PY
 )"
   fi
   CAMOUFLAGE_MANIFEST_PATH="$(mktemp)"
-  python3 scripts/generate_camouflage_site.py --deployment-id "${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID}" > "${CAMOUFLAGE_MANIFEST_PATH}"
+  if [ -n "${TWOMAN_CAMOUFLAGE_SITE_NAME}" ]; then
+    python3 scripts/generate_camouflage_site.py \
+      --deployment-id "${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID}" \
+      --site-name "${TWOMAN_CAMOUFLAGE_SITE_NAME}" > "${CAMOUFLAGE_MANIFEST_PATH}"
+  else
+    python3 scripts/generate_camouflage_site.py \
+      --deployment-id "${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID}" > "${CAMOUFLAGE_MANIFEST_PATH}"
+  fi
   if [ -z "${TWOMAN_PUBLIC_BASE_PATH:-}" ] || [ "${TWOMAN_PUBLIC_BASE_PATH}" = "/twoman" ]; then
     TWOMAN_PUBLIC_BASE_PATH="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "passenger_base_path")"
   fi
@@ -170,6 +179,9 @@ if [ -n "${CAMOUFLAGE_MANIFEST_PATH}" ]; then
   CAMOUFLAGE_SITE_HTML="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "landing_html")"
   ensure_remote_dir "public_html/${CAMOUFLAGE_SITE_SLUG}"
   upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "index.html" "${CAMOUFLAGE_SITE_HTML}"
+  if [ "${TWOMAN_CAMOUFLAGE_SITE_ROOT_INDEX}" = "true" ]; then
+    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "index.html" "${CAMOUFLAGE_SITE_HTML}"
+  fi
 fi
 ensure_remote_dir "${APP_RELATIVE}"
 ensure_remote_dir "${APP_RELATIVE}/tmp"
@@ -237,6 +249,9 @@ print(json.dumps({
 }))
 PY
 if [ -n "${CAMOUFLAGE_MANIFEST_PATH}" ]; then
+  if [ "${TWOMAN_CAMOUFLAGE_SITE_ROOT_INDEX}" = "true" ]; then
+    echo "Camouflage root page: ${TWOMAN_PUBLIC_ORIGIN}/"
+  fi
   echo "Camouflage site: ${TWOMAN_PUBLIC_ORIGIN}/$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "site_slug")/"
 fi
 echo "Passenger base path: ${TWOMAN_PUBLIC_ORIGIN}${TWOMAN_PUBLIC_BASE_PATH}"
