@@ -5,6 +5,7 @@ import asyncio
 from collections import deque
 import contextlib
 import json
+import logging
 import os
 import sys
 import time
@@ -15,6 +16,14 @@ ROOT_DIR = os.path.dirname(CURRENT_DIR)
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
+from twoman_http import (
+    expected_binary_media_type,
+    extract_connection_identity,
+    is_health_path,
+    normalize_request_path,
+    parse_lane_path,
+    validate_binary_media_type,
+)
 from twoman_protocol import (
     Frame,
     FrameDecoder,
@@ -30,8 +39,20 @@ from twoman_protocol import (
     encode_frame,
     make_error_payload,
 )
+from runtime_diagnostics import (
+    DurableEventRecorder,
+    configure_component_logger,
+    event_log_path,
+    event_log_settings,
+    runtime_log_path,
+    runtime_log_settings,
+)
 
 TRACE_ENABLED = os.environ.get("TWOMAN_TRACE", "").strip().lower() in ("1", "true", "yes", "on", "debug", "verbose")
+LOGGER = logging.getLogger("twoman.http_broker")
+RUNTIME_LOG_PATH = ""
+EVENT_LOG_PATH = ""
+EVENT_RECORDER = None
 
 
 def now_ms():
@@ -41,9 +62,80 @@ def now_ms():
 def trace(message):
     if not TRACE_ENABLED:
         return
+    if LOGGER.handlers:
+        LOGGER.debug(message)
+        return
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
     sys.stderr.write("[%s] [broker] %s\n" % (timestamp, message))
     sys.stderr.flush()
+
+
+def record_event(kind, **fields):
+    if EVENT_RECORDER is None:
+        return
+    try:
+        EVENT_RECORDER.record(kind, component="http-broker", **fields)
+    except Exception:
+        LOGGER.exception("http broker event log write failed kind=%s", kind)
+
+
+def configure_runtime_logging(config_path, config):
+    global RUNTIME_LOG_PATH
+    if LOGGER.handlers:
+        return
+    RUNTIME_LOG_PATH = runtime_log_path(config_path, config, "http-broker.log")
+    settings = runtime_log_settings(config)
+    configure_component_logger(
+        LOGGER,
+        log_path=RUNTIME_LOG_PATH,
+        trace_enabled=TRACE_ENABLED,
+        runtime_log_max_bytes=settings["max_bytes"],
+        runtime_log_backup_count=settings["backup_count"],
+        console_prefix="http-broker",
+    )
+    LOGGER.info(
+        "http broker logging initialized log_path=%s max_bytes=%s backup_count=%s",
+        RUNTIME_LOG_PATH,
+        settings["max_bytes"],
+        settings["backup_count"],
+    )
+
+
+def configure_event_logging(config_path, config):
+    global EVENT_RECORDER, EVENT_LOG_PATH
+    if EVENT_RECORDER is not None:
+        return
+    EVENT_LOG_PATH = event_log_path(config_path, config, "http-broker-events.ndjson")
+    settings = event_log_settings(config)
+    EVENT_RECORDER = DurableEventRecorder(
+        EVENT_LOG_PATH,
+        max_bytes=settings["max_bytes"],
+        backup_count=settings["backup_count"],
+        recent_limit=settings["recent_limit"],
+    )
+    LOGGER.info(
+        "http broker event logging initialized event_log_path=%s max_bytes=%s backup_count=%s",
+        EVENT_LOG_PATH,
+        settings["max_bytes"],
+        settings["backup_count"],
+    )
+
+
+def log_unhandled_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    LOGGER.critical("unhandled http broker exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+
+def log_asyncio_exception(loop, context):
+    del loop
+    exception = context.get("exception")
+    message = context.get("message", "asyncio loop exception")
+    if exception is None:
+        LOGGER.error("asyncio loop exception message=%s", message)
+        return
+    LOGGER.error("asyncio loop exception message=%s", message, exc_info=(type(exception), exception, exception.__traceback__))
 
 
 def padded_payload(payload, minimum_size=1024):
@@ -108,6 +200,7 @@ class StreamState(object):
 
 class BrokerState(object):
     def __init__(self, config):
+        self.config = config
         self.client_tokens = set(config.get("client_tokens", []))
         self.agent_tokens = set(config.get("agent_tokens", []))
         self.peer_ttl_ms = int(config.get("peer_ttl_seconds", 90)) * 1000
@@ -153,6 +246,7 @@ class BrokerState(object):
                 peer = PeerState(role, peer_label, peer_session_id)
                 self.peers[key] = peer
                 trace("peer online role=%s label=%s session=%s" % (role, peer_label, peer_session_id))
+                record_event("peer_online", role=role, peer_label=peer_label, peer_session_id=peer_session_id)
             peer.touch()
             peer.peer_label = peer_label
             if role == "agent":
@@ -166,18 +260,56 @@ class BrokerState(object):
             peer = self.peers.get((role, peer_session_id))
             if peer is None:
                 trace("drop frame type=%s stream=%s target=%s/%s lane=%s reason=no-peer" % (frame.type_id, frame.stream_id, role, peer_session_id, lane))
+                record_event(
+                    "queue_drop",
+                    reason="no-peer",
+                    role=role,
+                    peer_session_id=peer_session_id,
+                    lane=lane,
+                    type_id=frame.type_id,
+                    stream_id=frame.stream_id,
+                )
                 return False
             queue = peer.queues[lane]
             if queue.buffered_bytes >= self.max_lane_bytes:
                 trace("drop frame type=%s stream=%s target=%s/%s lane=%s reason=queue-full buffered=%s" % (frame.type_id, frame.stream_id, role, peer_session_id, lane, queue.buffered_bytes))
+                record_event(
+                    "queue_drop",
+                    reason="queue-full",
+                    role=role,
+                    peer_session_id=peer_session_id,
+                    lane=lane,
+                    type_id=frame.type_id,
+                    stream_id=frame.stream_id,
+                    buffered_bytes=queue.buffered_bytes,
+                )
                 return False
             total_buffered = peer.buffered_bytes_total()
             if total_buffered >= self.max_peer_buffered_bytes:
                 trace("drop frame type=%s stream=%s target=%s/%s lane=%s reason=peer-buffer-full buffered=%s" % (frame.type_id, frame.stream_id, role, peer_session_id, lane, total_buffered))
+                record_event(
+                    "queue_drop",
+                    reason="peer-buffer-full",
+                    role=role,
+                    peer_session_id=peer_session_id,
+                    lane=lane,
+                    type_id=frame.type_id,
+                    stream_id=frame.stream_id,
+                    buffered_bytes=total_buffered,
+                )
                 return False
         await peer.queues[lane].put(payload)
         if frame.type_id != FRAME_DATA:
             trace("queue frame type=%s stream=%s target=%s/%s lane=%s bytes=%s" % (frame.type_id, frame.stream_id, role, peer_session_id, lane, len(payload)))
+            record_event(
+                "queue_ctl",
+                role=role,
+                peer_session_id=peer_session_id,
+                lane=lane,
+                type_id=frame.type_id,
+                stream_id=frame.stream_id,
+                payload_bytes=len(frame.payload),
+            )
         return True
 
     async def handle_frame(self, sender_role, sender_peer_session_id, lane, frame):
@@ -195,6 +327,15 @@ class BrokerState(object):
                 stream = self.streams_by_agent.get(frame.stream_id)
             if stream is None:
                 trace("drop frame type=%s stream=%s from=%s/%s lane=%s reason=unknown-stream" % (frame.type_id, frame.stream_id, sender_role, sender_peer_session_id, lane))
+                record_event(
+                    "frame_drop",
+                    reason="unknown-stream",
+                    sender_role=sender_role,
+                    sender_peer_session_id=sender_peer_session_id,
+                    lane=lane,
+                    type_id=frame.type_id,
+                    stream_id=frame.stream_id,
+                )
                 return
             stream.touch()
             if sender_role == "helper":
@@ -224,6 +365,18 @@ class BrokerState(object):
                 sender_peer_session_id,
                 LANE_CTL,
                 Frame(FRAME_RST, stream_id=frame.stream_id, payload=make_error_payload("broker queue full")),
+            )
+        elif frame.type_id != FRAME_DATA:
+            record_event(
+                "frame_forward",
+                sender_role=sender_role,
+                sender_peer_session_id=sender_peer_session_id,
+                target_role=target_role,
+                target_peer_session_id=target_peer_session_id,
+                source_lane=lane,
+                type_id=frame.type_id,
+                source_stream_id=frame.stream_id,
+                target_stream_id=outbound_stream_id,
             )
 
         if frame.type_id == FRAME_RST:
@@ -259,8 +412,22 @@ class BrokerState(object):
                     agent_session_id,
                     agent_stream_id,
                 ))
+                record_event(
+                    "open_map",
+                    helper_session_id=helper_session_id,
+                    helper_peer_label=helper_peer_label,
+                    helper_stream_id=frame.stream_id,
+                    agent_session_id=agent_session_id,
+                    agent_stream_id=agent_stream_id,
+                )
         if open_error:
             trace("open fail stream=%s helper=%s reason=%s" % (frame.stream_id, helper_session_id, open_error))
+            record_event(
+                "open_fail",
+                helper_session_id=helper_session_id,
+                helper_stream_id=frame.stream_id,
+                reason=open_error,
+            )
             await self.queue_frame(
                 "helper",
                 helper_session_id,
@@ -270,6 +437,12 @@ class BrokerState(object):
             return
         if not agent_session_id:
             trace("open fail stream=%s helper=%s reason=no-agent" % (frame.stream_id, helper_session_id))
+            record_event(
+                "open_fail",
+                helper_session_id=helper_session_id,
+                helper_stream_id=frame.stream_id,
+                reason="no-agent",
+            )
             await self.queue_frame(
                 "helper",
                 helper_session_id,
@@ -282,6 +455,14 @@ class BrokerState(object):
     def _drop_stream_locked(self, stream):
         self.streams_by_helper.pop((stream.helper_session_id, stream.helper_stream_id), None)
         self.streams_by_agent.pop(stream.agent_stream_id, None)
+        record_event(
+            "drop_stream",
+            helper_session_id=stream.helper_session_id,
+            helper_peer_label=stream.helper_peer_label,
+            helper_stream_id=stream.helper_stream_id,
+            agent_session_id=stream.agent_session_id,
+            agent_stream_id=stream.agent_stream_id,
+        )
         helper_peer = self.peers.get(("helper", stream.helper_session_id))
         if helper_peer is not None and helper_peer.active_streams > 0:
             helper_peer.active_streams -= 1
@@ -309,6 +490,7 @@ class BrokerState(object):
             stale_peers = [key for key, peer in self.peers.items() if peer.last_seen_ms < peer_cutoff]
             for key in stale_peers:
                 role, peer_session_id = key
+                record_event("cleanup_peer_expired", role=role, peer_session_id=peer_session_id)
                 stale_streams_for_peer = [
                     stream
                     for stream in self.streams_by_agent.values()
@@ -324,6 +506,13 @@ class BrokerState(object):
 
             stale_streams = [stream for stream in self.streams_by_agent.values() if stream.last_seen_ms < stream_cutoff]
             for stream in stale_streams:
+                record_event(
+                    "cleanup_stream_expired",
+                    helper_session_id=stream.helper_session_id,
+                    helper_stream_id=stream.helper_stream_id,
+                    agent_session_id=stream.agent_session_id,
+                    agent_stream_id=stream.agent_stream_id,
+                )
                 resets.extend(self._reset_frames_for_stale_stream_locked(stream))
                 self._drop_stream_locked(stream)
 
@@ -378,6 +567,10 @@ class BrokerState(object):
                 "streams": len(self.streams_by_agent),
                 "agent_peer_label": self.agent_peer_label,
                 "agent_session_id": self.agent_session_id,
+                "log_paths": {
+                    "runtime": RUNTIME_LOG_PATH,
+                    "events": EVENT_LOG_PATH,
+                },
                 "max_streams_per_peer_session": self.max_streams_per_peer_session,
                 "max_open_rate_per_peer_session": self.max_open_rate_per_peer_session,
                 "open_rate_window_seconds": int(self.open_rate_window_ms / 1000),
@@ -386,6 +579,7 @@ class BrokerState(object):
                 "buffered_pri_bytes": buffered["pri"],
                 "buffered_bulk_bytes": buffered["bulk"],
                 "metrics": self.metrics,
+                "recent_events": EVENT_RECORDER.snapshot(64) if EVENT_RECORDER is not None else [],
             }
 
     def lane_profile(self, lane):
@@ -397,15 +591,26 @@ class BrokerState(object):
 
 
 class AsyncBrokerServer(object):
-    def __init__(self, host, port, config):
+    def __init__(self, host, port, config, unix_socket_path=None):
         self.host = host
-        self.port = int(port)
+        self.port = int(port) if port is not None else 0
+        self.unix_socket_path = unix_socket_path
+        self.config = config
+        self.binary_media_type = expected_binary_media_type(config)
         self.state = BrokerState(config)
+        self.down_wait_ms = self._normalize_down_wait_ms(config.get("down_wait_ms"))
+        self.streaming_ctl_down_helper = bool(config.get("streaming_ctl_down_helper", True))
+        self.streaming_data_down_helper = bool(config.get("streaming_data_down_helper", True))
         self.server = None
         self.cleanup_task = None
 
     async def start(self):
-        self.server = await asyncio.start_server(self.handle_connection, self.host, self.port)
+        if self.unix_socket_path:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(self.unix_socket_path)
+            self.server = await asyncio.start_unix_server(self.handle_connection, path=self.unix_socket_path)
+        else:
+            self.server = await asyncio.start_server(self.handle_connection, self.host, self.port)
         loop = asyncio.get_event_loop()
         self.cleanup_task = loop.create_task(self._cleanup_loop())
 
@@ -419,37 +624,48 @@ class AsyncBrokerServer(object):
             request_line, headers, body = await self._read_request(reader)
             method, raw_path, _version = request_line.split(" ", 2)
             parsed = urllib.parse.urlsplit(raw_path)
-            if parsed.path == "/health":
+            request_path = normalize_request_path(
+                parsed.path,
+                self.config.get("base_uri") or self.config.get("route_base_path"),
+            )
+            if is_health_path(request_path, self.config.get("health_template")):
                 await self._send_json(writer, 200, {"ok": True, "stats": await self.state.stats()})
                 return
 
-            parts = parsed.path.strip("/").split("/")
-            if len(parts) != 2 or parts[0] not in (list(LANES) + [LANE_DATA]) or parts[1] not in ("up", "down"):
+            route = parse_lane_path(request_path, self.config.get("route_template"))
+            if route is None:
                 await self._send_json(writer, 404, {"error": "not found"})
                 return
 
-            lane = parts[0]
-            direction = parts[1]
-            role = headers.get("x-twoman-role", "")
-            peer_label = headers.get("x-twoman-peer", "")
-            peer_session_id = headers.get("x-twoman-session", "")
-            token = headers.get("x-relay-token", "")
+            lane = route.get("lane", "")
+            direction = route.get("direction", "")
+            if lane not in (list(LANES) + [LANE_DATA]) or direction not in ("up", "down"):
+                await self._send_json(writer, 404, {"error": "not found"})
+                return
+            identity = extract_connection_identity(headers, self.config)
+            role = identity["role"]
+            peer_label = identity["peer_label"]
+            peer_session_id = identity["peer_session_id"]
+            token = identity["token"]
             if not role or not peer_label or not peer_session_id or not await self.state.auth(role, token):
                 await self._send_json(writer, 403, {"error": "invalid role or token"})
                 return
             peer = await self.state.ensure_peer(role, peer_label, peer_session_id)
             if method == "GET" and direction == "down":
                 if lane == LANE_DATA:
-                    if role == "helper":
+                    if role == "helper" and self.streaming_data_down_helper:
                         await self._handle_streaming_data_down(writer, peer)
                     else:
                         await self._handle_data_down(writer, peer)
-                elif lane == LANE_CTL and role == "helper":
+                elif lane == LANE_CTL and role == "helper" and self.streaming_ctl_down_helper:
                     await self._handle_helper_ctl_down(writer, peer)
+                elif lane == LANE_CTL:
+                    await self._handle_ctl_down(writer, peer)
                 else:
                     await self._handle_down(writer, peer, lane)
                 return
             if method == "POST" and direction == "up":
+                validate_binary_media_type(headers.get("content-type", ""), self.config)
                 await self._handle_up(writer, role, peer_session_id, lane, body)
                 return
             await self._send_json(writer, 405, {"error": "method not allowed"})
@@ -464,6 +680,43 @@ class AsyncBrokerServer(object):
             with contextlib.suppress(Exception):
                 writer.close()
                 await writer.wait_closed()
+
+    def _normalize_down_wait_ms(self, configured):
+        values = {"ctl": 1000, "data": 1000}
+        if isinstance(configured, dict):
+            for lane in ("ctl", "data"):
+                try:
+                    if lane in configured:
+                        values[lane] = max(0, int(configured[lane]))
+                except (TypeError, ValueError):
+                    continue
+        return values
+
+    async def _next_ctl_payload(self, peer, wait_timeout_ms):
+        queue = peer.queues[LANE_CTL]
+        try:
+            payload = await asyncio.wait_for(queue.get(), timeout=max(0.0, float(wait_timeout_ms) / 1000.0))
+        except asyncio.TimeoutError:
+            return padded_payload(encode_frame(Frame(FRAME_PING, offset=now_ms())), minimum_size=1024)
+        peer.touch()
+        profile = self.state.lane_profile(LANE_CTL)
+        payloads = [payload]
+        total = len(payload)
+        frames = 1
+        deadline = asyncio.get_event_loop().time() + (float(profile["hold_ms"]) / 1000.0)
+        while total < int(profile["max_bytes"]) and frames < int(profile["max_frames"]):
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                payload = await asyncio.wait_for(queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                break
+            payloads.append(payload)
+            total += len(payload)
+            frames += 1
+        body = b"".join(payloads)
+        return padded_payload(body, minimum_size=int(profile["pad_min"]))
 
     async def _handle_down(self, writer, peer, lane):
         trace("down open role=%s peer=%s session=%s lane=%s" % (peer.role, peer.peer_label, peer.peer_session_id, lane))
@@ -502,15 +755,23 @@ class AsyncBrokerServer(object):
         try:
             writer.write(
                 b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: application/octet-stream\r\n"
-                b"Cache-Control: no-store\r\n"
-                b"Connection: close\r\n"
+                + ("Content-Type: %s\r\n" % self.binary_media_type).encode("ascii")
+                + b"Cache-Control: no-store\r\n"
+                + b"Connection: close\r\n"
                 + ("Content-Length: %d\r\n\r\n" % len(body)).encode("ascii")
             )
             writer.write(body)
             await writer.drain()
         except Exception as error:
             trace("down error role=%s peer=%s session=%s lane=%s error=%r" % (peer.role, peer.peer_label, peer.peer_session_id, lane, error))
+            record_event(
+                "down_error",
+                role=peer.role,
+                peer_label=peer.peer_label,
+                peer_session_id=peer.peer_session_id,
+                lane=lane,
+                error=str(error),
+            )
             raise
 
     async def _handle_streaming_data_down(self, writer, peer):
@@ -518,17 +779,20 @@ class AsyncBrokerServer(object):
         try:
             writer.write(
                 b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: application/octet-stream\r\n"
-                b"Cache-Control: no-store\r\n"
-                b"Transfer-Encoding: chunked\r\n"
-                b"Connection: close\r\n\r\n"
+                + ("Content-Type: %s\r\n" % self.binary_media_type).encode("ascii")
+                + b"Cache-Control: no-store\r\n"
+                + b"Transfer-Encoding: chunked\r\n"
+                + b"Connection: close\r\n\r\n"
             )
             await writer.drain()
             last_send = asyncio.get_event_loop().time()
             while True:
-                payload, source_lane, frames, hold_ms, pad_bytes = await self._next_data_payload(peer)
+                payload, source_lane, frames, hold_ms, pad_bytes = await self._next_data_payload(
+                    peer,
+                    wait_timeout_ms=self.down_wait_ms["data"],
+                )
                 if payload is None:
-                    heartbeat = encode_frame(Frame(FRAME_PING, offset=now_ms()))
+                    heartbeat = padded_payload(encode_frame(Frame(FRAME_PING, offset=now_ms())), minimum_size=1024)
                     await self._write_chunk(writer, heartbeat)
                     last_send = asyncio.get_event_loop().time()
                     continue
@@ -550,11 +814,22 @@ class AsyncBrokerServer(object):
                 last_send = asyncio.get_event_loop().time()
         except Exception as error:
             trace("down stream error role=%s peer=%s session=%s lane=data error=%r" % (peer.role, peer.peer_label, peer.peer_session_id, error))
+            record_event(
+                "down_error",
+                role=peer.role,
+                peer_label=peer.peer_label,
+                peer_session_id=peer.peer_session_id,
+                lane="data",
+                error=str(error),
+            )
             raise
 
     async def _handle_data_down(self, writer, peer):
         trace("down open role=%s peer=%s session=%s lane=data" % (peer.role, peer.peer_label, peer.peer_session_id))
-        payload, source_lane, frames, hold_ms, pad_bytes = await self._next_data_payload(peer)
+        payload, source_lane, frames, hold_ms, pad_bytes = await self._next_data_payload(
+            peer,
+            wait_timeout_ms=self.down_wait_ms["data"],
+        )
         if payload is None:
             payload = padded_payload(encode_frame(Frame(FRAME_PING, offset=now_ms())), minimum_size=1024)
             source_lane = "pri"
@@ -577,8 +852,23 @@ class AsyncBrokerServer(object):
         ))
         writer.write(
             b"HTTP/1.1 200 OK\r\n"
-            b"Content-Type: application/octet-stream\r\n"
-            b"Cache-Control: no-store\r\n"
+            + ("Content-Type: %s\r\n" % self.binary_media_type).encode("ascii")
+            + b"Cache-Control: no-store\r\n"
+            + ("Content-Length: %d\r\n\r\n" % len(payload)).encode("ascii")
+        )
+        writer.write(payload)
+        await writer.drain()
+
+    async def _handle_ctl_down(self, writer, peer):
+        trace("down open role=%s peer=%s session=%s lane=ctl" % (peer.role, peer.peer_label, peer.peer_session_id))
+        payload = await self._next_ctl_payload(peer, self.down_wait_ms["ctl"])
+        self.state.metrics["down_responses"][LANE_CTL] += 1
+        self.state.metrics["down_frames"][LANE_CTL] += 1
+        self.state.metrics["down_bytes"][LANE_CTL] += len(payload)
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            + ("Content-Type: %s\r\n" % self.binary_media_type).encode("ascii")
+            + b"Cache-Control: no-store\r\n"
             + ("Content-Length: %d\r\n\r\n" % len(payload)).encode("ascii")
         )
         writer.write(payload)
@@ -590,16 +880,15 @@ class AsyncBrokerServer(object):
         try:
             writer.write(
                 b"HTTP/1.1 200 OK\r\n"
-                b"Content-Type: application/octet-stream\r\n"
-                b"Cache-Control: no-store\r\n"
-                b"Transfer-Encoding: chunked\r\n"
-                b"Connection: close\r\n\r\n"
+                + ("Content-Type: %s\r\n" % self.binary_media_type).encode("ascii")
+                + b"Cache-Control: no-store\r\n"
+                + b"Transfer-Encoding: chunked\r\n"
+                + b"Connection: close\r\n\r\n"
             )
             await writer.drain()
             while True:
                 try:
-                    payload = await asyncio.wait_for(queue.get(), timeout=10.0)
-                    peer.touch()
+                    payload = await self._next_ctl_payload(peer, self.down_wait_ms["ctl"])
                     self.state.metrics["down_responses"][LANE_CTL] += 1
                     self.state.metrics["down_frames"][LANE_CTL] += 1
                     self.state.metrics["down_bytes"][LANE_CTL] += len(payload)
@@ -611,13 +900,21 @@ class AsyncBrokerServer(object):
                     ))
                     await self._write_chunk(writer, payload)
                 except asyncio.TimeoutError:
-                    heartbeat = encode_frame(Frame(FRAME_PING, offset=now_ms()))
+                    heartbeat = padded_payload(encode_frame(Frame(FRAME_PING, offset=now_ms())), minimum_size=1024)
                     await self._write_chunk(writer, heartbeat)
         except Exception as error:
             trace("down stream error role=%s peer=%s session=%s lane=ctl error=%r" % (peer.role, peer.peer_label, peer.peer_session_id, error))
+            record_event(
+                "down_error",
+                role=peer.role,
+                peer_label=peer.peer_label,
+                peer_session_id=peer.peer_session_id,
+                lane="ctl",
+                error=str(error),
+            )
             raise
 
-    async def _next_data_payload(self, peer):
+    async def _next_data_payload(self, peer, wait_timeout_ms=10000):
         pri_queue = peer.queues["pri"]
         bulk_queue = peer.queues["bulk"]
         profile = None
@@ -635,7 +932,11 @@ class AsyncBrokerServer(object):
                 loop = asyncio.get_event_loop()
                 pri_task = loop.create_task(pri_queue.get())
                 bulk_task = loop.create_task(bulk_queue.get())
-                done, pending = await asyncio.wait([pri_task, bulk_task], timeout=10.0, return_when=asyncio.FIRST_COMPLETED)
+                done, pending = await asyncio.wait(
+                    [pri_task, bulk_task],
+                    timeout=max(0.0, float(wait_timeout_ms) / 1000.0),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
                 for task in pending:
                     task.cancel()
                 if not done:
@@ -695,6 +996,14 @@ class AsyncBrokerServer(object):
             self.state.metrics["up_frames"][frame_lane] += 1
             self.state.metrics["up_bytes"][frame_lane] += len(encode_frame(frame))
         self.state.metrics["up_batches"][batch_lane] += 1
+        record_event(
+            "up_batch",
+            role=role,
+            peer_session_id=peer_session_id,
+            lane=batch_lane,
+            frame_count=frame_count,
+            body_bytes=len(body),
+        )
         await self._send_json(writer, 200, {"ok": True})
 
     async def _send_json(self, writer, status, payload):
@@ -734,14 +1043,62 @@ def load_config(path):
 def main():
     parser = argparse.ArgumentParser(description="Twoman localhost broker")
     parser.add_argument("--listen-host", default="127.0.0.1")
-    parser.add_argument("--listen-port", required=True, type=int)
+    parser.add_argument("--listen-port", type=int)
+    parser.add_argument("--unix-socket")
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
+    if not args.unix_socket and args.listen_port is None:
+        parser.error("--listen-port is required unless --unix-socket is provided")
     config = load_config(args.config)
-    server = AsyncBrokerServer(args.listen_host, args.listen_port, config)
-    loop = asyncio.get_event_loop()
+    global TRACE_ENABLED
+    if not TRACE_ENABLED and config.get("trace_enabled"):
+        TRACE_ENABLED = True
+    configure_runtime_logging(args.config, config)
+    configure_event_logging(args.config, config)
+    sys.excepthook = log_unhandled_exception
+    server = AsyncBrokerServer(args.listen_host, args.listen_port, config, unix_socket_path=args.unix_socket)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.set_exception_handler(log_asyncio_exception)
+    LOGGER.info(
+        "http broker starting listen_host=%s listen_port=%s unix_socket=%s log_path=%s event_log_path=%s",
+        args.listen_host,
+        args.listen_port,
+        args.unix_socket or "",
+        RUNTIME_LOG_PATH or "stderr-only",
+        EVENT_LOG_PATH or "disabled",
+    )
+    record_event(
+        "broker_starting",
+        listen_host=args.listen_host,
+        listen_port=args.listen_port,
+        unix_socket=args.unix_socket or "",
+    )
     loop.run_until_complete(server.start())
-    loop.run_forever()
+    LOGGER.info("http broker started listen_host=%s listen_port=%s unix_socket=%s", args.listen_host, args.listen_port, args.unix_socket or "")
+    record_event("broker_started", listen_host=args.listen_host, listen_port=args.listen_port, unix_socket=args.unix_socket or "")
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        LOGGER.info("http broker interrupted by user")
+        record_event("broker_interrupted")
+    finally:
+        LOGGER.info("http broker stopping")
+        record_event("broker_stopping")
+        if server.cleanup_task is not None:
+            server.cleanup_task.cancel()
+            with contextlib.suppress(Exception):
+                loop.run_until_complete(server.cleanup_task)
+        if server.server is not None:
+            server.server.close()
+            with contextlib.suppress(Exception):
+                loop.run_until_complete(server.server.wait_closed())
+        if args.unix_socket:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(args.unix_socket)
+        LOGGER.info("http broker stopped")
+        record_event("broker_stopped")
+        loop.close()
 
 
 if __name__ == "__main__":

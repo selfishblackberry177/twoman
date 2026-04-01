@@ -26,7 +26,7 @@ class DesktopClientTuiTest(unittest.IsolatedAsyncioTestCase):
             await pilot.click("#profile-add")
             await pilot.pause()
             app.screen.query_one("#profile-name", Input).value = "Primary"
-            app.screen.query_one("#profile-url", Input).value = "https://host.example.com/bridge/v2"
+            app.screen.query_one("#profile-url", Input).value = "https://host.example.com/api/v1/telemetry"
             app.screen.query_one("#profile-token", Input).value = "token-123"
             await pilot.click("#profile-save")
             await pilot.pause()
@@ -58,7 +58,7 @@ class DesktopClientTuiTest(unittest.IsolatedAsyncioTestCase):
         profile = self.controller.save_profile(
             ClientProfile(
                 name="Primary",
-                broker_base_url="https://host.example.com/bridge/v2",
+                broker_base_url="https://host.example.com/api/v1/telemetry",
                 client_token="token-123",
             )
         )

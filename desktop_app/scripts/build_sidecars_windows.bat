@@ -7,6 +7,9 @@ set BUILD_ROOT=%APP_ROOT%\build\windows-sidecars
 set DIST_DIR=%APP_ROOT%\src-tauri\resources\sidecars\windows
 set STAGE_DIR=%BUILD_ROOT%\dist
 set TUNNEL_DIR=%BUILD_ROOT%\tunnel
+if "%TWOMAN_HELPER_BINARY_BASENAME%"=="" set TWOMAN_HELPER_BINARY_BASENAME=local-network-helper
+if "%TWOMAN_GATEWAY_BINARY_BASENAME%"=="" set TWOMAN_GATEWAY_BINARY_BASENAME=local-network-bridge
+if "%TWOMAN_TUNNEL_BINARY_BASENAME%"=="" set TWOMAN_TUNNEL_BINARY_BASENAME=standard-system-adapter
 
 if exist "%BUILD_ROOT%" rmdir /s /q "%BUILD_ROOT%"
 mkdir "%BUILD_ROOT%"
@@ -26,7 +29,7 @@ if "%TWOMAN_WINDOWS_PYTHON%"=="" (
   --clean ^
   --onefile ^
   --noconsole ^
-  --name twoman-helper ^
+  --name %TWOMAN_HELPER_BINARY_BASENAME% ^
   --paths "%ROOT%" ^
   --hidden-import local_client.helper ^
   --hidden-import twoman_protocol ^
@@ -36,21 +39,21 @@ if "%TWOMAN_WINDOWS_PYTHON%"=="" (
   --specpath "%BUILD_ROOT%\spec-helper" ^
   "%ROOT%\local_client\helper.py"
 
-copy /Y "%STAGE_DIR%\twoman-helper.exe" "%DIST_DIR%\twoman-helper.exe" >nul
+copy /Y "%STAGE_DIR%\%TWOMAN_HELPER_BINARY_BASENAME%.exe" "%DIST_DIR%\%TWOMAN_HELPER_BINARY_BASENAME%.exe" >nul
 
 %TWOMAN_WINDOWS_PYTHON% -m PyInstaller ^
   --noconfirm ^
   --clean ^
   --onefile ^
   --noconsole ^
-  --name twoman-gateway ^
+  --name %TWOMAN_GATEWAY_BINARY_BASENAME% ^
   --paths "%ROOT%" ^
   --distpath "%STAGE_DIR%" ^
   --workpath "%BUILD_ROOT%\work-gateway" ^
   --specpath "%BUILD_ROOT%\spec-gateway" ^
   "%ROOT%\desktop_client\socks_gateway.py"
 
-copy /Y "%STAGE_DIR%\twoman-gateway.exe" "%DIST_DIR%\twoman-gateway.exe" >nul
+copy /Y "%STAGE_DIR%\%TWOMAN_GATEWAY_BINARY_BASENAME%.exe" "%DIST_DIR%\%TWOMAN_GATEWAY_BINARY_BASENAME%.exe" >nul
 
 if "%TWOMAN_SING_BOX_URL%"=="" (
   set TWOMAN_SING_BOX_URL=https://github.com/SagerNet/sing-box/releases/download/v1.12.12/sing-box-1.12.12-windows-amd64.zip
@@ -66,7 +69,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "Expand-Archive -Path $zip -DestinationPath $extract -Force;" ^
   "$exe=Get-ChildItem -Path $extract -Filter sing-box.exe -Recurse | Select-Object -First 1;" ^
   "if (-not $exe) { throw 'sing-box.exe not found in archive' };" ^
-  "Copy-Item -Force $exe.FullName '%DIST_DIR%\twoman-tunnel.exe';"
+  "Copy-Item -Force $exe.FullName '%DIST_DIR%\%TWOMAN_TUNNEL_BINARY_BASENAME%.exe';"
 
 if errorlevel 1 exit /b 1
 

@@ -4,6 +4,7 @@ import asyncio
 import collections
 import contextlib
 import os
+import random
 import ssl
 import sys
 import urllib.parse
@@ -14,6 +15,16 @@ try:
 except ImportError:  # pragma: no cover - compatibility for older distro packages
     from websockets import connect as ws_connect
 
+from twoman_http import (
+    RouteProvider,
+    build_connection_headers,
+    expected_binary_media_type,
+    is_json_media_type,
+    jittered_backoff_seconds,
+    jittered_interval_seconds,
+    validate_binary_media_type,
+    validate_json_media_type,
+)
 from twoman_protocol import (
     FLAG_DATA_BULK,
     FRAME_DATA,
@@ -54,6 +65,7 @@ class LaneTransport(object):
         upload_profiles=None,
         streaming_up_lanes=None,
         idle_repoll_delay_seconds=None,
+        protocol_config=None,
     ):
         self.base_url = base_url.rstrip("/")
         self.token = token
@@ -77,6 +89,9 @@ class LaneTransport(object):
         self.upload_profiles = self._merge_upload_profiles(default_upload_profiles, upload_profiles or {})
         self.streaming_up_lanes = self._normalize_streaming_up_lanes(streaming_up_lanes)
         self.idle_repoll_delay_seconds = self._normalize_idle_repoll_delay_seconds(idle_repoll_delay_seconds)
+        self.protocol_config = dict(protocol_config or {})
+        self.route_provider = RouteProvider.from_config(self.base_url, self.protocol_config)
+        self.random = random.Random()
         self.queues = dict((lane, asyncio.Queue()) for lane in LANES)
         self.data_queue = asyncio.Queue() if self.collapse_data_lanes else None
         self.replay_queues = dict((lane, collections.deque()) for lane in self._external_lanes())
@@ -84,6 +99,7 @@ class LaneTransport(object):
         self.clients = {}
         self.tasks = []
         self.failure_counts = {}
+        self.event_handler = None
 
     async def start(self):
         if self.clients:
@@ -98,9 +114,17 @@ class LaneTransport(object):
                 self.tasks.append(asyncio.create_task(self._up_loop(lane)))
             self.tasks.append(asyncio.create_task(self._down_loop(lane)))
         self.tasks.append(asyncio.create_task(self._ping_loop()))
+        self._report_event(
+            "transport_start",
+            base_url=self.base_url,
+            collapse_data_lanes=self.collapse_data_lanes,
+            http2_enabled=self.http2_enabled_lanes,
+            streaming_up_lanes=self.streaming_up_lanes,
+        )
 
     async def stop(self):
         self.stop_event.set()
+        self._report_event("transport_stop")
         for task in self.tasks:
             task.cancel()
         for task in self.tasks:
@@ -179,10 +203,11 @@ class LaneTransport(object):
                     total += len(encoded)
                 response = await self.clients[(lane, "up")].post(
                     self._lane_url(lane, "up"),
-                    headers=self._headers(),
+                    headers=self._headers(binary_request=True),
                     content=b"".join(batch),
                 )
                 response.raise_for_status()
+                self._validate_ack_response(response)
                 self._mark_success("up", lane)
                 trace("%s/%s@%s up ok lane=%s batch_bytes=%s status=%s" % (self.role, self.peer_label, self.peer_session_id, lane, total, response.status_code))
             except asyncio.CancelledError:
@@ -191,6 +216,13 @@ class LaneTransport(object):
                 await self._requeue_frames_front(lane, batch_frames)
                 await self._reset_client(lane, "up")
                 delay = self._backoff_after_error("up", lane)
+                self._report_event(
+                    "transport_up_error",
+                    lane=lane,
+                    delay_seconds=delay,
+                    error=repr(error),
+                    queued_frames=len(batch_frames),
+                )
                 trace("%s/%s@%s up error lane=%s delay=%0.3f error=%r" % (self.role, self.peer_label, self.peer_session_id, lane, delay, error))
                 if delay > 0:
                     await asyncio.sleep(delay)
@@ -202,6 +234,7 @@ class LaneTransport(object):
             try:
                 async with self.clients[(lane, "down")].stream("GET", self._lane_url(lane, "down"), headers=self._headers()) as response:
                     response.raise_for_status()
+                    self._validate_binary_response(response)
                     self._mark_success("down", lane)
                     trace("%s/%s@%s down open lane=%s status=%s" % (self.role, self.peer_label, self.peer_session_id, lane, response.status_code))
                     async for chunk in response.aiter_bytes():
@@ -216,11 +249,17 @@ class LaneTransport(object):
                 if not saw_non_ping:
                     delay = self.idle_repoll_delay_seconds.get(lane, 0.0)
                     if delay > 0:
-                        await asyncio.sleep(delay)
+                        await asyncio.sleep(self._jittered_interval(delay))
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 delay = self._backoff_after_error("down", lane)
+                self._report_event(
+                    "transport_down_error",
+                    lane=lane,
+                    delay_seconds=delay,
+                    error=repr(error),
+                )
                 trace("%s/%s@%s down error lane=%s delay=%0.3f error=%r" % (self.role, self.peer_label, self.peer_session_id, lane, delay, error))
                 if delay > 0:
                     await asyncio.sleep(delay)
@@ -230,40 +269,46 @@ class LaneTransport(object):
             try:
                 response = await self.clients[(lane, "up")].post(
                     self._lane_url(lane, "up"),
-                    headers=self._headers(),
+                    headers=self._headers(binary_request=True),
                     content=self._streaming_upload_chunks(lane),
                 )
                 response.raise_for_status()
+                self._validate_ack_response(response)
                 self._mark_success("up_stream", lane)
                 trace("%s/%s@%s up stream closed lane=%s status=%s" % (self.role, self.peer_label, self.peer_session_id, lane, response.status_code))
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 delay = self._backoff_after_error("up_stream", lane)
+                self._report_event(
+                    "transport_up_stream_error",
+                    lane=lane,
+                    delay_seconds=delay,
+                    error=repr(error),
+                )
                 trace("%s/%s@%s up stream error lane=%s delay=%0.3f error=%r" % (self.role, self.peer_label, self.peer_session_id, lane, delay, error))
                 if delay > 0:
                     await asyncio.sleep(delay)
 
     async def _ping_loop(self):
         while not self.stop_event.is_set():
-            await asyncio.sleep(15.0)
+            await asyncio.sleep(self._jittered_interval(self.protocol_config.get("heartbeat_interval_seconds", 15.0)))
             await self.send_frame(LANE_CTL, Frame(FRAME_PING, offset=int(asyncio.get_running_loop().time() * 1000)))
 
-    def _headers(self):
-        return {
-            "X-Relay-Token": self.token,
-            "X-Twoman-Role": self.role,
-            "X-Twoman-Peer": self.peer_label,
-            "X-Twoman-Session": self.peer_session_id,
-        }
+    def _headers(self, binary_request=False):
+        headers = build_connection_headers(
+            self.token,
+            self.role,
+            self.peer_label,
+            self.peer_session_id,
+            self.protocol_config,
+        )
+        if binary_request:
+            headers["Content-Type"] = expected_binary_media_type(self.protocol_config)
+        return headers
 
     def _lane_url(self, lane, direction):
-        parsed = urllib.parse.urlsplit(self.base_url)
-        path = parsed.path.rstrip("/")
-        url = "%s://%s" % (parsed.scheme, parsed.netloc)
-        if path:
-            url += path
-        return "%s/%s/%s" % (url, lane, direction)
+        return self.route_provider.lane_url(lane, direction)
 
     def _external_lanes(self):
         if self.collapse_data_lanes:
@@ -336,15 +381,14 @@ class LaneTransport(object):
         key = (direction, lane)
         failures = self.failure_counts.get(key, 0) + 1
         self.failure_counts[key] = failures
-        if failures <= 1:
-            return 0.0
-        if failures == 2:
-            return 0.1
-        if failures == 3:
-            return 0.25
-        if failures == 4:
-            return 0.5
-        return min(2.0, 0.5 * (2 ** max(0, failures - 4)))
+        return jittered_backoff_seconds(
+            failures,
+            initial_delay=float(self.protocol_config.get("backoff_initial_delay_seconds", 0.1)),
+            maximum_delay=float(self.protocol_config.get("backoff_max_delay_seconds", 5.0)),
+            multiplier=float(self.protocol_config.get("backoff_multiplier", 2.0)),
+            free_failures=int(self.protocol_config.get("backoff_free_failures", 1)),
+            rng=self.random,
+        )
 
     async def _next_outbound_frame(self, lane):
         replay = self.replay_queues.get(lane)
@@ -440,6 +484,43 @@ class LaneTransport(object):
             verify=self.verify_tls,
         )
 
+    def _validate_ack_response(self, response):
+        validate_json_media_type(response.headers.get("content-type", ""))
+        payload = response.json()
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            raise ValueError("unexpected transport ack payload")
+        return payload
+
+    def _validate_binary_response(self, response):
+        content_type = response.headers.get("content-type", "")
+        if is_json_media_type(content_type):
+            payload = response.json()
+            error = payload.get("error") if isinstance(payload, dict) else payload
+            raise ValueError("binary response returned JSON: %s" % error)
+        validate_binary_media_type(content_type, self.protocol_config)
+
+    def _jittered_interval(self, base_delay):
+        return jittered_interval_seconds(
+            base_delay,
+            jitter_ratio=float(self.protocol_config.get("interval_jitter_ratio", 0.2)),
+            rng=self.random,
+        )
+
+    def _report_event(self, kind, **fields):
+        if self.event_handler is None:
+            return
+        payload = {
+            "kind": kind,
+            "role": self.role,
+            "peer_label": self.peer_label,
+            "peer_session_id": self.peer_session_id,
+        }
+        payload.update(fields)
+        try:
+            self.event_handler(payload)
+        except Exception:
+            pass
+
 
 class AsyncFrameQueue(object):
     def __init__(self):
@@ -479,10 +560,13 @@ class WebSocketLaneTransport(object):
         collapse_data_lanes=False,
         upload_profiles=None,
         streaming_up_lanes=None,
+        idle_repoll_delay_seconds=None,
+        protocol_config=None,
     ):
         del http2_enabled
         del upload_profiles
         del streaming_up_lanes
+        del idle_repoll_delay_seconds
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.role = role
@@ -494,11 +578,15 @@ class WebSocketLaneTransport(object):
         self.max_batch_bytes = int(max_batch_bytes)
         self.verify_tls = bool(verify_tls)
         self.collapse_data_lanes = bool(collapse_data_lanes)
+        self.protocol_config = dict(protocol_config or {})
+        self.route_provider = RouteProvider.from_config(self.base_url, self.protocol_config)
+        self.random = random.Random()
         self.queues = dict((lane, AsyncFrameQueue()) for lane in LANES)
         self.data_queue = AsyncFrameQueue() if self.collapse_data_lanes else None
         self.stop_event = asyncio.Event()
         self.tasks = []
         self.failure_counts = {}
+        self.event_handler = None
 
     async def start(self):
         if self.tasks:
@@ -506,9 +594,15 @@ class WebSocketLaneTransport(object):
         for lane in self._external_lanes():
             self.tasks.append(asyncio.create_task(self._lane_loop(lane)))
         self.tasks.append(asyncio.create_task(self._ping_loop()))
+        self._report_event(
+            "transport_start",
+            base_url=self.base_url,
+            collapse_data_lanes=self.collapse_data_lanes,
+        )
 
     async def stop(self):
         self.stop_event.set()
+        self._report_event("transport_stop")
         for task in self.tasks:
             task.cancel()
         for task in self.tasks:
@@ -545,8 +639,8 @@ class WebSocketLaneTransport(object):
                     self._lane_url(lane),
                     additional_headers=self._headers(),
                     open_timeout=self.http_timeout_seconds,
-                    ping_interval=20,
-                    ping_timeout=20,
+                    ping_interval=float(self.protocol_config.get("ws_ping_interval_seconds", 20)),
+                    ping_timeout=float(self.protocol_config.get("ws_ping_timeout_seconds", 20)),
                     close_timeout=5,
                     max_size=None,
                     max_queue=16,
@@ -603,25 +697,23 @@ class WebSocketLaneTransport(object):
 
     async def _ping_loop(self):
         while not self.stop_event.is_set():
-            await asyncio.sleep(15.0)
+            await asyncio.sleep(self._jittered_interval(self.protocol_config.get("heartbeat_interval_seconds", 15.0)))
             await self.send_frame(LANE_CTL, Frame(FRAME_PING, offset=int(asyncio.get_running_loop().time() * 1000)))
 
     def _headers(self):
-        return {
-            "X-Relay-Token": self.token,
-            "X-Twoman-Role": self.role,
-            "X-Twoman-Peer": self.peer_label,
-            "X-Twoman-Session": self.peer_session_id,
-        }
+        return build_connection_headers(
+            self.token,
+            self.role,
+            self.peer_label,
+            self.peer_session_id,
+            self.protocol_config,
+        )
 
     def _lane_url(self, lane):
-        parsed = urllib.parse.urlsplit(self.base_url)
+        url = self.route_provider.ws_lane_url(lane)
+        parsed = urllib.parse.urlsplit(url)
         scheme = "wss" if parsed.scheme == "https" else "ws"
-        path = parsed.path.rstrip("/")
-        url = "%s://%s" % (scheme, parsed.netloc)
-        if path:
-            url += path
-        return "%s/%s" % (url, lane)
+        return urllib.parse.urlunsplit((scheme, parsed.netloc, parsed.path, parsed.query, parsed.fragment))
 
     def _external_lanes(self):
         if self.collapse_data_lanes:
@@ -635,15 +727,14 @@ class WebSocketLaneTransport(object):
         key = (direction, lane)
         failures = self.failure_counts.get(key, 0) + 1
         self.failure_counts[key] = failures
-        if failures <= 1:
-            return 0.0
-        if failures == 2:
-            return 0.1
-        if failures == 3:
-            return 0.25
-        if failures == 4:
-            return 0.5
-        return min(2.0, 0.5 * (2 ** max(0, failures - 4)))
+        return jittered_backoff_seconds(
+            failures,
+            initial_delay=float(self.protocol_config.get("backoff_initial_delay_seconds", 0.1)),
+            maximum_delay=float(self.protocol_config.get("backoff_max_delay_seconds", 5.0)),
+            multiplier=float(self.protocol_config.get("backoff_multiplier", 2.0)),
+            free_failures=int(self.protocol_config.get("backoff_free_failures", 1)),
+            rng=self.random,
+        )
 
     async def _next_outbound_frame(self, lane):
         if lane != LANE_DATA:
@@ -667,12 +758,34 @@ class WebSocketLaneTransport(object):
         context.verify_mode = ssl.CERT_NONE
         return context
 
+    def _jittered_interval(self, base_delay):
+        return jittered_interval_seconds(
+            base_delay,
+            jitter_ratio=float(self.protocol_config.get("interval_jitter_ratio", 0.2)),
+            rng=self.random,
+        )
+
     def _logical_lane(self, lane, frame):
         if lane != LANE_DATA:
             return lane
         if frame.type_id != FRAME_DATA:
             return LANE_CTL
         return "bulk" if (frame.flags & FLAG_DATA_BULK) else LANE_PRI
+
+    def _report_event(self, kind, **fields):
+        if self.event_handler is None:
+            return
+        payload = {
+            "kind": kind,
+            "role": self.role,
+            "peer_label": self.peer_label,
+            "peer_session_id": self.peer_session_id,
+        }
+        payload.update(fields)
+        try:
+            self.event_handler(payload)
+        except Exception:
+            pass
 
 
 def create_transport(config, role, peer_id, on_frame):
@@ -692,6 +805,28 @@ def create_transport(config, role, peer_id, on_frame):
         "upload_profiles": config.get("upload_profiles", {}),
         "streaming_up_lanes": config.get("streaming_up_lanes", []),
         "idle_repoll_delay_seconds": config.get("idle_repoll_delay_seconds", {}),
+        "protocol_config": {
+            "auth_mode": config.get("auth_mode", "bearer"),
+            "legacy_custom_headers_enabled": config.get("legacy_custom_headers_enabled", True),
+            "binary_media_type": config.get("binary_media_type", "image/webp"),
+            "binary_media_types": config.get("binary_media_types", []),
+            "route_template": config.get("route_template", "/{lane}/{direction}"),
+            "ws_route_template": config.get("ws_route_template", "/{lane}"),
+            "health_template": config.get("health_template", "/health"),
+            "route_context": config.get("route_context", {}),
+            "version": config.get("version", config.get("api_version", "")),
+            "tenant": config.get("tenant", config.get("tenant_id", "")),
+            "endpoint": config.get("endpoint", config.get("endpoint_id", "")),
+            "identity_cookie_names": config.get("identity_cookie_names", {}),
+            "backoff_initial_delay_seconds": config.get("backoff_initial_delay_seconds", 0.1),
+            "backoff_max_delay_seconds": config.get("backoff_max_delay_seconds", 5.0),
+            "backoff_multiplier": config.get("backoff_multiplier", 2.0),
+            "backoff_free_failures": config.get("backoff_free_failures", 1),
+            "heartbeat_interval_seconds": config.get("heartbeat_interval_seconds", 15.0),
+            "interval_jitter_ratio": config.get("interval_jitter_ratio", 0.2),
+            "ws_ping_interval_seconds": config.get("ws_ping_interval_seconds", 20.0),
+            "ws_ping_timeout_seconds": config.get("ws_ping_timeout_seconds", 20.0),
+        },
     }
     if transport_kind == "ws":
         return WebSocketLaneTransport(**common_args)

@@ -16,8 +16,8 @@ internet access. The local helper exposes normal HTTP and SOCKS5 proxies so
 apps like Telegram and browsers can use the system.
 
 Compatibility note:
-- the live bridge path remains `/bridge/v2`
-- that path name is kept for wire compatibility with existing deployments, not because this repository ships multiple public versions
+- the public broker base URI is configurable end-to-end; deployments can mount the service under paths such as `/api/v1/telemetry` or `/wp-content/sync`
+- route templates are now relative to that configured base URI by default
 
 ## Status
 
@@ -46,7 +46,6 @@ What it is not:
 - `host/runtime/http_broker_daemon.py`: asyncio broker for bridge-style cPanel deployments
 - `host/app/bridge_runtime.php`: PHP bootstrap that starts and supervises the bridge broker
 - `host/public/api.php`: public health/bootstrap endpoint for bridge-style deployments
-- `host/twoman.htaccess`: LiteSpeed reverse-proxy rules for bridge-style deployments
 - `tests/run_e2e.sh`: local smoke test
 - `tests/run_e2e_node_http.sh`: local smoke test for the Node selector broker
 
@@ -76,7 +75,7 @@ Key design points:
 - helper downlinks are streamed HTTP/1.1 responses
 - helper uplinks are bounded POST batches
 - the broker assigns agent-side stream IDs and scopes helper streams by session
-- public authentication uses bearer tokens in `X-Relay-Token`
+- public authentication prefers `Authorization: Bearer <token>` with standard cookies for peer/session identity
 
 More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
@@ -88,7 +87,7 @@ Today:
 
 - the stable fallback backend is the cPanel LiteSpeed bridge backend
 - the current best managed-host backend is the CloudLinux Node selector path
-- the Passenger Python backend is an experimental compatibility track
+- the Passenger Python backend is the preferred shared-host integration track
 - the generic Passenger Node backend remains a proof track for hosts where it genuinely works
 
 This is intentional. Different host classes expose different runtime models,
@@ -129,7 +128,7 @@ export TWOMAN_SERVER_HOST='<hidden-server-host>'
 export TWOMAN_SERVER_USER='root'
 export TWOMAN_SERVER_PASSWORD='server-password'
 export TWOMAN_SERVER_DIR='/opt/twoman'
-export TWOMAN_BROKER_BASE_URL='https://your-host.example/twoman/bridge/v2'
+export TWOMAN_BROKER_BASE_URL='https://your-host.example/api/v1/telemetry'
 export TWOMAN_AGENT_TOKEN='replace-with-agent-token'
 export TWOMAN_AGENT_PEER_ID='agent-main'
 
@@ -139,7 +138,7 @@ export TWOMAN_AGENT_PEER_ID='agent-main'
 ### 3. Start the local helper
 
 ```bash
-export TWOMAN_BROKER_BASE_URL='https://your-host.example/twoman/bridge/v2'
+export TWOMAN_BROKER_BASE_URL='https://your-host.example/api/v1/telemetry'
 export TWOMAN_CLIENT_TOKEN='replace-with-client-token'
 ./scripts/start_client.sh
 ```
@@ -154,7 +153,7 @@ Default helper ports:
 
 ## Requirements
 
-- cPanel host with LiteSpeed `.htaccess` reverse proxy support to `127.0.0.1`
+- cPanel/Passenger or managed-host application-server integration for the public broker path
 - Python 3 on the host for `host/runtime/http_broker_daemon.py`
 - Python 3.9+ recommended for helper and hidden agent
 - `curl` for `scripts/deploy_host.sh`
@@ -167,7 +166,7 @@ Default helper ports:
 Bridge health:
 
 ```bash
-curl -H 'X-Relay-Token: YOUR_CLIENT_TOKEN' \
+curl -H 'Authorization: Bearer YOUR_CLIENT_TOKEN' \
   'https://your-host.example/twoman/api.php?action=health'
 ```
 

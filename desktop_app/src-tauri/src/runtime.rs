@@ -18,21 +18,22 @@ use crate::{
         PlatformInfo, ShareLogTail, ShareStatus, SharedProxy, SharedProxyProtocol,
     },
     storage::{
-        helper_config_path, helper_log_path, helper_pid_path, load_profiles, load_settings,
-        load_shares, normalize_mode_for_platform, normalize_settings, read_log_tail, save_profiles,
-        save_settings, save_shares, share_config_path, share_log_path, share_pid_path,
-        tunnel_config_path, tunnel_log_path, tunnel_pid_path, tunnel_work_dir, validate_profile,
-        validate_share, AppPaths,
+        helper_config_path, helper_listen_state_path, helper_log_path, helper_pid_path,
+        load_profiles, load_settings, load_shares, normalize_mode_for_platform,
+        normalize_settings, read_log_tail, save_profiles, save_settings, save_shares,
+        share_config_path, share_log_path, share_pid_path, tunnel_config_path,
+        tunnel_log_path, tunnel_pid_path, tunnel_work_dir, validate_profile, validate_share,
+        AppPaths,
     },
     system_proxy::SystemProxyManager,
 };
+use serde::Deserialize;
 use serde_json::json;
 
 const PORT_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
 const PORT_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const LOG_TAIL_LINES: usize = 40;
 const TUNNEL_WAIT_TIMEOUT: Duration = Duration::from_secs(18);
-const TUNNEL_INTERFACE_NAME: &str = "Twoman Tunnel";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -321,7 +322,10 @@ impl DesktopRuntime {
             if matches!(settings.connection_mode, ConnectionMode::Tunnel) && !windows_supports_tunnel()
             {
                 return Err(
-                    "Tunnel mode requires Administrator on Windows. Reopen Twoman as Administrator to create the TUN interface."
+                    format!(
+                        "Tunnel mode requires Administrator on Windows. Reopen {} as Administrator to create the TUN interface.",
+                        desktop_display_name()
+                    )
                         .into(),
                 );
             }
@@ -336,11 +340,7 @@ impl DesktopRuntime {
                 None
             };
 
-            let connected_message = if helper.used_fallback_ports {
-                format!("Connected via {} on alternate local ports", profile.name)
-            } else {
-                format!("Connected via {}", profile.name)
-            };
+            let connected_message = format!("Connected via {}", profile.name);
 
             Ok((
                 helper,
@@ -367,7 +367,7 @@ impl DesktopRuntime {
                     child: runtime_tunnel.child,
                     log_path: runtime_tunnel.log_path,
                     pid_path: runtime_tunnel.pid_path,
-                    interface_name: TUNNEL_INTERFACE_NAME.to_string(),
+                    interface_name: tunnel_interface_name(),
                 });
                 state.phase = ConnectionPhase::Connected;
                 state.message = connected_message;
@@ -611,15 +611,13 @@ impl DesktopRuntime {
         profile: &ClientProfile,
         mode: ConnectionMode,
     ) -> Result<SpawnedProcess, String> {
-        kill_twoman_port_owners(&[profile.http_port, profile.socks_port]);
-        let helper_ports = resolve_helper_ports(profile.http_port, profile.socks_port)
-            .ok_or_else(|| "could not find a free local SOCKS/HTTP port pair".to_string())?;
-
         let log_path = helper_log_path(&self.paths);
         let config_path = helper_config_path(&self.paths);
         let pid_path = helper_pid_path(&self.paths);
+        let listen_state_path = helper_listen_state_path(&self.paths);
         terminate_pid_file(&pid_path);
         let _ = fs::remove_file(&pid_path);
+        let _ = fs::remove_file(&listen_state_path);
         fs::write(
             &config_path,
             serde_json::to_vec_pretty(&json!({
@@ -627,8 +625,9 @@ impl DesktopRuntime {
                 "broker_base_url": profile.broker_base_url,
                 "client_token": profile.client_token,
                 "listen_host": "127.0.0.1",
-                "http_listen_port": helper_ports.http_port,
-                "socks_listen_port": helper_ports.socks_port,
+                "http_listen_port": 0,
+                "socks_listen_port": 0,
+                "listen_state_path": listen_state_path,
                 "log_path": log_path,
                 "pid_file": pid_path,
                 "http_timeout_seconds": profile.http_timeout_seconds,
@@ -661,14 +660,9 @@ impl DesktopRuntime {
             &log_path,
         )?;
 
-        if !wait_for_port_state("127.0.0.1", helper_ports.http_port, true, PORT_WAIT_TIMEOUT)
-            || !wait_for_port_state(
-                "127.0.0.1",
-                helper_ports.socks_port,
-                true,
-                PORT_WAIT_TIMEOUT,
-            )
-        {
+        let Some(listen_state) =
+            wait_for_helper_listen_state(&mut child, &log_path, &listen_state_path, PORT_WAIT_TIMEOUT)
+        else {
             terminate_child(&mut child);
             return Err(format!(
                 "helper failed to start in {} mode\n{}",
@@ -679,15 +673,14 @@ impl DesktopRuntime {
                 },
                 read_log_tail(&log_path, LOG_TAIL_LINES)
             ));
-        }
+        };
 
         Ok(SpawnedProcess {
             child,
             log_path,
             pid_path,
-            http_port: helper_ports.http_port,
-            socks_port: helper_ports.socks_port,
-            used_fallback_ports: helper_ports.used_fallback,
+            http_port: listen_state.http_port,
+            socks_port: listen_state.socks_port,
         })
     }
 
@@ -738,7 +731,7 @@ impl DesktopRuntime {
                     {
                         "type": "tun",
                         "tag": "tun-in",
-                        "interface_name": TUNNEL_INTERFACE_NAME,
+                        "interface_name": tunnel_interface_name(),
                         "address": [
                             "172.19.0.1/30",
                             "fdfe:dcba:9876::1/126",
@@ -824,7 +817,6 @@ impl DesktopRuntime {
             pid_path,
             http_port: 0,
             socks_port: 0,
-            used_fallback_ports: false,
         })
     }
 
@@ -885,7 +877,6 @@ impl DesktopRuntime {
             pid_path,
             http_port: 0,
             socks_port: 0,
-            used_fallback_ports: false,
         })
     }
 
@@ -955,7 +946,12 @@ struct SpawnedProcess {
     pid_path: PathBuf,
     http_port: u16,
     socks_port: u16,
-    used_fallback_ports: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelperListenState {
+    http_port: u16,
+    socks_port: u16,
 }
 
 struct ProgramSpec {
@@ -1109,11 +1105,30 @@ fn parse_profile_upstream_host_port(base_url: &str) -> Result<(String, u16), Str
     Ok((authority.to_string(), default_port))
 }
 
+fn desktop_display_name() -> &'static str {
+    option_env!("TWOMAN_DESKTOP_DISPLAY_NAME").unwrap_or("Local Network Bridge")
+}
+
+fn tunnel_interface_name() -> String {
+    option_env!("TWOMAN_TUNNEL_INTERFACE_NAME")
+        .unwrap_or("Standard System Adapter")
+        .to_string()
+}
+
+fn sidecar_basename(kind: &str) -> &'static str {
+    match kind {
+        "helper" => option_env!("TWOMAN_HELPER_BINARY_BASENAME").unwrap_or("local-network-helper"),
+        "gateway" => option_env!("TWOMAN_GATEWAY_BINARY_BASENAME").unwrap_or("local-network-bridge"),
+        "tunnel" => option_env!("TWOMAN_TUNNEL_BINARY_BASENAME").unwrap_or("standard-system-adapter"),
+        _ => "runtime-helper",
+    }
+}
+
 fn sidecar_name(kind: &str) -> String {
     if cfg!(windows) {
-        format!("twoman-{kind}.exe")
+        format!("{}.exe", sidecar_basename(kind))
     } else {
-        format!("twoman-{kind}")
+        sidecar_basename(kind).to_string()
     }
 }
 
@@ -1169,30 +1184,6 @@ fn spawn_runtime_command(program: ProgramSpec, log_path: &Path) -> Result<Child,
         .map_err(|error| format!("failed to start {}: {error}", program.executable.display()))
 }
 
-struct HelperPorts {
-    http_port: u16,
-    socks_port: u16,
-    used_fallback: bool,
-}
-
-fn resolve_helper_ports(
-    preferred_http_port: u16,
-    preferred_socks_port: u16,
-) -> Option<HelperPorts> {
-    for offset in 0..=64u16 {
-        let http_port = preferred_http_port.checked_add(offset)?;
-        let socks_port = preferred_socks_port.checked_add(offset)?;
-        if !port_bound("127.0.0.1", http_port) && !port_bound("127.0.0.1", socks_port) {
-            return Some(HelperPorts {
-                http_port,
-                socks_port,
-                used_fallback: offset != 0,
-            });
-        }
-    }
-    None
-}
-
 #[cfg(windows)]
 fn terminate_child(child: &mut Child) {
     let pid = child.id();
@@ -1229,6 +1220,35 @@ fn wait_for_port_state(host: &str, port: u16, expected_bound: bool, timeout: Dur
         thread::sleep(Duration::from_millis(150));
     }
     false
+}
+
+fn wait_for_helper_listen_state(
+    child: &mut Child,
+    _log_path: &Path,
+    state_path: &Path,
+    timeout: Duration,
+) -> Option<HelperListenState> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) => {}
+        }
+        let state = fs::read_to_string(state_path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<HelperListenState>(&content).ok());
+        if let Some(state) = state {
+            if state.http_port > 0
+                && state.socks_port > 0
+                && wait_for_port_state("127.0.0.1", state.http_port, true, Duration::from_secs(1))
+                && wait_for_port_state("127.0.0.1", state.socks_port, true, Duration::from_secs(1))
+            {
+                return Some(state);
+            }
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+    None
 }
 
 fn wait_for_listener_start(
@@ -1314,13 +1334,14 @@ fn terminate_pid_file(pid_path: &Path) {
 
 #[cfg(windows)]
 fn kill_twoman_port_owners(ports: &[u16]) {
+    let helper_marker = sidecar_basename("helper").to_ascii_lowercase();
+    let gateway_marker = sidecar_basename("gateway").to_ascii_lowercase();
     for pid in port_owner_pids(ports) {
         if let Some(name) = process_name_for_pid(pid) {
             let lower = name.to_ascii_lowercase();
-            if lower.contains("twoman")
-                || lower.contains("desktop_app")
-                || lower.contains("twoman-helper")
-                || lower.contains("twoman-gateway")
+            if lower.contains("desktop_app")
+                || lower.contains(helper_marker.as_str())
+                || lower.contains(gateway_marker.as_str())
             {
                 terminate_pid(pid);
             }

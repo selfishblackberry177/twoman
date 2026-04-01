@@ -41,6 +41,7 @@ from twoman_protocol import (
     parse_error_payload,
     random_peer_id,
 )
+from runtime_diagnostics import DurableEventRecorder, event_log_path, event_log_settings, runtime_log_settings
 from twoman_transport import create_transport
 
 
@@ -55,8 +56,11 @@ MAX_RECV_REORDER_BYTES = 1024 * 1024
 TRACE_ENABLED = os.environ.get("TWOMAN_TRACE", "").strip().lower() in ("1", "true", "yes", "on", "debug", "verbose")
 LOGGER = logging.getLogger("twoman.helper")
 RUNTIME_LOG_PATH = ""
+EVENT_LOG_PATH = ""
 FAULT_LOG_HANDLE = None
 PID_FILE_PATH = ""
+LISTEN_STATE_PATH = ""
+EVENT_RECORDER = None
 
 
 def trace(message):
@@ -67,6 +71,15 @@ def trace(message):
         return
     sys.stderr.write("[helper] %s\n" % message)
     sys.stderr.flush()
+
+
+def record_event(kind, **fields):
+    if EVENT_RECORDER is None:
+        return
+    try:
+        EVENT_RECORDER.record(kind, component="helper", **fields)
+    except Exception:
+        LOGGER.exception("helper event log write failed kind=%s", kind)
 
 
 def resolve_log_path(config_path, config):
@@ -91,6 +104,7 @@ def configure_runtime_logging(config_path, config):
     if LOGGER.handlers:
         return
     RUNTIME_LOG_PATH = resolve_log_path(config_path, config)
+    settings = runtime_log_settings(config)
     log_dir = os.path.dirname(RUNTIME_LOG_PATH)
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
@@ -100,8 +114,8 @@ def configure_runtime_logging(config_path, config):
 
     file_handler = RotatingFileHandler(
         RUNTIME_LOG_PATH,
-        maxBytes=5 * 1024 * 1024,
-        backupCount=3,
+        maxBytes=settings["max_bytes"],
+        backupCount=settings["backup_count"],
         encoding="utf-8",
     )
     file_handler.setLevel(logging.DEBUG)
@@ -118,7 +132,32 @@ def configure_runtime_logging(config_path, config):
     faulthandler.enable(FAULT_LOG_HANDLE, all_threads=True)
     sys.excepthook = log_unhandled_exception
     threading.excepthook = log_thread_exception
-    LOGGER.info("helper logging initialized log_path=%s", RUNTIME_LOG_PATH)
+    LOGGER.info(
+        "helper logging initialized log_path=%s max_bytes=%s backup_count=%s",
+        RUNTIME_LOG_PATH,
+        settings["max_bytes"],
+        settings["backup_count"],
+    )
+
+
+def configure_event_logging(config_path, config):
+    global EVENT_RECORDER, EVENT_LOG_PATH
+    if EVENT_RECORDER is not None:
+        return
+    EVENT_LOG_PATH = event_log_path(config_path, config, "helper-events.ndjson")
+    settings = event_log_settings(config)
+    EVENT_RECORDER = DurableEventRecorder(
+        EVENT_LOG_PATH,
+        max_bytes=settings["max_bytes"],
+        backup_count=settings["backup_count"],
+        recent_limit=settings["recent_limit"],
+    )
+    LOGGER.info(
+        "helper event logging initialized event_log_path=%s max_bytes=%s backup_count=%s",
+        EVENT_LOG_PATH,
+        settings["max_bytes"],
+        settings["backup_count"],
+    )
 
 
 def configure_pid_file(config_path, config):
@@ -136,6 +175,21 @@ def configure_pid_file(config_path, config):
         os.makedirs(pid_dir, exist_ok=True)
 
 
+def configure_listen_state_path(config_path, config):
+    global LISTEN_STATE_PATH
+    configured_path = str(config.get("listen_state_path", "")).strip()
+    if not configured_path:
+        LISTEN_STATE_PATH = ""
+        return
+    if os.path.isabs(configured_path):
+        LISTEN_STATE_PATH = configured_path
+    else:
+        LISTEN_STATE_PATH = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(config_path)), configured_path))
+    state_dir = os.path.dirname(LISTEN_STATE_PATH)
+    if state_dir:
+        os.makedirs(state_dir, exist_ok=True)
+
+
 def write_pid_file():
     if not PID_FILE_PATH:
         return
@@ -148,6 +202,29 @@ def remove_pid_file():
         return
     with contextlib.suppress(OSError):
         os.remove(PID_FILE_PATH)
+
+
+def write_listen_state(payload):
+    if not LISTEN_STATE_PATH:
+        return
+    tmp_path = LISTEN_STATE_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    os.replace(tmp_path, LISTEN_STATE_PATH)
+
+
+def remove_listen_state_file():
+    if not LISTEN_STATE_PATH:
+        return
+    with contextlib.suppress(OSError):
+        os.remove(LISTEN_STATE_PATH)
+
+
+def bound_port(server):
+    sockets = getattr(server, "sockets", None) or []
+    if not sockets:
+        raise RuntimeError("server sockets are unavailable")
+    return int(sockets[0].getsockname()[1])
 
 
 def log_unhandled_exception(exc_type, exc_value, exc_traceback):
@@ -251,6 +328,9 @@ def target_from_request(request_line, headers):
             path += "?" + parsed.query
         host = parsed.hostname
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        host_header = headers.get("Host", "")
+        if host_header and not authority_matches(host, port, host_header):
+            raise RuntimeError("absolute-form request target does not match Host header")
         rebuilt = "%s %s HTTP/1.1\r\n" % (method, path)
         return host, port, rebuilt
 
@@ -276,6 +356,89 @@ def rebuild_http_request(request_line, headers, rest):
     outgoing_headers.append("Connection: close\r\n")
     payload = rebuilt_request_line + "".join(outgoing_headers) + "\r\n"
     return host, port, payload.encode("iso-8859-1") + rest
+
+
+def authority_matches(expected_host, expected_port, header_value):
+    expected_host = normalize_authority_host(expected_host)
+    actual_host, actual_port = split_authority_header(header_value, expected_port)
+    return expected_host == actual_host and int(expected_port) == int(actual_port)
+
+
+def normalize_authority_host(value):
+    text = str(value or "").strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    return text.lower()
+
+
+def split_authority_header(value, default_port):
+    text = str(value or "").strip()
+    if text.startswith("[") and "]" in text:
+        host, _, remainder = text[1:].partition("]")
+        if remainder.startswith(":"):
+            return normalize_authority_host(host), int(remainder[1:])
+        return normalize_authority_host(host), int(default_port)
+    if text.count(":") == 1:
+        host, port_text = text.rsplit(":", 1)
+        return normalize_authority_host(host), int(port_text)
+    return normalize_authority_host(text), int(default_port)
+
+
+async def read_connect_preamble(reader, timeout_seconds, max_bytes):
+    try:
+        return await asyncio.wait_for(reader.read(int(max_bytes)), timeout=max(0.1, float(timeout_seconds)))
+    except asyncio.TimeoutError:
+        return b""
+
+
+def extract_tls_server_name(payload):
+    if len(payload) < 5 or payload[0] != 22:
+        return ""
+    record_length = struct.unpack("!H", payload[3:5])[0]
+    record = payload[5:5 + record_length]
+    if len(record) < 4 or record[0] != 1:
+        return ""
+    body_length = int.from_bytes(record[1:4], "big")
+    body = record[4:4 + body_length]
+    if len(body) < 34:
+        return ""
+    index = 34
+    if index >= len(body):
+        return ""
+    session_id_length = body[index]
+    index += 1 + session_id_length
+    if index + 2 > len(body):
+        return ""
+    cipher_suites_length = struct.unpack("!H", body[index:index + 2])[0]
+    index += 2 + cipher_suites_length
+    if index >= len(body):
+        return ""
+    compression_methods_length = body[index]
+    index += 1 + compression_methods_length
+    if index + 2 > len(body):
+        return ""
+    extensions_length = struct.unpack("!H", body[index:index + 2])[0]
+    index += 2
+    end = min(len(body), index + extensions_length)
+    while index + 4 <= end:
+        extension_type, extension_size = struct.unpack("!HH", body[index:index + 4])
+        index += 4
+        extension_data = body[index:index + extension_size]
+        index += extension_size
+        if extension_type != 0 or len(extension_data) < 5:
+            continue
+        list_length = struct.unpack("!H", extension_data[:2])[0]
+        names_end = min(len(extension_data), 2 + list_length)
+        name_index = 2
+        while name_index + 3 <= names_end:
+            name_type = extension_data[name_index]
+            name_length = struct.unpack("!H", extension_data[name_index + 1:name_index + 3])[0]
+            name_index += 3
+            name_value = extension_data[name_index:name_index + name_length]
+            name_index += name_length
+            if name_type == 0 and len(name_value) == name_length:
+                return name_value.decode("idna")
+    return ""
 
 
 class ProxyStream(object):
@@ -305,6 +468,12 @@ class ProxyStream(object):
 
     async def open(self):
         trace("open stream=%s target=%s:%s" % (self.stream_id, self.target_host, self.target_port))
+        record_event(
+            "stream_open_requested",
+            stream_id=self.stream_id,
+            target_host=self.target_host,
+            target_port=self.target_port,
+        )
         frame = Frame(
             FRAME_OPEN,
             stream_id=self.stream_id,
@@ -314,8 +483,21 @@ class ProxyStream(object):
         await asyncio.wait_for(self.open_event.wait(), timeout=30)
         if self.open_failed:
             trace("open failed stream=%s error=%s" % (self.stream_id, self.open_failed))
+            record_event(
+                "stream_open_failed",
+                stream_id=self.stream_id,
+                target_host=self.target_host,
+                target_port=self.target_port,
+                error=self.open_failed,
+            )
             raise RuntimeError(self.open_failed)
         trace("open ok stream=%s" % self.stream_id)
+        record_event(
+            "stream_open_ok",
+            stream_id=self.stream_id,
+            target_host=self.target_host,
+            target_port=self.target_port,
+        )
 
     async def on_frame(self, frame):
         if frame.type_id == FRAME_OPEN_OK:
@@ -325,6 +507,7 @@ class ProxyStream(object):
         if frame.type_id == FRAME_OPEN_FAIL:
             self.open_failed = parse_error_payload(frame.payload)
             trace("recv OPEN_FAIL stream=%s error=%s" % (self.stream_id, self.open_failed))
+            record_event("stream_open_fail_frame", stream_id=self.stream_id, error=self.open_failed)
             self.open_event.set()
             await self.recv_queue.put(None)
             return
@@ -351,10 +534,17 @@ class ProxyStream(object):
             if frame.type_id == FRAME_RST and frame.payload:
                 self.open_failed = parse_error_payload(frame.payload)
                 trace("recv RST stream=%s error=%s" % (self.stream_id, self.open_failed))
+                record_event("stream_reset", stream_id=self.stream_id, error=self.open_failed)
                 await self.recv_queue.put(None)
                 return
             self.fin_offset = int(frame.offset)
             trace("recv FIN stream=%s fin_offset=%s recv_offset=%s" % (self.stream_id, self.fin_offset, self.recv_offset))
+            record_event(
+                "stream_fin_received",
+                stream_id=self.stream_id,
+                fin_offset=self.fin_offset,
+                recv_offset=self.recv_offset,
+            )
             if self.recv_offset >= self.fin_offset:
                 await self.recv_queue.put(None)
 
@@ -506,6 +696,7 @@ class HelperRuntime(object):
         self.next_stream_id = max(1, seed | 1)
         self.peer_id = config.get("peer_id") or random_peer_id()
         self.transport = create_transport(config, "helper", self.peer_id, self.on_frame)
+        self.transport.event_handler = self._record_transport_event
 
     async def start(self):
         await self.transport.start()
@@ -528,6 +719,10 @@ class HelperRuntime(object):
 
     async def release_stream(self, stream_id):
         self.streams.pop(stream_id, None)
+        record_event("stream_released", stream_id=stream_id)
+
+    def _record_transport_event(self, event):
+        record_event(**event)
 
 
 async def relay_stream(runtime, stream, reader, writer, initial_payload=b"", connected_response=None, open_stream=True):
@@ -546,6 +741,7 @@ async def relay_stream(runtime, stream, reader, writer, initial_payload=b"", con
                 data = await reader.read(READ_CHUNK)
                 if not data:
                     trace("local EOF stream=%s send_offset=%s" % (stream.stream_id, stream.send_offset))
+                    record_event("local_eof", stream_id=stream.stream_id, send_offset=stream.send_offset)
                     await stream.finish()
                     return
                 trace("local read stream=%s bytes=%s" % (stream.stream_id, len(data)))
@@ -564,6 +760,14 @@ async def relay_stream(runtime, stream, reader, writer, initial_payload=b"", con
                             stream.local_write_bytes,
                             stream.local_write_count,
                         )
+                    )
+                    record_event(
+                        "remote_eof",
+                        stream_id=stream.stream_id,
+                        recv_offset=stream.recv_offset,
+                        local_written=stream.local_write_bytes,
+                        local_writes=stream.local_write_count,
+                        error=stream.open_failed,
                     )
                     with contextlib.suppress(Exception):
                         writer.write_eof()
@@ -645,8 +849,21 @@ async def handle_http(runtime, reader, writer):
         method = request_line.split(" ", 1)[0].upper()
         if method == "CONNECT":
             host, port, _ = target_from_request(request_line, headers)
+            connected_response = None
             initial_payload = b""
-            connected_response = b"HTTP/1.1 200 Connection Established\r\n\r\n"
+            if runtime.config.get("enforce_connect_sni", True):
+                writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await writer.drain()
+                initial_payload = await read_connect_preamble(
+                    reader,
+                    timeout_seconds=float(runtime.config.get("connect_sni_timeout_seconds", 1.0)),
+                    max_bytes=int(runtime.config.get("connect_sni_probe_bytes", 4096)),
+                )
+                server_name = extract_tls_server_name(initial_payload)
+                if server_name and normalize_authority_host(server_name) != normalize_authority_host(host):
+                    raise RuntimeError("TLS SNI does not match CONNECT host")
+            else:
+                connected_response = b"HTTP/1.1 200 Connection Established\r\n\r\n"
         else:
             host, port, initial_payload = rebuild_http_request(request_line, headers, rest)
             connected_response = None
@@ -723,7 +940,7 @@ async def main_async(config):
     http_port = int(config.get("http_listen_port", 8080))
     socks_port = int(config.get("socks_listen_port", 1080))
     LOGGER.info(
-        "helper starting transport=%s listen_host=%s http_port=%s socks_port=%s trace=%s http2_ctl=%s http2_data=%s",
+        "helper starting transport=%s listen_host=%s http_port=%s socks_port=%s trace=%s http2_ctl=%s http2_data=%s peer_id=%s transport_session=%s",
         config.get("transport", "http"),
         listen_host,
         http_port,
@@ -731,6 +948,17 @@ async def main_async(config):
         TRACE_ENABLED,
         bool(config.get("http2_enabled", {}).get("ctl", False)),
         bool(config.get("http2_enabled", {}).get("data", False)),
+        runtime.peer_id,
+        runtime.transport.peer_session_id,
+    )
+    record_event(
+        "helper_starting",
+        peer_id=runtime.peer_id,
+        transport_session_id=runtime.transport.peer_session_id,
+        transport=config.get("transport", "http"),
+        listen_host=listen_host,
+        http_port=http_port,
+        socks_port=socks_port,
     )
     await runtime.start()
     http_server = None
@@ -746,11 +974,36 @@ async def main_async(config):
             listen_host,
             socks_port,
         )
-        LOGGER.info("helper started log_path=%s", RUNTIME_LOG_PATH or "stderr-only")
+        active_http_port = bound_port(http_server)
+        active_socks_port = bound_port(socks_server)
+        write_listen_state(
+            {
+                "listen_host": listen_host,
+                "http_port": active_http_port,
+                "socks_port": active_socks_port,
+                "transport_session_id": runtime.transport.peer_session_id,
+            }
+        )
+        LOGGER.info(
+            "helper started log_path=%s event_log_path=%s transport_session=%s http_port=%s socks_port=%s",
+            RUNTIME_LOG_PATH or "stderr-only",
+            EVENT_LOG_PATH or "disabled",
+            runtime.transport.peer_session_id,
+            active_http_port,
+            active_socks_port,
+        )
+        record_event(
+            "helper_started",
+            transport_session_id=runtime.transport.peer_session_id,
+            listen_host=listen_host,
+            http_port=active_http_port,
+            socks_port=active_socks_port,
+        )
         async with http_server, socks_server:
             await asyncio.gather(http_server.serve_forever(), socks_server.serve_forever())
     finally:
         LOGGER.info("helper stopping")
+        record_event("helper_stopping", transport_session_id=runtime.transport.peer_session_id)
         if http_server is not None:
             http_server.close()
             with contextlib.suppress(Exception):
@@ -760,7 +1013,9 @@ async def main_async(config):
             with contextlib.suppress(Exception):
                 await socks_server.wait_closed()
         await runtime.stop()
+        remove_listen_state_file()
         LOGGER.info("helper stopped")
+        record_event("helper_stopped", transport_session_id=runtime.transport.peer_session_id)
 
 
 def main():
@@ -769,7 +1024,9 @@ def main():
     args = parser.parse_args()
     config = load_config(args.config)
     configure_runtime_logging(args.config, config)
+    configure_event_logging(args.config, config)
     configure_pid_file(args.config, config)
+    configure_listen_state_path(args.config, config)
     for signum in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
         if signum is None:
             continue
@@ -777,12 +1034,15 @@ def main():
             signal.signal(signum, handle_shutdown_signal)
     try:
         write_pid_file()
+        remove_listen_state_file()
         asyncio.run(main_async(config))
     except KeyboardInterrupt:
         LOGGER.info("helper interrupted by user")
+        record_event("helper_interrupted")
         raise SystemExit(0)
     except Exception:
         LOGGER.exception("helper crashed")
+        record_event("helper_crashed")
         raise SystemExit(1)
     finally:
         remove_pid_file()

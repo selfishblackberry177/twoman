@@ -92,6 +92,10 @@ require_env TWOMAN_AGENT_TOKEN
 TWOMAN_PUBLIC_BASE_PATH="${TWOMAN_PUBLIC_BASE_PATH:-/twoman}"
 TWOMAN_APP_NAME="${TWOMAN_APP_NAME:-twoman_py}"
 TWOMAN_APP_ROOT="${TWOMAN_APP_ROOT:-${TWOMAN_CPANEL_HOME}/twoman_passenger}"
+if [ -z "${TWOMAN_ROUTE_TEMPLATE:-}" ]; then
+  TWOMAN_ROUTE_TEMPLATE='/{lane}/{direction}'
+fi
+TWOMAN_HEALTH_TEMPLATE="${TWOMAN_HEALTH_TEMPLATE:-/health}"
 
 APP_RELATIVE="${TWOMAN_APP_ROOT#${TWOMAN_CPANEL_HOME}/}"
 REMOTE_TMP_DIR="${TWOMAN_APP_ROOT}/tmp"
@@ -101,6 +105,16 @@ CONFIG_JSON="$(cat <<EOF
 {
   "client_tokens": ["${TWOMAN_CLIENT_TOKEN}"],
   "agent_tokens": ["${TWOMAN_AGENT_TOKEN}"],
+  "base_uri": "${TWOMAN_PUBLIC_BASE_PATH}",
+  "binary_media_type": "image/webp",
+  "route_template": "${TWOMAN_ROUTE_TEMPLATE}",
+  "health_template": "${TWOMAN_HEALTH_TEMPLATE}",
+  "down_wait_ms": {
+    "ctl": 100,
+    "data": 100
+  },
+  "streaming_ctl_down_helper": false,
+  "streaming_data_down_helper": false,
   "peer_ttl_seconds": 90,
   "stream_ttl_seconds": 300,
   "max_lane_bytes": 16777216,
@@ -116,8 +130,13 @@ echo "Uploading Passenger host app files..."
 ensure_remote_dir "${APP_RELATIVE}"
 ensure_remote_dir "${APP_RELATIVE}/tmp"
 ensure_remote_dir "${APP_RELATIVE}/logs"
+ensure_remote_dir "${APP_RELATIVE}/runtime"
+upload_file "runtime_diagnostics.py" "${TWOMAN_APP_ROOT}" "runtime_diagnostics.py"
+upload_file "twoman_http.py" "${TWOMAN_APP_ROOT}" "twoman_http.py"
 upload_file "twoman_protocol.py" "${TWOMAN_APP_ROOT}" "twoman_protocol.py"
+upload_file "host/runtime/http_broker_daemon.py" "${TWOMAN_APP_ROOT}" "http_broker_daemon.py"
 upload_content "${TWOMAN_APP_ROOT}" "broker_app.py" "$(cat host/passenger_python/broker_app.py)"
+upload_content "${TWOMAN_APP_ROOT}" "passenger_proxy.py" "$(cat host/passenger_python/passenger_proxy.py)"
 upload_content "${TWOMAN_APP_ROOT}" "passenger_wsgi.py" "$(cat host/passenger_python/passenger_wsgi.py)"
 upload_content "${TWOMAN_APP_ROOT}" "config.json" "${CONFIG_JSON}"
 
@@ -144,14 +163,21 @@ echo "Passenger register response: ${register_result}"
 
 echo "Checking Passenger broker health..."
 sleep 3
-health_result="$(curl -sk -H "X-Relay-Token: ${TWOMAN_CLIENT_TOKEN}" \
-  "${TWOMAN_PUBLIC_ORIGIN}${TWOMAN_PUBLIC_BASE_PATH}/bridge/v2/health")"
+health_result="$(curl -sk -H "Authorization: Bearer ${TWOMAN_CLIENT_TOKEN}" \
+  "${TWOMAN_PUBLIC_ORIGIN}${TWOMAN_PUBLIC_BASE_PATH}${TWOMAN_HEALTH_TEMPLATE}")"
 echo "${health_result}" | python3 - <<'PY'
 import json,sys
 data=json.load(sys.stdin)
 if not data.get("ok"):
     raise SystemExit("Passenger health failed: %s" % (data,))
-print(json.dumps({"ok": data.get("ok"), "pid": data.get("pid"), "peers": data.get("peers"), "streams": data.get("streams")}))
+stats = data.get("stats") if isinstance(data.get("stats"), dict) else data
+print(json.dumps({
+    "ok": data.get("ok"),
+    "peers": stats.get("peers"),
+    "streams": stats.get("streams"),
+    "agent_peer_label": stats.get("agent_peer_label"),
+    "log_paths": stats.get("log_paths"),
+}))
 PY
 echo
 echo "Passenger host deployment complete."

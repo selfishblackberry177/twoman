@@ -80,6 +80,14 @@ TWOMAN_BRIDGE_MAX_STREAMS_PER_PEER_SESSION="${TWOMAN_BRIDGE_MAX_STREAMS_PER_PEER
 TWOMAN_BRIDGE_MAX_OPEN_RATE_PER_PEER_SESSION="${TWOMAN_BRIDGE_MAX_OPEN_RATE_PER_PEER_SESSION:-120}"
 TWOMAN_BRIDGE_OPEN_RATE_WINDOW_SECONDS="${TWOMAN_BRIDGE_OPEN_RATE_WINDOW_SECONDS:-10}"
 TWOMAN_BRIDGE_MAX_PEER_BUFFERED_BYTES="${TWOMAN_BRIDGE_MAX_PEER_BUFFERED_BYTES:-33554432}"
+TWOMAN_BRIDGE_USE_UNIX_SOCKET="${TWOMAN_BRIDGE_USE_UNIX_SOCKET:-false}"
+TWOMAN_BRIDGE_LOCAL_SOCKET_PATH="${TWOMAN_BRIDGE_LOCAL_SOCKET_PATH:-${TWOMAN_CPANEL_HOME}/twoman_runtime/bridge.sock}"
+TWOMAN_BRIDGE_PUBLIC_BASE_PATH="${TWOMAN_BRIDGE_PUBLIC_BASE_PATH:-/api/v1/telemetry}"
+if [ -z "${TWOMAN_BRIDGE_ROUTE_TEMPLATE:-}" ]; then
+  TWOMAN_BRIDGE_ROUTE_TEMPLATE='/{lane}/{direction}'
+fi
+TWOMAN_BRIDGE_HEALTH_TEMPLATE="${TWOMAN_BRIDGE_HEALTH_TEMPLATE:-/health}"
+TWOMAN_BRIDGE_BINARY_MEDIA_TYPE="${TWOMAN_BRIDGE_BINARY_MEDIA_TYPE:-image/webp}"
 
 PUBLIC_BASE_TRIMMED="${TWOMAN_PUBLIC_BASE_PATH#/}"
 REMOTE_BASE="${TWOMAN_CPANEL_HOME}/public_html/${PUBLIC_BASE_TRIMMED}"
@@ -113,6 +121,12 @@ return [
     'poll_sleep_us' => 200000,
     'job_lease_seconds' => 30,
     'bridge_local_port' => ${TWOMAN_BRIDGE_LOCAL_PORT},
+    'bridge_use_unix_socket' => ${TWOMAN_BRIDGE_USE_UNIX_SOCKET},
+    'bridge_local_socket_path' => '${TWOMAN_BRIDGE_LOCAL_SOCKET_PATH}',
+    'bridge_public_base_path' => '${TWOMAN_BRIDGE_PUBLIC_BASE_PATH}',
+    'bridge_route_template' => '${TWOMAN_BRIDGE_ROUTE_TEMPLATE}',
+    'bridge_health_template' => '${TWOMAN_BRIDGE_HEALTH_TEMPLATE}',
+    'bridge_binary_media_type' => '${TWOMAN_BRIDGE_BINARY_MEDIA_TYPE}',
     'bridge_session_ttl_seconds' => ${TWOMAN_BRIDGE_SESSION_TTL_SECONDS},
     'bridge_max_agent_idle_seconds' => ${TWOMAN_BRIDGE_MAX_AGENT_IDLE_SECONDS},
     'bridge_max_streams_per_peer_session' => ${TWOMAN_BRIDGE_MAX_STREAMS_PER_PEER_SESSION},
@@ -140,12 +154,14 @@ ensure_remote_dir "${RELATIVE_BASE}/app"
 ensure_remote_dir "${RELATIVE_BASE}/runtime"
 ensure_remote_dir "${RELATIVE_BASE}/storage"
 ensure_remote_dir "${RELATIVE_BASE}/offload"
+upload_file "runtime_diagnostics.py" "${REMOTE_BASE}" "runtime_diagnostics.py"
+upload_file "twoman_http.py" "${REMOTE_BASE}" "twoman_http.py"
+upload_file "twoman_protocol.py" "${REMOTE_BASE}" "twoman_protocol.py"
 upload_content "${REMOTE_APP_DIR}" "bootstrap.php" "$(cat host/app/bootstrap.php)"
 upload_content "${REMOTE_APP_DIR}" "bridge_runtime.php" "$(cat host/app/bridge_runtime.php)"
 upload_file "host/runtime/http_broker_daemon.py" "${REMOTE_RUNTIME_DIR}" "http_broker_daemon.py"
 upload_content "${REMOTE_BASE}" "api.php" "$(cat host/public/api.php)"
 upload_content "${REMOTE_BASE}" "health.php" "$(cat host/public/health.php)"
-upload_content "${REMOTE_BASE}" ".htaccess" "$(cat host/twoman.htaccess)"
 upload_content "${REMOTE_APP_DIR}" "config.php" "${HOST_CONFIG_CONTENT}"
 
 echo "Restarting broker..."
@@ -158,7 +174,7 @@ if [ "${restart_result}" != "ok" ]; then
 fi
 
 echo "Checking health..."
-curl -sk -H "X-Relay-Token: ${TWOMAN_CLIENT_TOKEN}" \
+curl -sk -H "Authorization: Bearer ${TWOMAN_CLIENT_TOKEN}" \
   "${TWOMAN_PUBLIC_ORIGIN}/${PUBLIC_BASE_TRIMMED}/api.php?action=health"
 echo
 echo "Host deployment complete."

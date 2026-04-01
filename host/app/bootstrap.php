@@ -143,9 +143,9 @@ function relay_header($name)
 function relay_auth($tokenType)
 {
     $config = relay_config();
-    $token = trim(relay_header('X-Relay-Token'));
+    $token = relay_auth_token();
     if ($token === '') {
-        relay_fail(401, 'Missing X-Relay-Token header');
+        relay_fail(401, 'Missing bearer token');
     }
 
     $allowed = isset($config[$tokenType]) ? $config[$tokenType] : [];
@@ -154,6 +154,15 @@ function relay_auth($tokenType)
     }
 
     return $token;
+}
+
+function relay_auth_token()
+{
+    $authorization = trim(relay_header('Authorization'));
+    if ($authorization !== '' && preg_match('/^Bearer\s+(.+)$/i', $authorization, $matches)) {
+        return trim((string) $matches[1]);
+    }
+    return trim(relay_header('X-Relay-Token'));
 }
 
 function relay_auth_reverse()

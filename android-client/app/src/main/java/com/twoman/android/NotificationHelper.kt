@@ -10,7 +10,7 @@ import android.os.Build
 import androidx.core.app.NotificationCompat
 
 object NotificationHelper {
-    const val CHANNEL_ID = "twoman-runtime"
+    const val CHANNEL_ID = "local-network-runtime"
     const val PROXY_NOTIFICATION_ID = 2001
     const val VPN_NOTIFICATION_ID = 2002
 
@@ -25,7 +25,7 @@ object NotificationHelper {
         manager.createNotificationChannel(
             NotificationChannel(
                 CHANNEL_ID,
-                context.getString(R.string.notification_channel_name),
+                context.getString(R.string.runtime_channel_name),
                 NotificationManager.IMPORTANCE_LOW,
             ),
         )

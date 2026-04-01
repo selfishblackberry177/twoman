@@ -69,9 +69,14 @@ class ProfileAdapter(
 
             binding.profileName.text = profile.name
             binding.profileBroker.text = profile.brokerBaseUrl
-            val shareAddress = if (profile.shareLanSocks) LanShareInfo.displayAddress(profile.socksPort) else null
+            val shareAddress =
+                if (profile.shareLanSocks && profile.socksPort > 0) {
+                    LanShareInfo.displayAddress(profile.socksPort)
+                } else {
+                    null
+                }
             binding.profilePorts.text = listOfNotNull(
-                "HTTP ${profile.httpPort}   SOCKS ${profile.socksPort}",
+                "HTTP ${if (profile.httpPort > 0) profile.httpPort else "Dynamic"}   SOCKS ${if (profile.socksPort > 0) profile.socksPort else "Dynamic"}",
                 shareAddress?.let { "LAN $it" },
             ).joinToString("\n")
             binding.profileModeState.visibility =

@@ -8,7 +8,6 @@ Target layout under your public base path, for example `/home/<user>/public_html
 
 - `api.php`
 - `health.php`
-- `.htaccess`
 - `app/bootstrap.php`
 - `app/bridge_runtime.php`
 - `app/config.php`
@@ -23,7 +22,6 @@ Upload these repo files to the matching host paths:
 
 - `host/public/api.php` -> `<public>/api.php`
 - `host/public/health.php` -> `<public>/health.php`
-- `host/twoman.htaccess` -> `<public>/.htaccess`
 - `host/app/bootstrap.php` -> `<public>/app/bootstrap.php`
 - `host/app/bridge_runtime.php` -> `<public>/app/bridge_runtime.php`
 - `host/runtime/http_broker_daemon.py` -> `<public>/runtime/http_broker_daemon.py`
@@ -80,7 +78,7 @@ Open:
 https://your-host.example/twoman/api.php?action=health
 ```
 
-with a valid `X-Relay-Token` header from either the client token or the agent token.
+with a valid `Authorization: Bearer ...` token from either the client token or the agent token.
 
 Expected result:
 
@@ -110,7 +108,7 @@ Example:
 
 ```json
 {
-  "broker_base_url": "https://your-host.example/twoman/bridge/v2",
+  "broker_base_url": "https://your-host.example/api/v1/telemetry",
   "agent_token": "replace-with-agent-token",
   "http_timeout_seconds": 30,
   "flush_delay_seconds": 0.01,
@@ -181,7 +179,7 @@ Example:
 
 ```json
 {
-  "broker_base_url": "https://your-host.example/twoman/bridge/v2",
+  "broker_base_url": "https://your-host.example/api/v1/telemetry",
   "client_token": "replace-with-client-token",
   "listen_host": "127.0.0.1",
   "http_listen_port": 18092,
@@ -218,7 +216,7 @@ Stop helper:
 Bridge health:
 
 ```bash
-curl -H 'X-Relay-Token: YOUR_CLIENT_TOKEN' \
+curl -H 'Authorization: Bearer YOUR_CLIENT_TOKEN' \
   'https://your-host.example/twoman/api.php?action=health'
 ```
 
@@ -243,7 +241,7 @@ Expected result:
 If the host script path fails:
 
 - verify file upload permissions in cPanel File Manager
-- verify `.htaccess` proxy rules are present under the public base path
+- verify the configured application-server route serves `/health` relative to the public broker base URI
 - verify `/bin/python3` exists on the host
 - verify `api.php?action=health` returns `ok`
 

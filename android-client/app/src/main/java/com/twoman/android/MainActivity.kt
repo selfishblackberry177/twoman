@@ -434,8 +434,8 @@ class MainActivity : AppCompatActivity() {
         dialogBinding.nameInput.setText(profile.name)
         dialogBinding.brokerInput.setText(profile.brokerBaseUrl)
         dialogBinding.tokenInput.setText(profile.clientToken)
-        dialogBinding.httpPortInput.setText(profile.httpPort.toString())
-        dialogBinding.socksPortInput.setText(profile.socksPort.toString())
+        dialogBinding.httpPortInput.setText(if (profile.httpPort == 0) "" else profile.httpPort.toString())
+        dialogBinding.socksPortInput.setText(if (profile.socksPort == 0) "" else profile.socksPort.toString())
         dialogBinding.verifyTlsSwitch.isChecked = profile.verifyTls
         dialogBinding.http2CtlSwitch.isChecked = profile.http2Ctl
         dialogBinding.http2DataSwitch.isChecked = profile.http2Data
@@ -463,8 +463,8 @@ class MainActivity : AppCompatActivity() {
         dialogBinding.nameInput.setText(imported.name)
         dialogBinding.brokerInput.setText(imported.brokerBaseUrl)
         dialogBinding.tokenInput.setText(imported.clientToken)
-        dialogBinding.httpPortInput.setText(imported.httpPort.toString())
-        dialogBinding.socksPortInput.setText(imported.socksPort.toString())
+        dialogBinding.httpPortInput.setText(if (imported.httpPort == 0) "" else imported.httpPort.toString())
+        dialogBinding.socksPortInput.setText(if (imported.socksPort == 0) "" else imported.socksPort.toString())
         dialogBinding.verifyTlsSwitch.isChecked = imported.verifyTls
         dialogBinding.http2CtlSwitch.isChecked = imported.http2Ctl
         dialogBinding.http2DataSwitch.isChecked = imported.http2Data
@@ -481,8 +481,8 @@ class MainActivity : AppCompatActivity() {
         val name = dialogBinding.nameInput.text.toString().trim()
         val broker = dialogBinding.brokerInput.text.toString().trim()
         val token = dialogBinding.tokenInput.text.toString().trim()
-        val httpPort = dialogBinding.httpPortInput.text.toString().toIntOrNull() ?: 28167
-        val socksPort = dialogBinding.socksPortInput.text.toString().toIntOrNull() ?: 21167
+        val httpPort = dialogBinding.httpPortInput.text.toString().toIntOrNull() ?: 0
+        val socksPort = dialogBinding.socksPortInput.text.toString().toIntOrNull() ?: 0
         if (name.isBlank() || broker.isBlank() || token.isBlank()) {
             Toast.makeText(this, getString(R.string.save_requires_fields), Toast.LENGTH_SHORT).show()
             return

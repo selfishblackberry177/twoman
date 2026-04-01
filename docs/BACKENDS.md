@@ -18,14 +18,14 @@ These backend families still target the same product shape:
 
 ## Backend Families
 
-### `cpanel_litespeed_bridge`
+### `cpanel_runtime_bridge`
 
-Stable backend for hostile shared hosts with no real app runtime.
+Control-plane/runtime bootstrap for hostile shared hosts. The public data path now
+expects internal app-server integration instead of legacy rewrite proxying.
 
 Implementation surface:
 
 - PHP bootstrap/watchdog
-- LiteSpeed `.htaccess [P]` reverse proxy
 - localhost Python broker
 
 Primary files:
@@ -34,7 +34,6 @@ Primary files:
 - `host/app/bridge_runtime.php`
 - `host/public/api.php`
 - `host/public/health.php`
-- `host/twoman.htaccess`
 - `scripts/deploy_host.sh`
 
 ### `cloudlinux_node_selector`
@@ -75,9 +74,9 @@ Implementation surface:
 Current status:
 
 - application registration is proven on the audited CloudLinux host
-- `/bridge/v2/health` is served by the Passenger Python app
+- `/health` is served relative to the configured Passenger base URI
 - `LSAPI_CHILDREN=1` and `LSAPI_AVOID_FORK=1` are required baseline settings
-- full Twoman broker traffic is not yet production-ready on this backend
+- full broker traffic now expects Passenger-managed routing rather than `.htaccess` loopback proxying
 
 Primary files:
 

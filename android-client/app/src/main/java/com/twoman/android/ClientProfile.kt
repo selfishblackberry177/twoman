@@ -13,8 +13,8 @@ data class ClientProfile(
     val http2Ctl: Boolean = true,
     val http2Data: Boolean = false,
     val shareLanSocks: Boolean = false,
-    val httpPort: Int = 28167,
-    val socksPort: Int = 21167,
+    val httpPort: Int = 0,
+    val socksPort: Int = 0,
     val httpTimeoutSeconds: Int = 30,
     val flushDelaySeconds: Double = 0.01,
     val maxBatchBytes: Int = 65536,
@@ -47,7 +47,7 @@ data class ClientProfile(
         put("traceEnabled", traceEnabled)
     }
 
-    fun toRuntimeConfig(logPath: String): JSONObject = JSONObject().apply {
+    fun toRuntimeConfig(logPath: String, listenStatePath: String): JSONObject = JSONObject().apply {
         put("transport", "http")
         put("broker_base_url", brokerBaseUrl)
         put("client_token", clientToken)
@@ -61,6 +61,7 @@ data class ClientProfile(
         )
         put("http_listen_port", httpPort)
         put("socks_listen_port", socksPort)
+        put("listen_state_path", listenStatePath)
         put("log_path", logPath)
         put("http_timeout_seconds", httpTimeoutSeconds)
         put("flush_delay_seconds", flushDelaySeconds)
@@ -136,8 +137,8 @@ data class ClientProfile(
             http2Ctl = json.optBoolean("http2Ctl", true),
             http2Data = json.optBoolean("http2Data", false),
             shareLanSocks = json.optBoolean("shareLanSocks", false),
-            httpPort = json.optInt("httpPort", 28167),
-            socksPort = json.optInt("socksPort", 21167),
+            httpPort = json.optInt("httpPort", 0),
+            socksPort = json.optInt("socksPort", 0),
             httpTimeoutSeconds = json.optInt("httpTimeoutSeconds", 30),
             flushDelaySeconds = json.optDouble("flushDelaySeconds", 0.01),
             maxBatchBytes = json.optInt("maxBatchBytes", 65536),

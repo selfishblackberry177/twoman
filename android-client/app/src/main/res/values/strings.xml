@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">Twoman</string>
+    <string name="app_name">Local Network Bridge</string>
     <string name="status_stopped">Stopped</string>
     <string name="status_proxy">Proxy</string>
     <string name="status_vpn">VPN</string>
@@ -34,9 +34,6 @@
     <string name="label_http2_ctl">HTTP/2 control</string>
     <string name="label_http2_data">HTTP/2 data</string>
     <string name="label_share_lan_socks">Share SOCKS on LAN</string>
-    <string name="notification_proxy_title">Twoman proxy</string>
-    <string name="notification_vpn_title">Twoman VPN</string>
-    <string name="notification_channel_name">Twoman</string>
     <string name="logs_title">Logs</string>
     <string name="profile_running_proxy">Running in Proxy mode</string>
     <string name="profile_running_vpn">Running in VPN mode</string>

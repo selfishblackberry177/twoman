@@ -479,10 +479,12 @@ class WebSocketLaneTransport(object):
         collapse_data_lanes=False,
         upload_profiles=None,
         streaming_up_lanes=None,
+        idle_repoll_delay_seconds=None,
     ):
         del http2_enabled
         del upload_profiles
         del streaming_up_lanes
+        del idle_repoll_delay_seconds
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.role = role

@@ -23,6 +23,21 @@ function bridge_runtime_local_port()
     return isset($config['bridge_local_port']) ? (int) $config['bridge_local_port'] : 18093;
 }
 
+function bridge_runtime_socket_path()
+{
+    $config = relay_config();
+    if (isset($config['bridge_local_socket_path']) && trim((string) $config['bridge_local_socket_path']) !== '') {
+        return (string) $config['bridge_local_socket_path'];
+    }
+    return bridge_runtime_dir() . '/bridge.sock';
+}
+
+function bridge_runtime_use_unix_socket()
+{
+    $config = relay_config();
+    return !empty($config['bridge_use_unix_socket']);
+}
+
 function bridge_runtime_daemon_script()
 {
     return bridge_runtime_dir() . '/http_broker_daemon.py';
@@ -72,10 +87,14 @@ function bridge_runtime_write_pid($path, $pid)
 function bridge_runtime_kill_matching_processes()
 {
     $script = bridge_runtime_daemon_script();
-    $port = bridge_runtime_local_port();
+    if (bridge_runtime_use_unix_socket()) {
+        $selector = '--unix-socket ' . bridge_runtime_socket_path();
+    } else {
+        $selector = '--listen-port ' . (int) bridge_runtime_local_port();
+    }
     $command = "ps -eo pid=,args= | grep " . escapeshellarg($script)
-        . " | grep -- '--listen-port " . (int) $port
-        . "' | grep -v grep | awk '{print \$1}'";
+        . " | grep -- " . escapeshellarg($selector)
+        . " | grep -v grep | awk '{print \$1}'";
     $output = trim((string) @shell_exec($command));
     if ($output === '') {
         return;
@@ -127,6 +146,10 @@ function bridge_runtime_write_config()
         'max_open_rate_per_peer_session' => isset($config['bridge_max_open_rate_per_peer_session']) ? (int) $config['bridge_max_open_rate_per_peer_session'] : 120,
         'open_rate_window_seconds' => isset($config['bridge_open_rate_window_seconds']) ? (int) $config['bridge_open_rate_window_seconds'] : 10,
         'max_peer_buffered_bytes' => isset($config['bridge_max_peer_buffered_bytes']) ? (int) $config['bridge_max_peer_buffered_bytes'] : min(bridge_runtime_max_lane_bytes() * 2, 32 * 1024 * 1024),
+        'base_uri' => isset($config['bridge_public_base_path']) ? (string) $config['bridge_public_base_path'] : '',
+        'binary_media_type' => isset($config['bridge_binary_media_type']) ? (string) $config['bridge_binary_media_type'] : 'image/webp',
+        'route_template' => isset($config['bridge_route_template']) ? (string) $config['bridge_route_template'] : '/{lane}/{direction}',
+        'health_template' => isset($config['bridge_health_template']) ? (string) $config['bridge_health_template'] : '/health',
     ];
 
     $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
@@ -152,17 +175,31 @@ function bridge_runtime_tcp_is_open($host, $port)
     return true;
 }
 
+function bridge_runtime_socket_is_open($path)
+{
+    $socket = @stream_socket_client('unix://' . $path, $errno, $errstr, 1.0);
+    if (!is_resource($socket)) {
+        return false;
+    }
+    fclose($socket);
+    return true;
+}
+
 function bridge_runtime_http_get($path, $timeoutSeconds)
 {
-    $errno = 0;
-    $errstr = '';
-    $socket = @fsockopen(
-        bridge_runtime_local_host(),
-        bridge_runtime_local_port(),
-        $errno,
-        $errstr,
-        $timeoutSeconds
-    );
+    if (bridge_runtime_use_unix_socket()) {
+        $socket = @stream_socket_client('unix://' . bridge_runtime_socket_path(), $errno, $errstr, $timeoutSeconds);
+    } else {
+        $errno = 0;
+        $errstr = '';
+        $socket = @fsockopen(
+            bridge_runtime_local_host(),
+            bridge_runtime_local_port(),
+            $errno,
+            $errstr,
+            $timeoutSeconds
+        );
+    }
     if (!is_resource($socket)) {
         return false;
     }
@@ -190,7 +227,11 @@ function bridge_runtime_http_get($path, $timeoutSeconds)
 
 function bridge_runtime_ping()
 {
-    if (!bridge_runtime_tcp_is_open(bridge_runtime_local_host(), bridge_runtime_local_port())) {
+    if (bridge_runtime_use_unix_socket()) {
+        if (!bridge_runtime_socket_is_open(bridge_runtime_socket_path())) {
+            return false;
+        }
+    } elseif (!bridge_runtime_tcp_is_open(bridge_runtime_local_host(), bridge_runtime_local_port())) {
         return false;
     }
 
@@ -214,10 +255,15 @@ function bridge_runtime_start()
     bridge_runtime_write_config();
     $logPath = bridge_runtime_logs_dir() . '/bridge.log';
     $command = 'cd ' . escapeshellarg(bridge_runtime_dir())
-        . ' && nohup /bin/python3 ' . escapeshellarg($script)
-        . ' --listen-host ' . escapeshellarg(bridge_runtime_local_host())
-        . ' --listen-port ' . (int) bridge_runtime_local_port()
-        . ' --config ' . escapeshellarg(bridge_runtime_daemon_config_path())
+        . ' && nohup /bin/python3 ' . escapeshellarg($script);
+    if (bridge_runtime_use_unix_socket()) {
+        @unlink(bridge_runtime_socket_path());
+        $command .= ' --unix-socket ' . escapeshellarg(bridge_runtime_socket_path());
+    } else {
+        $command .= ' --listen-host ' . escapeshellarg(bridge_runtime_local_host())
+            . ' --listen-port ' . (int) bridge_runtime_local_port();
+    }
+    $command .= ' --config ' . escapeshellarg(bridge_runtime_daemon_config_path())
         . ' >> ' . escapeshellarg($logPath) . ' 2>&1 < /dev/null & echo $!';
     $pid = trim((string) @shell_exec($command));
     if ($pid !== '' && preg_match('/^[0-9]+$/', $pid)) {
@@ -260,5 +306,11 @@ function bridge_runtime_ensure()
 
 function bridge_runtime_bridge_base_url()
 {
-    return relay_current_origin() . relay_public_base_path() . '/bridge/v2';
+    $config = relay_config();
+    $bridgeBasePath = isset($config['bridge_public_base_path']) ? trim((string) $config['bridge_public_base_path']) : '';
+    $publicBasePath = rtrim(relay_public_base_path(), '/');
+    if ($bridgeBasePath === '') {
+        return relay_current_origin() . ($publicBasePath !== '' ? $publicBasePath : '');
+    }
+    return relay_current_origin() . $publicBasePath . '/' . ltrim($bridgeBasePath, '/');
 }

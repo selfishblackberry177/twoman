@@ -6,10 +6,23 @@ const { WebSocketServer, WebSocket } = require("ws");
 
 const ROOT_DIR = path.resolve(__dirname, "..", "..");
 const CONFIG_PATH = process.env.TWOMAN_CONFIG_PATH || path.join(__dirname, "config.json");
-const RUNTIME_LOG_PATH = process.env.TWOMAN_RUNTIME_LOG_PATH || path.join(__dirname, "broker-runtime.log");
 let TRACE_ENABLED = /^(1|true|yes|on|debug|verbose)$/i.test(process.env.TWOMAN_TRACE || "");
 let DEBUG_STATS_ENABLED = /^(1|true|yes|on|debug|verbose)$/i.test(process.env.TWOMAN_DEBUG_STATS || "");
 const HEARTBEAT_INTERVAL_MS = 20000;
+const DEFAULT_RUNTIME_LOG_MAX_BYTES = 5 * 1024 * 1024;
+const DEFAULT_RUNTIME_LOG_BACKUP_COUNT = 3;
+const DEFAULT_EVENT_LOG_MAX_BYTES = 10 * 1024 * 1024;
+const DEFAULT_EVENT_LOG_BACKUP_COUNT = 5;
+const DEFAULT_RECENT_EVENT_LIMIT = 200;
+const DEFAULT_BINARY_MEDIA_TYPE = "image/webp";
+let RUNTIME_LOG_PATH = process.env.TWOMAN_RUNTIME_LOG_PATH || "";
+let EVENT_LOG_PATH = process.env.TWOMAN_EVENT_LOG_PATH || "";
+let RUNTIME_LOG_MAX_BYTES = DEFAULT_RUNTIME_LOG_MAX_BYTES;
+let RUNTIME_LOG_BACKUP_COUNT = DEFAULT_RUNTIME_LOG_BACKUP_COUNT;
+let EVENT_LOG_MAX_BYTES = DEFAULT_EVENT_LOG_MAX_BYTES;
+let EVENT_LOG_BACKUP_COUNT = DEFAULT_EVENT_LOG_BACKUP_COUNT;
+let RECENT_EVENT_LIMIT = DEFAULT_RECENT_EVENT_LIMIT;
+let BINARY_MEDIA_TYPE = DEFAULT_BINARY_MEDIA_TYPE;
 
 const FRAME_HEADER_SIZE = 20;
 const FRAME_OPEN_OK = 4;
@@ -25,16 +38,108 @@ const LANE_CTL = "ctl";
 const LANE_DATA = "data";
 const DEFAULT_DATA_REPLAY_RESEND_MS = 750;
 
+function coerceInt(value, fallbackValue, minimum = 1) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) {
+    return Math.max(minimum, fallbackValue);
+  }
+  return Math.max(minimum, parsed);
+}
+
+function defaultLogDir() {
+  return path.join(path.dirname(path.resolve(CONFIG_PATH)), "logs");
+}
+
+function resolveLogPath(configValue, envValue, defaultFilename) {
+  const explicitEnv = String(envValue || "").trim();
+  if (explicitEnv) {
+    return path.resolve(explicitEnv);
+  }
+  const configured = String(configValue || "").trim();
+  if (configured) {
+    return path.isAbsolute(configured)
+      ? configured
+      : path.resolve(path.dirname(path.resolve(CONFIG_PATH)), configured);
+  }
+  const sharedLogDir = String(process.env.TWOMAN_LOG_DIR || "").trim();
+  const baseDir = sharedLogDir ? path.resolve(sharedLogDir) : defaultLogDir();
+  return path.join(baseDir, defaultFilename);
+}
+
+function ensureLogDir(filePath) {
+  const directory = path.dirname(path.resolve(filePath));
+  fs.mkdirSync(directory, { recursive: true });
+}
+
+function rotateFile(filePath, backupCount) {
+  if (!fs.existsSync(filePath)) {
+    return;
+  }
+  if (backupCount <= 0) {
+    fs.rmSync(filePath, { force: true });
+    return;
+  }
+  const oldest = `${filePath}.${backupCount}`;
+  if (fs.existsSync(oldest)) {
+    fs.rmSync(oldest, { force: true });
+  }
+  for (let index = backupCount - 1; index >= 1; index -= 1) {
+    const source = `${filePath}.${index}`;
+    const target = `${filePath}.${index + 1}`;
+    if (fs.existsSync(source)) {
+      fs.renameSync(source, target);
+    }
+  }
+  fs.renameSync(filePath, `${filePath}.1`);
+}
+
+function appendRotatedLine(filePath, maxBytes, backupCount, line) {
+  try {
+    ensureLogDir(filePath);
+    const incomingBytes = Buffer.byteLength(line, "utf8");
+    const currentSize = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
+    if (maxBytes > 0 && currentSize + incomingBytes > maxBytes) {
+      rotateFile(filePath, backupCount);
+    }
+    fs.appendFileSync(filePath, line, "utf8");
+  } catch (_error) {
+    // Best-effort diagnostics only.
+  }
+}
+
+function runtimeLog(message) {
+  if (!RUNTIME_LOG_PATH) {
+    return;
+  }
+  appendRotatedLine(RUNTIME_LOG_PATH, RUNTIME_LOG_MAX_BYTES, RUNTIME_LOG_BACKUP_COUNT, `${new Date().toISOString()} ${message}\n`);
+}
+
+function jsonSafe(value) {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  if (["string", "number", "boolean"].includes(typeof value)) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => jsonSafe(entry));
+  }
+  if (typeof value === "object") {
+    const result = {};
+    for (const [key, entry] of Object.entries(value)) {
+      result[String(key)] = jsonSafe(entry);
+    }
+    return result;
+  }
+  return String(value);
+}
+
 function trace(message) {
   if (!TRACE_ENABLED) {
     return;
   }
   const line = `[node-broker] ${message}\n`;
-  try {
-    fs.appendFileSync(RUNTIME_LOG_PATH, `${new Date().toISOString()} ${message}\n`, "utf8");
-  } catch (_error) {
-    // Best-effort runtime log only.
-  }
+  runtimeLog(message);
   process.stderr.write(line);
 }
 
@@ -245,17 +350,23 @@ class BrokerState {
     return { ctl, data };
   }
 
-  recordEvent(kind, details) {
-    if (!DEBUG_STATS_ENABLED) {
-      return;
-    }
-    this.recentEvents.push({
+  recordEvent(kind, details, options = {}) {
+    const event = {
       ts: new Date().toISOString(),
       kind,
-      ...details
-    });
-    if (this.recentEvents.length > 200) {
-      this.recentEvents.splice(0, this.recentEvents.length - 200);
+      ...jsonSafe(details)
+    };
+    if (options.durable !== false && EVENT_LOG_PATH) {
+      appendRotatedLine(
+        EVENT_LOG_PATH,
+        EVENT_LOG_MAX_BYTES,
+        EVENT_LOG_BACKUP_COUNT,
+        `${JSON.stringify(event)}\n`
+      );
+    }
+    this.recentEvents.push(event);
+    if (this.recentEvents.length > RECENT_EVENT_LIMIT) {
+      this.recentEvents.splice(0, this.recentEvents.length - RECENT_EVENT_LIMIT);
     }
   }
 
@@ -296,6 +407,11 @@ class BrokerState {
       this.peers.set(key, peer);
       this.metrics.peer_connects += 1;
       trace(`peer online role=${role} label=${peerLabel} session=${peerSessionId}`);
+      this.recordEvent("peer_online", {
+        role,
+        peer_label: peerLabel,
+        peer_session_id: peerSessionId
+      });
     }
     peer.touch();
     peer.peerLabel = peerLabel;
@@ -324,6 +440,12 @@ class BrokerState {
     if (peer.channels[lane] === ws) {
       peer.channels[lane] = null;
       this.metrics.peer_disconnects += 1;
+      this.recordEvent("channel_closed", {
+        role: peer.role,
+        peer_label: peer.peerLabel,
+        peer_session_id: peer.peerSessionId,
+        lane
+      });
     }
   }
 
@@ -400,7 +522,7 @@ class BrokerState {
         type_id: frame.typeId,
         stream_id: frame.streamId,
         payload_bytes: frame.payload ? frame.payload.length : 0
-      });
+      }, { durable: false });
     }
     this.metrics.frames_out.ctl += 1;
     peer.notifyWaiters(LANE_CTL);
@@ -440,7 +562,7 @@ class BrokerState {
         type_id: firstTypeId,
         stream_id: firstStreamId,
         bytes: first.length
-      });
+      }, { durable: false });
     }
     const profile = this.laneProfile(LANE_CTL);
     const payloads = [first];
@@ -600,6 +722,14 @@ class BrokerState {
           }
           peer.flushScheduled[lane] = false;
           trace(`flush error lane=${lane} peer=${peer.peerSessionId} error=${error}`);
+          runtimeLog(`flush error lane=${lane} role=${peer.role} label=${peer.peerLabel} peer=${peer.peerSessionId} error=${error}`);
+          this.recordEvent("flush_error", {
+            lane,
+            peer_role: peer.role,
+            peer_label: peer.peerLabel,
+            peer_session_id: peer.peerSessionId,
+            error: String(error && error.message ? error.message : error)
+          });
           return;
         }
         setImmediate(loop);
@@ -612,14 +742,16 @@ class BrokerState {
     if (frame.typeId === FRAME_PING) {
       return;
     }
-    this.recordEvent("frame_in", {
-      sender_role: senderRole,
-      sender_peer_session_id: senderPeerSessionId,
-      lane,
-      type_id: frame.typeId,
-      stream_id: frame.streamId,
-      payload_bytes: frame.payload ? frame.payload.length : 0
-    });
+    if (frame.typeId !== FRAME_DATA) {
+      this.recordEvent("frame_in", {
+        sender_role: senderRole,
+        sender_peer_session_id: senderPeerSessionId,
+        lane,
+        type_id: frame.typeId,
+        stream_id: frame.streamId,
+        payload_bytes: frame.payload ? frame.payload.length : 0
+      }, { durable: false });
+    }
     if (frame.typeId === FRAME_OPEN && senderRole === "helper") {
       this.handleOpen(senderPeerSessionId, frame);
       return;
@@ -677,7 +809,7 @@ class BrokerState {
         type_id: frame.typeId,
         source_stream_id: frame.streamId,
         target_stream_id: outboundStreamId
-      });
+      }, { durable: false });
     }
     if (!queued && senderRole === "helper") {
       this.queueFrame("helper", senderPeerSessionId, {
@@ -711,6 +843,11 @@ class BrokerState {
       agentSessionId = "";
     }
     if (openError) {
+      this.recordEvent("open_fail", {
+        helper_session_id: helperSessionId,
+        helper_stream_id: frame.streamId,
+        reason: openError
+      });
       this.queueFrame("helper", helperSessionId, {
         typeId: FRAME_OPEN_FAIL,
         flags: 0,
@@ -721,6 +858,11 @@ class BrokerState {
       return;
     }
     if (!agentSessionId) {
+      this.recordEvent("open_fail", {
+        helper_session_id: helperSessionId,
+        helper_stream_id: frame.streamId,
+        reason: "no-agent"
+      });
       this.queueFrame("helper", helperSessionId, {
         typeId: FRAME_OPEN_FAIL,
         flags: 0,
@@ -806,6 +948,15 @@ class BrokerState {
         }
       }
       for (const stream of staleStreams) {
+        this.recordEvent("cleanup_peer_expired", {
+          role: peer.role,
+          peer_label: peer.peerLabel,
+          peer_session_id: peer.peerSessionId,
+          helper_session_id: stream.helperSessionId,
+          helper_stream_id: stream.helperStreamId,
+          agent_session_id: stream.agentSessionId,
+          agent_stream_id: stream.agentStreamId
+        });
         if (peer.role === "helper" && stream.agentSessionId) {
           this.queueFrame("agent", stream.agentSessionId, {
             typeId: FRAME_RST,
@@ -836,6 +987,12 @@ class BrokerState {
       if (stream.lastSeenMs >= streamCutoff) {
         continue;
       }
+      this.recordEvent("cleanup_stream_expired", {
+        helper_session_id: stream.helperSessionId,
+        helper_stream_id: stream.helperStreamId,
+        agent_session_id: stream.agentSessionId,
+        agent_stream_id: stream.agentStreamId
+      });
       this.queueFrame("helper", stream.helperSessionId, {
         typeId: FRAME_RST,
         flags: 0,
@@ -886,10 +1043,15 @@ class BrokerState {
       agent_peer_label: this.agentPeerLabel,
       agent_session_id: this.agentSessionId,
       base_uri: this.baseUri,
+      log_paths: {
+        runtime: RUNTIME_LOG_PATH,
+        events: EVENT_LOG_PATH
+      },
       buffered_ctl_bytes: buffered.ctl,
       buffered_pri_bytes: buffered.pri,
       buffered_bulk_bytes: buffered.bulk,
-      metrics: this.metrics
+      metrics: this.metrics,
+      recent_event_count: this.recentEvents.length
     };
     if (DEBUG_STATS_ENABLED) {
       payload.peer_details = peers;
@@ -914,7 +1076,50 @@ if (!TRACE_ENABLED && loadedConfig.trace_enabled) {
 if (!DEBUG_STATS_ENABLED && loadedConfig.debug_stats_enabled) {
   DEBUG_STATS_ENABLED = true;
 }
+RUNTIME_LOG_PATH = resolveLogPath(
+  loadedConfig.log_path,
+  process.env.TWOMAN_RUNTIME_LOG_PATH || process.env.TWOMAN_LOG_PATH,
+  "node-broker.log"
+);
+EVENT_LOG_PATH = resolveLogPath(
+  loadedConfig.event_log_path,
+  process.env.TWOMAN_EVENT_LOG_PATH,
+  "node-broker-events.ndjson"
+);
+RUNTIME_LOG_MAX_BYTES = coerceInt(
+  loadedConfig.log_max_bytes || process.env.TWOMAN_RUNTIME_LOG_MAX_BYTES,
+  DEFAULT_RUNTIME_LOG_MAX_BYTES
+);
+RUNTIME_LOG_BACKUP_COUNT = coerceInt(
+  loadedConfig.log_backup_count || process.env.TWOMAN_RUNTIME_LOG_BACKUP_COUNT,
+  DEFAULT_RUNTIME_LOG_BACKUP_COUNT,
+  0
+);
+EVENT_LOG_MAX_BYTES = coerceInt(
+  loadedConfig.event_log_max_bytes || process.env.TWOMAN_EVENT_LOG_MAX_BYTES,
+  DEFAULT_EVENT_LOG_MAX_BYTES
+);
+EVENT_LOG_BACKUP_COUNT = coerceInt(
+  loadedConfig.event_log_backup_count || process.env.TWOMAN_EVENT_LOG_BACKUP_COUNT,
+  DEFAULT_EVENT_LOG_BACKUP_COUNT,
+  0
+);
+RECENT_EVENT_LIMIT = coerceInt(
+  loadedConfig.recent_event_limit || process.env.TWOMAN_RECENT_EVENT_LIMIT,
+  DEFAULT_RECENT_EVENT_LIMIT
+);
+BINARY_MEDIA_TYPE = String(
+  loadedConfig.binary_media_type || process.env.TWOMAN_BINARY_MEDIA_TYPE || DEFAULT_BINARY_MEDIA_TYPE
+).trim() || DEFAULT_BINARY_MEDIA_TYPE;
+ensureLogDir(RUNTIME_LOG_PATH);
+ensureLogDir(EVENT_LOG_PATH);
 const state = new BrokerState(loadedConfig);
+state.recordEvent("broker_loaded", {
+  config_path: CONFIG_PATH,
+  runtime_log_path: RUNTIME_LOG_PATH,
+  event_log_path: EVENT_LOG_PATH
+});
+runtimeLog(`broker loaded config_path=${CONFIG_PATH} runtime_log_path=${RUNTIME_LOG_PATH} event_log_path=${EVENT_LOG_PATH}`);
 
 function jsonResponse(res, statusCode, payload) {
   const body = Buffer.from(JSON.stringify(payload));
@@ -926,12 +1131,73 @@ function jsonResponse(res, statusCode, payload) {
   res.end(body);
 }
 
-function connectionHeaders(req) {
+function parseCookieHeader(value) {
+  const cookies = {};
+  for (const chunk of String(value || "").split(";")) {
+    const trimmed = chunk.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) {
+      continue;
+    }
+    const name = trimmed.slice(0, eq).trim();
+    const rawValue = trimmed.slice(eq + 1).trim();
+    cookies[name] = decodeURIComponent(rawValue);
+  }
+  return cookies;
+}
+
+function normalizeMediaType(value) {
+  return String(value || "").split(";", 1)[0].trim().toLowerCase();
+}
+
+function validateBinaryMediaType(value) {
+  const allowed = new Set([BINARY_MEDIA_TYPE, "application/octet-stream"]);
+  if (!allowed.has(normalizeMediaType(value))) {
+    throw new Error(`invalid binary content type: ${value || "<missing>"}`);
+  }
+}
+
+function isHealthRoute(route) {
+  return route === "/health" || route.endsWith("/health");
+}
+
+function parseLaneRoute(route) {
+  const parts = route.replace(/^\/+/, "").split("/").filter(Boolean);
+  if (parts.length < 2) {
+    return null;
+  }
   return {
-    token: req.headers["x-relay-token"] || "",
-    role: req.headers["x-twoman-role"] || "",
-    peer: req.headers["x-twoman-peer"] || "",
-    session: req.headers["x-twoman-session"] || ""
+    lane: parts[parts.length - 2],
+    direction: parts[parts.length - 1]
+  };
+}
+
+function parseWebSocketLaneRoute(route) {
+  const parts = route.replace(/^\/+/, "").split("/").filter(Boolean);
+  if (parts.length < 1) {
+    return "";
+  }
+  return parts[parts.length - 1];
+}
+
+function connectionHeaders(req) {
+  const cookies = parseCookieHeader(req.headers.cookie || "");
+  const authorization = String(req.headers.authorization || "");
+  let token = "";
+  if (authorization.toLowerCase().startsWith("bearer ")) {
+    token = authorization.slice(7).trim();
+  }
+  if (!token) {
+    token = String(cookies.twoman_auth || req.headers["x-relay-token"] || "");
+  }
+  return {
+    token,
+    role: String(cookies.twoman_role || req.headers["x-twoman-role"] || ""),
+    peer: String(cookies.twoman_peer || req.headers["x-twoman-peer"] || ""),
+    session: String(cookies.twoman_session || req.headers["x-twoman-session"] || "")
   };
 }
 
@@ -1040,7 +1306,7 @@ async function handleLaneDownStream(peer, lane, res) {
     closed = true;
   });
   res.writeHead(200, {
-    "Content-Type": "application/octet-stream",
+    "Content-Type": BINARY_MEDIA_TYPE,
     "Cache-Control": "no-store",
     "X-Accel-Buffering": "no",
     Connection: "keep-alive",
@@ -1069,7 +1335,7 @@ async function handleLaneDownStream(peer, lane, res) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
   const route = state.normalizePath(url.pathname);
-  if (route === "/health") {
+  if (isHealthRoute(route)) {
     jsonResponse(res, 200, state.stats());
     return;
   }
@@ -1089,10 +1355,10 @@ const server = http.createServer(async (req, res) => {
     await handleUploadProbe(req, res);
     return;
   }
-  const parts = route.replace(/^\/+/, "").split("/");
-  if (parts.length === 2 && (parts[0] === LANE_CTL || parts[0] === LANE_DATA) && (parts[1] === "up" || parts[1] === "down")) {
-    const lane = parts[0];
-    const direction = parts[1];
+  const parsedRoute = parseLaneRoute(route);
+  if (parsedRoute && (parsedRoute.lane === LANE_CTL || parsedRoute.lane === LANE_DATA) && (parsedRoute.direction === "up" || parsedRoute.direction === "down")) {
+    const lane = parsedRoute.lane;
+    const direction = parsedRoute.direction;
     const headers = connectionHeaders(req);
     if (!headers.role || !headers.peer || !headers.session || !state.auth(headers.role, headers.token)) {
       jsonResponse(res, 403, { error: "invalid role or token" });
@@ -1100,6 +1366,12 @@ const server = http.createServer(async (req, res) => {
     }
     const peer = state.ensurePeer(headers.role, headers.peer, headers.session);
     if (req.method === "POST" && direction === "up") {
+      try {
+        validateBinaryMediaType(req.headers["content-type"]);
+      } catch (error) {
+        jsonResponse(res, 415, { error: error.message });
+        return;
+      }
       const decoder = new FrameDecoder();
       let frameCount = 0;
       for await (const chunk of req) {
@@ -1117,7 +1389,7 @@ const server = http.createServer(async (req, res) => {
         ? await state.nextCtlPayload(peer, state.downWaitMs.ctl)
         : await state.nextDataPayload(peer, state.downWaitMs.data);
       res.writeHead(200, {
-        "Content-Type": "application/octet-stream",
+        "Content-Type": BINARY_MEDIA_TYPE,
         "Content-Length": String(payload.length),
         "Cache-Control": "no-store"
       });
@@ -1142,12 +1414,12 @@ server.on("upgrade", (req, socket, head) => {
     });
     return;
   }
-  if (route !== `/${LANE_CTL}` && route !== `/${LANE_DATA}`) {
+  const lane = parseWebSocketLaneRoute(route);
+  if (lane !== LANE_CTL && lane !== LANE_DATA) {
     socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
     socket.destroy();
     return;
   }
-  const lane = route.slice(1);
   const headers = connectionHeaders(req);
   if (!headers.role || !headers.peer || !headers.session || !state.auth(headers.role, headers.token)) {
     socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
@@ -1187,8 +1459,22 @@ wss.on("connection", (ws) => {
   });
   ws.on("error", (error) => {
     trace(`ws error role=${headers.role} session=${headers.session} lane=${lane} error=${error}`);
+    runtimeLog(`ws error role=${headers.role} label=${headers.peer} session=${headers.session} lane=${lane} error=${error}`);
+    state.recordEvent("ws_error", {
+      role: headers.role,
+      peer_label: headers.peer,
+      peer_session_id: headers.session,
+      lane,
+      error: String(error && error.message ? error.message : error)
+    });
   });
   trace(`channel open role=${headers.role} label=${headers.peer} session=${headers.session} lane=${lane}`);
+  state.recordEvent("channel_open", {
+    role: headers.role,
+    peer_label: headers.peer,
+    peer_session_id: headers.session,
+    lane
+  });
 });
 
 setInterval(() => {
@@ -1208,28 +1494,53 @@ setInterval(() => {
 
 server.listen(process.env.PORT || 3000, () => {
   trace(`listening pid=${process.pid} base_uri=${state.baseUri || "/"}`);
+  runtimeLog(`listening pid=${process.pid} base_uri=${state.baseUri || "/"} runtime_log_path=${RUNTIME_LOG_PATH} event_log_path=${EVENT_LOG_PATH}`);
+  state.recordEvent("broker_started", {
+    pid: process.pid,
+    base_uri: state.baseUri || "/",
+    runtime_log_path: RUNTIME_LOG_PATH,
+    event_log_path: EVENT_LOG_PATH
+  });
 });
 
 process.on("uncaughtException", (error) => {
   trace(`uncaughtException pid=${process.pid} error=${error && error.stack ? error.stack : error}`);
+  runtimeLog(`uncaughtException pid=${process.pid} error=${error && error.stack ? error.stack : error}`);
+  state.recordEvent("uncaught_exception", {
+    pid: process.pid,
+    error: String(error && error.stack ? error.stack : error)
+  });
 });
 
 process.on("unhandledRejection", (reason) => {
   trace(`unhandledRejection pid=${process.pid} reason=${reason && reason.stack ? reason.stack : reason}`);
+  runtimeLog(`unhandledRejection pid=${process.pid} reason=${reason && reason.stack ? reason.stack : reason}`);
+  state.recordEvent("unhandled_rejection", {
+    pid: process.pid,
+    reason: String(reason && reason.stack ? reason.stack : reason)
+  });
 });
 
 process.on("beforeExit", (code) => {
   trace(`beforeExit pid=${process.pid} code=${code}`);
+  runtimeLog(`beforeExit pid=${process.pid} code=${code}`);
+  state.recordEvent("before_exit", { pid: process.pid, code });
 });
 
 process.on("exit", (code) => {
   trace(`exit pid=${process.pid} code=${code}`);
+  runtimeLog(`exit pid=${process.pid} code=${code}`);
+  state.recordEvent("exit", { pid: process.pid, code });
 });
 
 process.on("SIGTERM", () => {
   trace(`signal pid=${process.pid} sig=SIGTERM`);
+  runtimeLog(`signal pid=${process.pid} sig=SIGTERM`);
+  state.recordEvent("signal", { pid: process.pid, signal: "SIGTERM" });
 });
 
 process.on("SIGINT", () => {
   trace(`signal pid=${process.pid} sig=SIGINT`);
+  runtimeLog(`signal pid=${process.pid} sig=SIGINT`);
+  state.recordEvent("signal", { pid: process.pid, signal: "SIGINT" });
 });

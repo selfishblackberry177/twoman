@@ -33,6 +33,15 @@ TWOMAN_DATA_UP_FLUSH_DELAY_SECONDS="${TWOMAN_DATA_UP_FLUSH_DELAY_SECONDS:-0.006}
 TWOMAN_OPEN_CONNECT_TIMEOUT_SECONDS="${TWOMAN_OPEN_CONNECT_TIMEOUT_SECONDS:-12}"
 TWOMAN_PREFER_IPV4="${TWOMAN_PREFER_IPV4:-true}"
 TWOMAN_HAPPY_EYEBALLS_DELAY_SECONDS="${TWOMAN_HAPPY_EYEBALLS_DELAY_SECONDS:-0.25}"
+TWOMAN_AUTH_MODE="${TWOMAN_AUTH_MODE:-bearer}"
+TWOMAN_LEGACY_CUSTOM_HEADERS_ENABLED="${TWOMAN_LEGACY_CUSTOM_HEADERS_ENABLED:-false}"
+TWOMAN_BINARY_MEDIA_TYPE="${TWOMAN_BINARY_MEDIA_TYPE:-image/webp}"
+if [ -z "${TWOMAN_ROUTE_TEMPLATE:-}" ]; then
+  TWOMAN_ROUTE_TEMPLATE='/{lane}/{direction}'
+fi
+TWOMAN_HEALTH_TEMPLATE="${TWOMAN_HEALTH_TEMPLATE:-/health}"
+TWOMAN_AGENT_SERVICE_USER="${TWOMAN_AGENT_SERVICE_USER:-twoman}"
+TWOMAN_AGENT_SERVICE_GROUP="${TWOMAN_AGENT_SERVICE_GROUP:-twoman}"
 
 STREAMING_UP_JSON="[]"
 if [ -n "${TWOMAN_STREAMING_UP_LANES}" ]; then
@@ -63,6 +72,8 @@ echo "Creating remote directory..."
 echo "Uploading agent files..."
 "${SCP_CMD[@]}" \
   requirements.txt \
+  runtime_diagnostics.py \
+  twoman_http.py \
   twoman_protocol.py \
   twoman_transport.py \
   hidden_server/agent.py \
@@ -77,7 +88,16 @@ CONFIG_JSON="$(cat <<EOF
   "transport": "${TWOMAN_TRANSPORT}",
   "broker_base_url": "${TWOMAN_BROKER_BASE_URL}",
   "agent_token": "${TWOMAN_AGENT_TOKEN}",
+  "auth_mode": "${TWOMAN_AUTH_MODE}",
+  "legacy_custom_headers_enabled": ${TWOMAN_LEGACY_CUSTOM_HEADERS_ENABLED},
+  "binary_media_type": "${TWOMAN_BINARY_MEDIA_TYPE}",
+  "route_template": "${TWOMAN_ROUTE_TEMPLATE}",
+  "health_template": "${TWOMAN_HEALTH_TEMPLATE}",
   "http_timeout_seconds": 30,
+  "heartbeat_interval_seconds": 15,
+  "interval_jitter_ratio": 0.2,
+  "backoff_initial_delay_seconds": 0.1,
+  "backoff_max_delay_seconds": 5,
   "flush_delay_seconds": 0.01,
   "max_batch_bytes": 65536,
   "verify_tls": ${TWOMAN_VERIFY_TLS},
@@ -113,12 +133,22 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${TWOMAN_SERVER_DIR}
+User=${TWOMAN_AGENT_SERVICE_USER}
+Group=${TWOMAN_AGENT_SERVICE_GROUP}
 Environment=PYTHONUNBUFFERED=1
 Environment=TWOMAN_TRACE=${TWOMAN_TRACE}
 ExecStart=/usr/bin/python3 ${TWOMAN_SERVER_DIR}/agent.py --config ${TWOMAN_SERVER_DIR}/config.json
 Restart=always
 RestartSec=2
 LimitNOFILE=65536
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=${TWOMAN_SERVER_DIR}
+UMask=0077
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -140,6 +170,9 @@ echo "Installing remote config and services..."
 "${SSH_CMD[@]}" "${TWOMAN_SERVER_USER}@${TWOMAN_SERVER_HOST}" "cat > '${TWOMAN_SERVER_DIR}/config.json' <<'EOF'
 ${CONFIG_JSON}
 EOF
+getent group '${TWOMAN_AGENT_SERVICE_GROUP}' >/dev/null 2>&1 || groupadd --system '${TWOMAN_AGENT_SERVICE_GROUP}'
+id -u '${TWOMAN_AGENT_SERVICE_USER}' >/dev/null 2>&1 || useradd --system --gid '${TWOMAN_AGENT_SERVICE_GROUP}' --home-dir '${TWOMAN_SERVER_DIR}' --shell /usr/sbin/nologin '${TWOMAN_AGENT_SERVICE_USER}'
+chown -R '${TWOMAN_AGENT_SERVICE_USER}:${TWOMAN_AGENT_SERVICE_GROUP}' '${TWOMAN_SERVER_DIR}'
 cat > '/etc/systemd/system/${TWOMAN_AGENT_SERVICE_NAME}' <<'EOF'
 ${SERVICE_CONTENT}
 EOF

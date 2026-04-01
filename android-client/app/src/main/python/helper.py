@@ -60,6 +60,7 @@ RUNTIME_LOG_PATH = ""
 FAULT_LOG_HANDLE = None
 STOP_LOOP = None
 STOP_EVENT = None
+LISTEN_STATE_PATH = ""
 
 
 def trace(message):
@@ -167,7 +168,59 @@ def load_config(path):
         config = json.load(handle)
     if "broker_base_url" not in config and "broker_v2_base_url" in config:
         config["broker_base_url"] = config["broker_v2_base_url"]
+    config["__config_path"] = os.path.abspath(path)
     return config
+
+
+def configure_listen_state_path(config):
+    global LISTEN_STATE_PATH
+    configured_path = str(config.get("listen_state_path", "")).strip()
+    if not configured_path:
+        LISTEN_STATE_PATH = ""
+        return
+    config_path = str(config.get("__config_path", "")).strip()
+    if os.path.isabs(configured_path):
+        LISTEN_STATE_PATH = configured_path
+    else:
+        LISTEN_STATE_PATH = os.path.abspath(os.path.join(os.path.dirname(config_path), configured_path))
+    state_dir = os.path.dirname(LISTEN_STATE_PATH)
+    if state_dir:
+        os.makedirs(state_dir, exist_ok=True)
+
+
+def write_listen_state(payload):
+    if not LISTEN_STATE_PATH:
+        return
+    tmp_path = LISTEN_STATE_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    os.replace(tmp_path, LISTEN_STATE_PATH)
+
+
+def remove_listen_state_file():
+    if not LISTEN_STATE_PATH:
+        return
+    with contextlib.suppress(OSError):
+        os.remove(LISTEN_STATE_PATH)
+
+
+def bound_port(server):
+    sockets = getattr(server, "sockets", None) or []
+    if not sockets:
+        raise RuntimeError("server sockets are unavailable")
+    return int(sockets[0].getsockname()[1])
+
+
+async def start_bound_servers(hosts, requested_port, handler):
+    servers = []
+    active_port = None
+    for listen_host in hosts:
+        bind_port = requested_port if active_port is None else active_port
+        server = await asyncio.start_server(handler, listen_host, bind_port)
+        if active_port is None:
+            active_port = bound_port(server)
+        servers.append(server)
+    return servers, int(active_port or requested_port)
 
 
 def recv_until_headers(data):
@@ -888,23 +941,30 @@ async def main_async(config):
     serve_tasks = []
     stop_task = None
     try:
-        for listen_host in http_listen_hosts:
-            http_servers.append(
-                await asyncio.start_server(
-                    lambda r, w: handle_http(runtime, r, w),
-                    listen_host,
-                    http_port,
-                )
-            )
-        for listen_host in socks_listen_hosts:
-            socks_servers.append(
-                await asyncio.start_server(
-                    lambda r, w: handle_socks(runtime, r, w),
-                    listen_host,
-                    socks_port,
-                )
-            )
-        LOGGER.info("helper started log_path=%s", RUNTIME_LOG_PATH or "stderr-only")
+        http_servers, active_http_port = await start_bound_servers(
+            http_listen_hosts,
+            http_port,
+            lambda r, w: handle_http(runtime, r, w),
+        )
+        socks_servers, active_socks_port = await start_bound_servers(
+            socks_listen_hosts,
+            socks_port,
+            lambda r, w: handle_socks(runtime, r, w),
+        )
+        write_listen_state(
+            {
+                "http_hosts": http_listen_hosts,
+                "socks_hosts": socks_listen_hosts,
+                "http_port": active_http_port,
+                "socks_port": active_socks_port,
+            }
+        )
+        LOGGER.info(
+            "helper started log_path=%s http_port=%s socks_port=%s",
+            RUNTIME_LOG_PATH or "stderr-only",
+            active_http_port,
+            active_socks_port,
+        )
         for server in http_servers + socks_servers:
             serve_tasks.append(asyncio.create_task(server.serve_forever()))
         stop_task = asyncio.create_task(STOP_EVENT.wait())
@@ -929,6 +989,7 @@ async def main_async(config):
             with contextlib.suppress(Exception):
                 await socks_server.wait_closed()
         await runtime.stop()
+        remove_listen_state_file()
         STOP_EVENT = None
         STOP_LOOP = None
         LOGGER.info("helper stopped")
@@ -940,12 +1001,14 @@ def main():
     args = parser.parse_args()
     config = load_config(args.config)
     configure_runtime_logging(args.config, config)
+    configure_listen_state_path(config)
     for signum in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
         if signum is None:
             continue
         with contextlib.suppress(ValueError):
             signal.signal(signum, handle_shutdown_signal)
     try:
+        remove_listen_state_file()
         asyncio.run(main_async(config))
     except KeyboardInterrupt:
         LOGGER.info("helper interrupted by user")

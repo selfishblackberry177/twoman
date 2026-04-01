@@ -11,8 +11,8 @@ require_env() {
 
 CONFIG_PATH="${1:-local_client/config.json}"
 LISTEN_HOST="${TWOMAN_LISTEN_HOST:-127.0.0.1}"
-HTTP_PORT="${TWOMAN_HTTP_PORT:-18092}"
-SOCKS_PORT="${TWOMAN_SOCKS_PORT:-11092}"
+HTTP_PORT="${TWOMAN_HTTP_PORT:-0}"
+SOCKS_PORT="${TWOMAN_SOCKS_PORT:-0}"
 VERIFY_TLS="${TWOMAN_VERIFY_TLS:-true}"
 TWOMAN_HTTP2_CTL="${TWOMAN_HTTP2_CTL:-true}"
 TWOMAN_HTTP2_DATA="${TWOMAN_HTTP2_DATA:-false}"
@@ -21,10 +21,18 @@ TWOMAN_STREAMING_UP_LANES="${TWOMAN_STREAMING_UP_LANES:-}"
 TWOMAN_TRACE="${TWOMAN_TRACE:-0}"
 TWOMAN_LOG_DIR="${TWOMAN_LOG_DIR:-local_client/logs}"
 TWOMAN_LOG_PATH="${TWOMAN_LOG_PATH:-${TWOMAN_LOG_DIR%/}/helper.log}"
+TWOMAN_LISTEN_STATE_PATH="${TWOMAN_LISTEN_STATE_PATH:-local_client/runtime/listen-state.json}"
 TWOMAN_IDLE_REPOLL_CTL="${TWOMAN_IDLE_REPOLL_CTL:-0.05}"
 TWOMAN_IDLE_REPOLL_DATA="${TWOMAN_IDLE_REPOLL_DATA:-0.1}"
 TWOMAN_DATA_UP_MAX_BATCH_BYTES="${TWOMAN_DATA_UP_MAX_BATCH_BYTES:-65536}"
 TWOMAN_DATA_UP_FLUSH_DELAY_SECONDS="${TWOMAN_DATA_UP_FLUSH_DELAY_SECONDS:-0.004}"
+TWOMAN_AUTH_MODE="${TWOMAN_AUTH_MODE:-bearer}"
+TWOMAN_LEGACY_CUSTOM_HEADERS_ENABLED="${TWOMAN_LEGACY_CUSTOM_HEADERS_ENABLED:-false}"
+TWOMAN_BINARY_MEDIA_TYPE="${TWOMAN_BINARY_MEDIA_TYPE:-image/webp}"
+if [ -z "${TWOMAN_ROUTE_TEMPLATE:-}" ]; then
+  TWOMAN_ROUTE_TEMPLATE='/{lane}/{direction}'
+fi
+TWOMAN_HEALTH_TEMPLATE="${TWOMAN_HEALTH_TEMPLATE:-/health}"
 
 STREAMING_UP_JSON="[]"
 if [ -n "${TWOMAN_STREAMING_UP_LANES}" ]; then
@@ -46,10 +54,20 @@ if [ ! -f "${CONFIG_PATH}" ]; then
   "transport": "${TWOMAN_TRANSPORT}",
   "broker_base_url": "${TWOMAN_BROKER_BASE_URL}",
   "client_token": "${TWOMAN_CLIENT_TOKEN}",
+  "auth_mode": "${TWOMAN_AUTH_MODE}",
+  "legacy_custom_headers_enabled": ${TWOMAN_LEGACY_CUSTOM_HEADERS_ENABLED},
+  "binary_media_type": "${TWOMAN_BINARY_MEDIA_TYPE}",
+  "route_template": "${TWOMAN_ROUTE_TEMPLATE}",
+  "health_template": "${TWOMAN_HEALTH_TEMPLATE}",
   "listen_host": "${LISTEN_HOST}",
   "http_listen_port": ${HTTP_PORT},
   "socks_listen_port": ${SOCKS_PORT},
+  "listen_state_path": "${TWOMAN_LISTEN_STATE_PATH}",
   "http_timeout_seconds": 30,
+  "heartbeat_interval_seconds": 15,
+  "interval_jitter_ratio": 0.2,
+  "backoff_initial_delay_seconds": 0.1,
+  "backoff_max_delay_seconds": 5,
   "flush_delay_seconds": 0.01,
   "max_batch_bytes": 65536,
   "log_path": "${TWOMAN_LOG_PATH}",
@@ -75,7 +93,7 @@ fi
 
 python3 -m pip install -r requirements.txt
 mkdir -p "$(dirname "${TWOMAN_LOG_PATH}")"
-echo "Twoman helper log: ${TWOMAN_LOG_PATH}" >&2
+echo "Local helper log: ${TWOMAN_LOG_PATH}" >&2
 exec env \
   TWOMAN_TRACE="${TWOMAN_TRACE}" \
   TWOMAN_LOG_PATH="${TWOMAN_LOG_PATH}" \

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import logging
 import os
 import queue
 import sys
@@ -13,6 +14,14 @@ ROOT_DIR = os.path.dirname(os.path.dirname(CURRENT_DIR))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
+from twoman_http import (
+    expected_binary_media_type,
+    extract_connection_identity,
+    is_health_path,
+    normalize_request_path,
+    parse_lane_path,
+    validate_binary_media_type,
+)
 from twoman_protocol import (
     Frame,
     FrameDecoder,
@@ -28,12 +37,23 @@ from twoman_protocol import (
     encode_frame,
     make_error_payload,
 )
+from runtime_diagnostics import (
+    DurableEventRecorder,
+    configure_component_logger,
+    event_log_path,
+    event_log_settings,
+    runtime_log_path,
+    runtime_log_settings,
+)
 
 
 TRACE_ENABLED = os.environ.get("TWOMAN_TRACE", "").strip().lower() in ("1", "true", "yes", "on", "debug", "verbose")
 CONFIG_PATH = os.environ.get("TWOMAN_CONFIG_PATH", os.path.join(CURRENT_DIR, "config.json"))
-BRIDGE_PREFIX = "/bridge/v2"
 DOWN_POLL_TIMEOUT_SECONDS = max(0.01, float(os.environ.get("TWOMAN_DOWN_POLL_TIMEOUT_SECONDS", "0.25")))
+LOGGER = logging.getLogger("twoman.passenger_broker")
+RUNTIME_LOG_PATH = ""
+EVENT_LOG_PATH = ""
+EVENT_RECORDER = None
 
 
 def now_ms():
@@ -43,9 +63,63 @@ def now_ms():
 def trace(message):
     if not TRACE_ENABLED:
         return
+    if LOGGER.handlers:
+        LOGGER.debug(message)
+        return
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
     sys.stderr.write("[%s] [passenger-broker] %s\n" % (timestamp, message))
     sys.stderr.flush()
+
+
+def record_event(kind, **fields):
+    if EVENT_RECORDER is None:
+        return
+    try:
+        EVENT_RECORDER.record(kind, component="passenger-broker", **fields)
+    except Exception:
+        LOGGER.exception("passenger broker event log write failed kind=%s", kind)
+
+
+def configure_runtime_logging(config_path, config):
+    global RUNTIME_LOG_PATH
+    if LOGGER.handlers:
+        return
+    RUNTIME_LOG_PATH = runtime_log_path(config_path, config, "passenger-broker.log")
+    settings = runtime_log_settings(config)
+    configure_component_logger(
+        LOGGER,
+        log_path=RUNTIME_LOG_PATH,
+        trace_enabled=TRACE_ENABLED,
+        runtime_log_max_bytes=settings["max_bytes"],
+        runtime_log_backup_count=settings["backup_count"],
+        console_prefix="passenger-broker",
+    )
+    LOGGER.info(
+        "passenger broker logging initialized log_path=%s max_bytes=%s backup_count=%s",
+        RUNTIME_LOG_PATH,
+        settings["max_bytes"],
+        settings["backup_count"],
+    )
+
+
+def configure_event_logging(config_path, config):
+    global EVENT_RECORDER, EVENT_LOG_PATH
+    if EVENT_RECORDER is not None:
+        return
+    EVENT_LOG_PATH = event_log_path(config_path, config, "passenger-broker-events.ndjson")
+    settings = event_log_settings(config)
+    EVENT_RECORDER = DurableEventRecorder(
+        EVENT_LOG_PATH,
+        max_bytes=settings["max_bytes"],
+        backup_count=settings["backup_count"],
+        recent_limit=settings["recent_limit"],
+    )
+    LOGGER.info(
+        "passenger broker event logging initialized event_log_path=%s max_bytes=%s backup_count=%s",
+        EVENT_LOG_PATH,
+        settings["max_bytes"],
+        settings["backup_count"],
+    )
 
 
 def padded_payload(payload, minimum_size=1024):
@@ -118,6 +192,7 @@ class StreamState(object):
 
 class BrokerState(object):
     def __init__(self, config):
+        self.config = config
         self.client_tokens = set(config.get("client_tokens", []))
         self.agent_tokens = set(config.get("agent_tokens", []))
         self.peer_ttl_ms = int(config.get("peer_ttl_seconds", 90)) * 1000
@@ -163,6 +238,7 @@ class BrokerState(object):
                 peer = PeerState(role, peer_label, peer_session_id)
                 self.peers[key] = peer
                 trace("peer online role=%s label=%s session=%s" % (role, peer_label, peer_session_id))
+                record_event("peer_online", role=role, peer_label=peer_label, peer_session_id=peer_session_id)
             peer.touch()
             peer.peer_label = peer_label
             if role == "agent":
@@ -176,14 +252,43 @@ class BrokerState(object):
             peer = self.peers.get((role, peer_session_id))
             if peer is None:
                 trace("drop frame type=%s stream=%s target=%s/%s lane=%s reason=no-peer" % (frame.type_id, frame.stream_id, role, peer_session_id, lane))
+                record_event(
+                    "queue_drop",
+                    reason="no-peer",
+                    role=role,
+                    peer_session_id=peer_session_id,
+                    lane=lane,
+                    type_id=frame.type_id,
+                    stream_id=frame.stream_id,
+                )
                 return False
             queue_obj = peer.queues[lane]
             if queue_obj.buffered_bytes >= self.max_lane_bytes:
                 trace("drop frame type=%s stream=%s target=%s/%s lane=%s reason=queue-full buffered=%s" % (frame.type_id, frame.stream_id, role, peer_session_id, lane, queue_obj.buffered_bytes))
+                record_event(
+                    "queue_drop",
+                    reason="queue-full",
+                    role=role,
+                    peer_session_id=peer_session_id,
+                    lane=lane,
+                    type_id=frame.type_id,
+                    stream_id=frame.stream_id,
+                    buffered_bytes=queue_obj.buffered_bytes,
+                )
                 return False
             total_buffered = peer.buffered_bytes_total()
             if total_buffered >= self.max_peer_buffered_bytes:
                 trace("drop frame type=%s stream=%s target=%s/%s lane=%s reason=peer-buffer-full buffered=%s" % (frame.type_id, frame.stream_id, role, peer_session_id, lane, total_buffered))
+                record_event(
+                    "queue_drop",
+                    reason="peer-buffer-full",
+                    role=role,
+                    peer_session_id=peer_session_id,
+                    lane=lane,
+                    type_id=frame.type_id,
+                    stream_id=frame.stream_id,
+                    buffered_bytes=total_buffered,
+                )
                 return False
         queue_obj.put(payload)
         if lane in ("pri", "bulk"):
@@ -191,6 +296,15 @@ class BrokerState(object):
                 peer.data_condition.notify_all()
         if frame.type_id != FRAME_DATA:
             trace("queue frame type=%s stream=%s target=%s/%s lane=%s bytes=%s" % (frame.type_id, frame.stream_id, role, peer_session_id, lane, len(payload)))
+            record_event(
+                "queue_ctl",
+                role=role,
+                peer_session_id=peer_session_id,
+                lane=lane,
+                type_id=frame.type_id,
+                stream_id=frame.stream_id,
+                payload_bytes=len(frame.payload),
+            )
         return True
 
     def handle_frame(self, sender_role, sender_peer_session_id, lane, frame):
@@ -206,6 +320,15 @@ class BrokerState(object):
                 stream = self.streams_by_agent.get(frame.stream_id)
             if stream is None:
                 trace("drop frame type=%s stream=%s from=%s/%s lane=%s reason=unknown-stream" % (frame.type_id, frame.stream_id, sender_role, sender_peer_session_id, lane))
+                record_event(
+                    "frame_drop",
+                    reason="unknown-stream",
+                    sender_role=sender_role,
+                    sender_peer_session_id=sender_peer_session_id,
+                    lane=lane,
+                    type_id=frame.type_id,
+                    stream_id=frame.stream_id,
+                )
                 return
             stream.touch()
             if sender_role == "helper":
@@ -234,6 +357,18 @@ class BrokerState(object):
                 LANE_CTL,
                 Frame(FRAME_RST, stream_id=frame.stream_id, payload=make_error_payload("broker queue full")),
             )
+        elif frame.type_id != FRAME_DATA:
+            record_event(
+                "frame_forward",
+                sender_role=sender_role,
+                sender_peer_session_id=sender_peer_session_id,
+                target_role=target_role,
+                target_peer_session_id=target_peer_session_id,
+                source_lane=lane,
+                type_id=frame.type_id,
+                source_stream_id=frame.stream_id,
+                target_stream_id=outbound_stream_id,
+            )
         if frame.type_id == FRAME_RST:
             with self.lock:
                 self._drop_stream_locked(stream)
@@ -261,10 +396,30 @@ class BrokerState(object):
                 if agent_peer is not None:
                     agent_peer.active_streams += 1
                 trace("open helper=%s/%s helper_stream=%s agent_session=%s agent_stream=%s" % (helper_peer_label, helper_session_id, frame.stream_id, agent_session_id, agent_stream_id))
+                record_event(
+                    "open_map",
+                    helper_session_id=helper_session_id,
+                    helper_peer_label=helper_peer_label,
+                    helper_stream_id=frame.stream_id,
+                    agent_session_id=agent_session_id,
+                    agent_stream_id=agent_stream_id,
+                )
         if open_error:
+            record_event(
+                "open_fail",
+                helper_session_id=helper_session_id,
+                helper_stream_id=frame.stream_id,
+                reason=open_error,
+            )
             self.queue_frame("helper", helper_session_id, LANE_CTL, Frame(FRAME_OPEN_FAIL, stream_id=frame.stream_id, payload=make_error_payload(open_error)))
             return
         if not agent_session_id:
+            record_event(
+                "open_fail",
+                helper_session_id=helper_session_id,
+                helper_stream_id=frame.stream_id,
+                reason="no-agent",
+            )
             self.queue_frame("helper", helper_session_id, LANE_CTL, Frame(FRAME_OPEN_FAIL, stream_id=frame.stream_id, payload=make_error_payload("hidden agent unavailable")))
             return
         self.queue_frame("agent", agent_session_id, LANE_CTL, Frame(FRAME_OPEN, stream_id=agent_stream_id, offset=frame.offset, payload=frame.payload, flags=frame.flags))
@@ -272,6 +427,14 @@ class BrokerState(object):
     def _drop_stream_locked(self, stream):
         self.streams_by_helper.pop((stream.helper_session_id, stream.helper_stream_id), None)
         self.streams_by_agent.pop(stream.agent_stream_id, None)
+        record_event(
+            "drop_stream",
+            helper_session_id=stream.helper_session_id,
+            helper_peer_label=stream.helper_peer_label,
+            helper_stream_id=stream.helper_stream_id,
+            agent_session_id=stream.agent_session_id,
+            agent_stream_id=stream.agent_stream_id,
+        )
         helper_peer = self.peers.get(("helper", stream.helper_session_id))
         if helper_peer is not None and helper_peer.active_streams > 0:
             helper_peer.active_streams -= 1
@@ -298,6 +461,7 @@ class BrokerState(object):
             stale_peers = [key for key, peer in self.peers.items() if peer.last_seen_ms < peer_cutoff]
             for key in stale_peers:
                 role, peer_session_id = key
+                record_event("cleanup_peer_expired", role=role, peer_session_id=peer_session_id)
                 stale_streams_for_peer = [
                     stream
                     for stream in self.streams_by_agent.values()
@@ -312,6 +476,13 @@ class BrokerState(object):
                     self.agent_peer_label = ""
             stale_streams = [stream for stream in self.streams_by_agent.values() if stream.last_seen_ms < stream_cutoff]
             for stream in stale_streams:
+                record_event(
+                    "cleanup_stream_expired",
+                    helper_session_id=stream.helper_session_id,
+                    helper_stream_id=stream.helper_stream_id,
+                    agent_session_id=stream.agent_session_id,
+                    agent_stream_id=stream.agent_stream_id,
+                )
                 resets.extend(self._reset_frames_for_stale_stream_locked(stream))
                 self._drop_stream_locked(stream)
         for role, peer_session_id, lane, frame in resets:
@@ -347,6 +518,10 @@ class BrokerState(object):
                 "streams": len(self.streams_by_agent),
                 "agent_peer_label": self.agent_peer_label,
                 "agent_session_id": self.agent_session_id,
+                "log_paths": {
+                    "runtime": RUNTIME_LOG_PATH,
+                    "events": EVENT_LOG_PATH,
+                },
                 "max_streams_per_peer_session": self.max_streams_per_peer_session,
                 "max_open_rate_per_peer_session": self.max_open_rate_per_peer_session,
                 "open_rate_window_seconds": int(self.open_rate_window_ms / 1000),
@@ -355,6 +530,7 @@ class BrokerState(object):
                 "buffered_pri_bytes": buffered["pri"],
                 "buffered_bulk_bytes": buffered["bulk"],
                 "metrics": self.metrics,
+                "recent_events": EVENT_RECORDER.snapshot(64) if EVENT_RECORDER is not None else [],
             }
 
     def lane_profile(self, lane):
@@ -413,7 +589,20 @@ def load_config():
         return json.load(handle)
 
 
-_STATE = BrokerState(load_config())
+_CONFIG = load_config()
+if not TRACE_ENABLED and _CONFIG.get("trace_enabled"):
+    TRACE_ENABLED = True
+configure_runtime_logging(CONFIG_PATH, _CONFIG)
+configure_event_logging(CONFIG_PATH, _CONFIG)
+LOGGER.info(
+    "passenger broker loaded config_path=%s log_path=%s event_log_path=%s",
+    CONFIG_PATH,
+    RUNTIME_LOG_PATH or "stderr-only",
+    EVENT_LOG_PATH or "disabled",
+)
+record_event("broker_loaded", config_path=CONFIG_PATH)
+_STATE = BrokerState(_CONFIG)
+_BINARY_MEDIA_TYPE = expected_binary_media_type(_CONFIG)
 _CLEANUP_STARTED = False
 _CLEANUP_LOCK = threading.Lock()
 
@@ -431,6 +620,7 @@ def ensure_cleanup_thread():
                     _STATE.cleanup()
                 except Exception as error:
                     trace("cleanup error=%r" % (error,))
+                    record_event("cleanup_error", error=str(error))
 
         thread = threading.Thread(target=loop, name="twoman-cleanup", daemon=True)
         thread.start()
@@ -453,6 +643,9 @@ def parse_request(environ):
     method = environ.get("REQUEST_METHOD", "GET").upper()
     path = environ.get("PATH_INFO", "") or "/"
     headers = {
+        "authorization": environ.get("HTTP_AUTHORIZATION", ""),
+        "cookie": environ.get("HTTP_COOKIE", ""),
+        "content-type": environ.get("CONTENT_TYPE", ""),
         "x-relay-token": environ.get("HTTP_X_RELAY_TOKEN", ""),
         "x-twoman-role": environ.get("HTTP_X_TWOMAN_ROLE", ""),
         "x-twoman-peer": environ.get("HTTP_X_TWOMAN_PEER", ""),
@@ -466,12 +659,10 @@ def parse_request(environ):
 
 
 def normalize_path(path):
-    if path == "/health":
-        return path
-    if path.startswith(BRIDGE_PREFIX):
-        suffix = path[len(BRIDGE_PREFIX):]
-        return suffix or "/"
-    return path
+    return normalize_request_path(
+        path,
+        _CONFIG.get("base_uri") or _CONFIG.get("route_base_path"),
+    )
 
 
 def application(environ, start_response):
@@ -479,25 +670,29 @@ def application(environ, start_response):
     method, raw_path, headers, body = parse_request(environ)
     path = normalize_path(raw_path)
 
-    if raw_path in ("/health", BRIDGE_PREFIX + "/health"):
+    if is_health_path(path, _CONFIG.get("health_template")):
         return json_response(start_response, 200, _STATE.stats())
 
-    parts = path.strip("/").split("/")
-    if len(parts) != 2 or parts[0] not in (list(LANES) + [LANE_DATA]) or parts[1] not in ("up", "down"):
+    route = parse_lane_path(path, _CONFIG.get("route_template"))
+    if route is None:
         return json_response(start_response, 404, {"error": "not found", "path": raw_path})
 
-    lane = parts[0]
-    direction = parts[1]
-    role = headers["x-twoman-role"]
-    peer_label = headers["x-twoman-peer"]
-    peer_session_id = headers["x-twoman-session"]
-    token = headers["x-relay-token"]
+    lane = route.get("lane", "")
+    direction = route.get("direction", "")
+    if lane not in (list(LANES) + [LANE_DATA]) or direction not in ("up", "down"):
+        return json_response(start_response, 404, {"error": "not found", "path": raw_path})
+    identity = extract_connection_identity(headers, _CONFIG)
+    role = identity["role"]
+    peer_label = identity["peer_label"]
+    peer_session_id = identity["peer_session_id"]
+    token = identity["token"]
     if not role or not peer_label or not peer_session_id or not _STATE.auth(role, token):
         return json_response(start_response, 403, {"error": "invalid role or token"})
 
     peer = _STATE.ensure_peer(role, peer_label, peer_session_id)
 
     if method == "POST" and direction == "up":
+        validate_binary_media_type(headers.get("content-type", ""), _CONFIG)
         decoder = FrameDecoder()
         frame_count = 0
         batch_lane = lane if lane != LANE_DATA else "pri"
@@ -514,6 +709,14 @@ def application(environ, start_response):
             _STATE.metrics["up_frames"][frame_lane] += 1
             _STATE.metrics["up_bytes"][frame_lane] += len(encode_frame(frame))
         _STATE.metrics["up_batches"][batch_lane] += 1
+        record_event(
+            "up_batch",
+            role=role,
+            peer_session_id=peer_session_id,
+            lane=batch_lane,
+            frame_count=frame_count,
+            body_bytes=len(body),
+        )
         return json_response(start_response, 200, {"ok": True, "frames": frame_count})
 
     if method != "GET" or direction != "down":
@@ -532,7 +735,7 @@ def application(environ, start_response):
         _STATE.metrics["down_bytes"][source_lane] += len(payload)
         _STATE.metrics["down_hold_ms"][source_lane] += hold_ms
         _STATE.metrics["down_pad_bytes"][source_lane] += pad_bytes
-        start_response("200 OK", [("Content-Type", "application/octet-stream"), ("Content-Length", str(len(payload))), ("Cache-Control", "no-store")])
+        start_response("200 OK", [("Content-Type", _BINARY_MEDIA_TYPE), ("Content-Length", str(len(payload))), ("Cache-Control", "no-store")])
         return [payload]
 
     queue_obj = peer.queues[lane]
@@ -543,7 +746,7 @@ def application(environ, start_response):
         payloads.append(queue_obj.get(timeout=DOWN_POLL_TIMEOUT_SECONDS))
     except queue.Empty:
         ping = padded_payload(encode_frame(Frame(FRAME_PING, offset=now_ms())), minimum_size=int(profile["pad_min"]))
-        start_response("200 OK", [("Content-Type", "application/octet-stream"), ("Content-Length", str(len(ping))), ("Cache-Control", "no-store")])
+        start_response("200 OK", [("Content-Type", _BINARY_MEDIA_TYPE), ("Content-Length", str(len(ping))), ("Cache-Control", "no-store")])
         return [ping]
     peer.touch()
     total = len(payloads[0])
@@ -569,5 +772,5 @@ def application(environ, start_response):
     _STATE.metrics["down_bytes"][lane] += len(padded)
     _STATE.metrics["down_hold_ms"][lane] += hold_ms
     _STATE.metrics["down_pad_bytes"][lane] += pad_bytes
-    start_response("200 OK", [("Content-Type", "application/octet-stream"), ("Content-Length", str(len(padded))), ("Cache-Control", "no-store")])
+    start_response("200 OK", [("Content-Type", _BINARY_MEDIA_TYPE), ("Content-Length", str(len(padded))), ("Cache-Control", "no-store")])
     return [padded]

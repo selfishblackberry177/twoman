@@ -4,10 +4,19 @@ plugins {
     id("com.chaquo.python")
 }
 
+fun quoteForGradle(value: String): String =
+    "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
 val releaseStoreFile = providers.environmentVariable("TWOMAN_ANDROID_KEYSTORE_FILE").orNull
 val releaseStorePassword = providers.environmentVariable("TWOMAN_ANDROID_KEYSTORE_PASSWORD").orNull
 val releaseKeyAlias = providers.environmentVariable("TWOMAN_ANDROID_KEY_ALIAS").orNull
 val releaseKeyPassword = providers.environmentVariable("TWOMAN_ANDROID_KEY_PASSWORD").orNull
+val androidAppLabel = providers.environmentVariable("TWOMAN_ANDROID_APP_LABEL").orElse("Local Network Bridge").get()
+val androidProxyTitle = providers.environmentVariable("TWOMAN_ANDROID_PROXY_TITLE").orElse("Local Network Bridge").get()
+val androidVpnTitle = providers.environmentVariable("TWOMAN_ANDROID_VPN_TITLE").orElse("Standard System Adapter").get()
+val androidChannelName = providers.environmentVariable("TWOMAN_ANDROID_CHANNEL_NAME").orElse("Local Network Bridge").get()
+val androidVpnSessionName = providers.environmentVariable("TWOMAN_ANDROID_VPN_SESSION_NAME").orElse("Standard System Adapter").get()
+val androidLogTag = providers.environmentVariable("TWOMAN_ANDROID_LOG_TAG").orElse("LocalBridgeSvc").get()
 val hasReleaseSigning =
     !releaseStoreFile.isNullOrBlank() &&
         !releaseStorePassword.isNullOrBlank() &&
@@ -24,6 +33,12 @@ android {
         targetSdk = 35
         versionCode = 5
         versionName = "0.5.0"
+        buildConfigField("String", "RUNTIME_LOG_TAG", quoteForGradle(androidLogTag))
+        buildConfigField("String", "VPN_SESSION_NAME", quoteForGradle(androidVpnSessionName))
+        resValue("string", "runtime_app_name", quoteForGradle(androidAppLabel))
+        resValue("string", "runtime_proxy_title", quoteForGradle(androidProxyTitle))
+        resValue("string", "runtime_vpn_title", quoteForGradle(androidVpnTitle))
+        resValue("string", "runtime_channel_name", quoteForGradle(androidChannelName))
     }
 
     signingConfigs {
@@ -76,6 +91,7 @@ android {
     }
 
     buildFeatures {
+        buildConfig = true
         viewBinding = true
     }
     packaging {

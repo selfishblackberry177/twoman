@@ -15,14 +15,14 @@ cat > "$TMP_DIR/broker-config.json" <<'JSON'
   "stream_ttl_seconds": 300,
   "max_lane_bytes": 16777216,
   "max_peer_buffered_bytes": 33554432,
-  "base_uri": ""
+  "base_uri": "/api/v1/telemetry"
 }
 JSON
 
 cat > "$TMP_DIR/agent.json" <<'JSON'
 {
   "transport": "ws",
-  "broker_base_url": "http://127.0.0.1:18094",
+  "broker_base_url": "http://127.0.0.1:18094/api/v1/telemetry",
   "agent_token": "test-agent-token",
   "peer_id": "agent-test",
   "http_timeout_seconds": 10,
@@ -35,12 +35,13 @@ JSON
 cat > "$TMP_DIR/helper.json" <<'JSON'
 {
   "transport": "ws",
-  "broker_base_url": "http://127.0.0.1:18094",
+  "broker_base_url": "http://127.0.0.1:18094/api/v1/telemetry",
   "client_token": "test-client-token",
   "peer_id": "helper-test",
   "listen_host": "127.0.0.1",
-  "http_listen_port": 28081,
-  "socks_listen_port": 21081,
+  "http_listen_port": 0,
+  "socks_listen_port": 0,
+  "listen_state_path": "helper-listen-state.json",
   "http_timeout_seconds": 10,
   "flush_delay_seconds": 0.01,
   "max_batch_bytes": 65536,
@@ -112,11 +113,44 @@ PY
 wait_for_port 127.0.0.1 18094 broker
 wait_for_port 127.0.0.1 19090 origin
 wait_for_port 127.0.0.1 19443 tls-origin
-wait_for_port 127.0.0.1 28081 http-helper
-wait_for_port 127.0.0.1 21081 socks-helper
+wait_for_listen_state() {
+  local path="$1"
+  for _ in $(seq 1 50); do
+    if python3 - "$path" <<'PY' >/dev/null 2>&1
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+assert int(payload["http_port"]) > 0
+assert int(payload["socks_port"]) > 0
+PY
+    then
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "Timed out waiting for helper listen state: $path" >&2
+  return 1
+}
+
+read_listen_port() {
+  local path="$1"
+  local key="$2"
+  python3 - "$path" "$key" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+print(int(payload[sys.argv[2]]))
+PY
+}
+
+wait_for_listen_state "$TMP_DIR/helper-listen-state.json"
+HELPER_HTTP_PORT="$(read_listen_port "$TMP_DIR/helper-listen-state.json" http_port)"
+HELPER_SOCKS_PORT="$(read_listen_port "$TMP_DIR/helper-listen-state.json" socks_port)"
+wait_for_port 127.0.0.1 "$HELPER_HTTP_PORT" http-helper
+wait_for_port 127.0.0.1 "$HELPER_SOCKS_PORT" socks-helper
 
 curl --fail --silent --show-error \
-  --socks5-hostname "127.0.0.1:21081" \
+  --socks5-hostname "127.0.0.1:${HELPER_SOCKS_PORT}" \
   "http://127.0.0.1:19090/socks-test?via=socks" \
   > "$TMP_DIR/socks.json"
 
@@ -129,7 +163,7 @@ assert payload["method"] == "GET", payload
 PY
 
 curl --fail --silent --show-error --insecure \
-  --proxy "http://127.0.0.1:28081" \
+  --proxy "http://127.0.0.1:${HELPER_HTTP_PORT}" \
   "https://127.0.0.1:19443/secure-test?via=http" \
   > "$TMP_DIR/http.txt"
 

@@ -11,9 +11,9 @@ Twoman is designed for environments where:
 ## Data Path
 
 1. An application talks to the local helper.
-2. The helper speaks Twoman frames to the public bridge at `/twoman/bridge/v2/...`.
-   The `/bridge/v2` path name is retained for deployment compatibility.
-3. LiteSpeed reverse-proxies those paths to the localhost Python broker.
+2. The helper speaks Twoman frames to the public broker at a fully configured base URI such as
+   `/api/v1/telemetry`, with relative route templates such as `/{lane}/{direction}`.
+3. Preferred shared-host deployments use internal application-server integration such as Passenger WSGI.
 4. The hidden agent maintains a reverse session to the broker.
 5. The hidden server opens the real outbound TCP connection.
 
@@ -32,13 +32,12 @@ The external `data` lane carries both `pri` and `bulk` traffic. `FRAME_DATA` bul
 
 ## Authentication
 
-Each public request includes:
-- `X-Relay-Token`
-- `X-Twoman-Role`
-- `X-Twoman-Peer`
-- `X-Twoman-Session`
+Each public request now prefers:
+- `Authorization: Bearer <token>`
+- `Cookie: twoman_role=...; twoman_peer=...; twoman_session=...`
 
-The token is the shared bearer credential. Peer and session headers are routing identity, not the secret.
+Legacy `X-Relay-Token` and `X-Twoman-*` headers are deprecated compatibility fallbacks.
+The token remains the shared bearer credential. Peer and session cookies provide routing identity, not the secret.
 
 ## Why The Host Broker Exists
 
@@ -49,14 +48,15 @@ The broker exists because:
 
 The broker is:
 - asyncio-based
-- loopback-bound
-- started and supervised by PHP bootstrap code
+- deployable behind Passenger WSGI or a compatibility daemon
+- able to use Unix domain sockets for host-internal control traffic when the deployment supports it
 
 ## Host Constraints
 
 Twoman is intentionally shaped around shared-host reality:
 - response streaming works better than aggressive request-body transport
 - helper downlinks use streamed HTTP/1.1
+- binary lane traffic defaults to `image/webp` so intermediaries see a standard media type
 - larger uploads and larger browser workloads are the practical ceiling
 
 ## Production Reality

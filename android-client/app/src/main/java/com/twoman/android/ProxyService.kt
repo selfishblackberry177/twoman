@@ -12,8 +12,9 @@ import org.json.JSONObject
 import kotlin.concurrent.thread
 
 class ProxyService : Service() {
-    private val loggerTag = "TwomanSvc"
+    private val loggerTag = BuildConfig.RUNTIME_LOG_TAG
     private var helperThread: Thread? = null
+    private var listenWatcherThread: Thread? = null
     private lateinit var stateStore: RuntimeStateStore
     @Volatile
     private var currentMode: String = MODE_PROXY
@@ -48,13 +49,16 @@ class ProxyService : Service() {
             NotificationHelper.PROXY_NOTIFICATION_ID,
             NotificationHelper.build(
                 this,
-                getString(R.string.notification_proxy_title),
-                "${profile.name}  ${profile.socksPort}/${profile.httpPort}",
+                getString(R.string.runtime_proxy_title),
+                getString(R.string.status_starting_message),
             ),
         )
         if (helperThread == null) {
-            helperThread = thread(name = "twoman-python-helper", start = true) {
+            helperThread = thread(name = "local-runtime-helper", start = true) {
                 runHelper(profile, mode)
+            }
+            listenWatcherThread = thread(name = "local-runtime-listen-watch", start = true) {
+                waitForListenState(profile, mode)
             }
         }
         return START_NOT_STICKY
@@ -63,7 +67,12 @@ class ProxyService : Service() {
     private fun runHelper(profile: ClientProfile, mode: String) {
         val configFile = AppFiles.runtimeConfigFile(this, profile.id)
         val logFile = AppFiles.runtimeLogFile(this, profile.id)
-        configFile.writeText(profile.toRuntimeConfig(logFile.absolutePath).toString(2), Charsets.UTF_8)
+        val listenStateFile = AppFiles.runtimeListenStateFile(this, profile.id)
+        listenStateFile.delete()
+        configFile.writeText(
+            profile.toRuntimeConfig(logFile.absolutePath, listenStateFile.absolutePath).toString(2),
+            Charsets.UTF_8,
+        )
         stateStore.write(
             RuntimeStatus(
                 running = true,
@@ -71,10 +80,10 @@ class ProxyService : Service() {
                 profileId = profile.id,
                 profileName = profile.name,
                 brokerBaseUrl = profile.brokerBaseUrl,
-                httpPort = profile.httpPort,
-                socksPort = profile.socksPort,
+                httpPort = 0,
+                socksPort = 0,
                 logPath = logFile.absolutePath,
-                message = "",
+                message = getString(R.string.status_starting_message),
             ),
         )
         try {
@@ -91,22 +100,53 @@ class ProxyService : Service() {
                     profileId = profile.id,
                     profileName = profile.name,
                     brokerBaseUrl = profile.brokerBaseUrl,
-                    httpPort = profile.httpPort,
-                    socksPort = profile.socksPort,
+                    httpPort = currentListenState(profile)?.httpPort ?: 0,
+                    socksPort = currentListenState(profile)?.socksPort ?: 0,
                     logPath = logFile.absolutePath,
                     message = error.message ?: error.javaClass.simpleName,
                 ),
             )
         } finally {
             helperThread = null
+            listenWatcherThread = null
             stopSelf()
         }
     }
+
+    private fun waitForListenState(profile: ClientProfile, mode: String) {
+        repeat(75) {
+            if (stopRequested || helperThread == null) {
+                return
+            }
+            val listenState = currentListenState(profile)
+            if (listenState != null && listenState.httpPort > 0 && listenState.socksPort > 0) {
+                stateStore.write(
+                    RuntimeStatus(
+                        running = true,
+                        mode = mode,
+                        profileId = profile.id,
+                        profileName = profile.name,
+                        brokerBaseUrl = profile.brokerBaseUrl,
+                        httpPort = listenState.httpPort,
+                        socksPort = listenState.socksPort,
+                        logPath = AppFiles.runtimeLogFile(this, profile.id).absolutePath,
+                        message = "",
+                    ),
+                )
+                return
+            }
+            Thread.sleep(200L)
+        }
+    }
+
+    private fun currentListenState(profile: ClientProfile): RuntimeListenState? =
+        AppFiles.readRuntimeListenState(this, profile.id)
 
     private fun requestStop() {
         stopRequested = true
         stopForeground(STOP_FOREGROUND_REMOVE)
         currentProfile?.let { profile ->
+            val listenState = currentListenState(profile)
             stateStore.write(
                 RuntimeStatus(
                     running = true,
@@ -114,15 +154,15 @@ class ProxyService : Service() {
                     profileId = profile.id,
                     profileName = profile.name,
                     brokerBaseUrl = profile.brokerBaseUrl,
-                    httpPort = profile.httpPort,
-                    socksPort = profile.socksPort,
+                    httpPort = listenState?.httpPort ?: 0,
+                    socksPort = listenState?.socksPort ?: 0,
                     logPath = AppFiles.runtimeLogFile(this, profile.id).absolutePath,
                     message = getString(R.string.status_stopping_message),
                 ),
             )
         }
         val threadToJoin = helperThread
-        thread(name = "twoman-python-stop", start = true) {
+        thread(name = "local-runtime-stop", start = true) {
             val stopped = runCatching {
                 if (!Python.isStarted()) {
                     false
@@ -147,8 +187,8 @@ class ProxyService : Service() {
                             profileId = profile.id,
                             profileName = profile.name,
                             brokerBaseUrl = profile.brokerBaseUrl,
-                            httpPort = profile.httpPort,
-                            socksPort = profile.socksPort,
+                            httpPort = currentListenState(profile)?.httpPort ?: 0,
+                            socksPort = currentListenState(profile)?.socksPort ?: 0,
                             logPath = AppFiles.runtimeLogFile(this, profile.id).absolutePath,
                             message = "",
                         ),
@@ -166,8 +206,8 @@ class ProxyService : Service() {
                         profileId = profile.id,
                         profileName = profile.name,
                         brokerBaseUrl = profile.brokerBaseUrl,
-                        httpPort = profile.httpPort,
-                        socksPort = profile.socksPort,
+                        httpPort = currentListenState(profile)?.httpPort ?: 0,
+                        socksPort = currentListenState(profile)?.socksPort ?: 0,
                         logPath = AppFiles.runtimeLogFile(this, profile.id).absolutePath,
                         message = "",
                     ),

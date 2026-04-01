@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import socket
 import sys
@@ -32,6 +33,14 @@ from twoman_protocol import (
     make_error_payload,
     parse_open_payload,
 )
+from runtime_diagnostics import (
+    DurableEventRecorder,
+    configure_component_logger,
+    event_log_path,
+    event_log_settings,
+    runtime_log_path,
+    runtime_log_settings,
+)
 from twoman_transport import create_transport
 
 
@@ -46,13 +55,88 @@ MAX_RECV_REORDER_BYTES = 1024 * 1024
 TRACE_ENABLED = os.environ.get("TWOMAN_TRACE", "").strip().lower() in ("1", "true", "yes", "on", "debug", "verbose")
 DEFAULT_OPEN_CONNECT_TIMEOUT_SECONDS = 12.0
 DEFAULT_HAPPY_EYEBALLS_DELAY_SECONDS = 0.25
+LOGGER = logging.getLogger("twoman.agent")
+RUNTIME_LOG_PATH = ""
+EVENT_LOG_PATH = ""
+EVENT_RECORDER = None
 
 
 def trace(message):
     if not TRACE_ENABLED:
         return
+    if LOGGER.handlers:
+        LOGGER.debug(message)
+        return
     sys.stderr.write("[agent] %s\n" % message)
     sys.stderr.flush()
+
+
+def record_event(kind, **fields):
+    if EVENT_RECORDER is None:
+        return
+    try:
+        EVENT_RECORDER.record(kind, component="agent", **fields)
+    except Exception:
+        LOGGER.exception("agent event log write failed kind=%s", kind)
+
+
+def configure_runtime_logging(config_path, config):
+    global RUNTIME_LOG_PATH
+    if LOGGER.handlers:
+        return
+    RUNTIME_LOG_PATH = runtime_log_path(config_path, config, "agent.log")
+    settings = runtime_log_settings(config)
+    configure_component_logger(
+        LOGGER,
+        log_path=RUNTIME_LOG_PATH,
+        trace_enabled=TRACE_ENABLED,
+        runtime_log_max_bytes=settings["max_bytes"],
+        runtime_log_backup_count=settings["backup_count"],
+        console_prefix="agent",
+    )
+    LOGGER.info(
+        "agent logging initialized log_path=%s max_bytes=%s backup_count=%s",
+        RUNTIME_LOG_PATH,
+        settings["max_bytes"],
+        settings["backup_count"],
+    )
+
+
+def configure_event_logging(config_path, config):
+    global EVENT_RECORDER, EVENT_LOG_PATH
+    if EVENT_RECORDER is not None:
+        return
+    EVENT_LOG_PATH = event_log_path(config_path, config, "agent-events.ndjson")
+    settings = event_log_settings(config)
+    EVENT_RECORDER = DurableEventRecorder(
+        EVENT_LOG_PATH,
+        max_bytes=settings["max_bytes"],
+        backup_count=settings["backup_count"],
+        recent_limit=settings["recent_limit"],
+    )
+    LOGGER.info(
+        "agent event logging initialized event_log_path=%s max_bytes=%s backup_count=%s",
+        EVENT_LOG_PATH,
+        settings["max_bytes"],
+        settings["backup_count"],
+    )
+
+
+def log_unhandled_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    LOGGER.critical("unhandled agent exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+
+def log_asyncio_exception(loop, context):
+    del loop
+    exception = context.get("exception")
+    message = context.get("message", "asyncio loop exception")
+    if exception is None:
+        LOGGER.error("asyncio loop exception message=%s", message)
+        return
+    LOGGER.error("asyncio loop exception message=%s", message, exc_info=(type(exception), exception, exception.__traceback__))
 
 
 def load_config(path):
@@ -89,6 +173,13 @@ class RemoteStream(object):
         if mode != MODE_TCP:
             raise RuntimeError("unsupported open mode")
         trace("open stream=%s target=%s:%s" % (self.stream_id, host, port))
+        record_event(
+            "stream_open_requested",
+            stream_id=self.stream_id,
+            target_host=host,
+            target_port=port,
+            mode=mode,
+        )
         self.reader, self.writer = await self.agent.open_origin_connection(host, port)
         transport = self.writer.transport
         if transport is not None:
@@ -98,6 +189,12 @@ class RemoteStream(object):
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         await self.agent.transport.send_frame(LANE_CTL, Frame(FRAME_OPEN_OK, stream_id=self.stream_id))
         trace("open ok stream=%s" % self.stream_id)
+        record_event(
+            "stream_open_ok",
+            stream_id=self.stream_id,
+            target_host=host,
+            target_port=port,
+        )
         self.remote_task = asyncio.create_task(self.remote_to_helper())
 
     async def on_frame(self, frame):
@@ -124,11 +221,18 @@ class RemoteStream(object):
         if frame.type_id == FRAME_FIN:
             self.fin_offset = int(frame.offset)
             trace("recv FIN stream=%s fin_offset=%s recv_offset=%s" % (self.stream_id, self.fin_offset, self.recv_offset))
+            record_event(
+                "stream_fin_received",
+                stream_id=self.stream_id,
+                fin_offset=self.fin_offset,
+                recv_offset=self.recv_offset,
+            )
             if self.recv_offset >= self.fin_offset:
                 await self._finish_remote_write()
             return
         if frame.type_id == FRAME_RST:
             trace("recv RST stream=%s" % self.stream_id)
+            record_event("stream_reset_received", stream_id=self.stream_id)
             await self.close()
 
     async def _accept_in_order_data(self, raw_offset, payload):
@@ -212,6 +316,7 @@ class RemoteStream(object):
                 if not data:
                     self.remote_read_eof = True
                     trace("remote EOF stream=%s send_offset=%s" % (self.stream_id, self.send_offset))
+                    record_event("remote_eof", stream_id=self.stream_id, send_offset=self.send_offset)
                     await self.flush_window()
                     await self.agent.transport.send_frame(
                         LANE_CTL,
@@ -263,6 +368,7 @@ class RemoteStream(object):
             return
         if self.window_flush_task is not None and not self.window_flush_task.done():
             self.window_flush_task.cancel()
+        record_event("stream_reset_sent", stream_id=self.stream_id, error=message)
         await self.agent.transport.send_frame(
             LANE_CTL,
             Frame(FRAME_RST, stream_id=self.stream_id, payload=make_error_payload(message)),
@@ -316,6 +422,7 @@ class AgentRuntime(object):
     def __init__(self, config):
         self.config = config
         self.transport = create_transport(config, "agent", config.get("peer_id", "agent"), self.on_frame)
+        self.transport.event_handler = self._record_transport_event
         self.streams = {}
         self.open_connect_timeout_seconds = max(
             1.0, float(config.get("open_connect_timeout_seconds", DEFAULT_OPEN_CONNECT_TIMEOUT_SECONDS))
@@ -328,12 +435,44 @@ class AgentRuntime(object):
 
     async def start(self):
         await self.transport.start()
-        await asyncio.Event().wait()
+        LOGGER.info(
+            "agent started log_path=%s event_log_path=%s peer_id=%s transport_session=%s",
+            RUNTIME_LOG_PATH or "stderr-only",
+            EVENT_LOG_PATH or "disabled",
+            self.config.get("peer_id", "agent"),
+            self.transport.peer_session_id,
+        )
+        record_event(
+            "agent_started",
+            peer_id=self.config.get("peer_id", "agent"),
+            transport_session_id=self.transport.peer_session_id,
+        )
+        try:
+            await asyncio.Event().wait()
+        finally:
+            LOGGER.info("agent stopping transport_session=%s", self.transport.peer_session_id)
+            record_event("agent_stopping", transport_session_id=self.transport.peer_session_id)
+            await self.stop()
+            LOGGER.info("agent stopped transport_session=%s", self.transport.peer_session_id)
+            record_event("agent_stopped", transport_session_id=self.transport.peer_session_id)
+
+    async def stop(self):
+        for stream in list(self.streams.values()):
+            with contextlib.suppress(Exception):
+                await stream.close()
+        await self.transport.stop()
 
     async def on_frame(self, frame, _lane):
         if frame.type_id == FRAME_OPEN:
             details = parse_open_payload(frame.payload)
             trace("recv OPEN stream=%s host=%s port=%s" % (frame.stream_id, details['host'], details['port']))
+            record_event(
+                "stream_open_received",
+                stream_id=frame.stream_id,
+                target_host=details["host"],
+                target_port=details["port"],
+                mode=details["mode"],
+            )
             stream = RemoteStream(self, frame.stream_id)
             self.streams[frame.stream_id] = stream
             stream.open_task = asyncio.create_task(
@@ -351,6 +490,10 @@ class AgentRuntime(object):
     def release_stream(self, stream_id, stream):
         if self.streams.get(stream_id) is stream:
             self.streams.pop(stream_id, None)
+            record_event("stream_released", stream_id=stream_id)
+
+    def _record_transport_event(self, event):
+        record_event(**event)
 
     async def open_origin_connection(self, host, port):
         loop = asyncio.get_running_loop()
@@ -363,6 +506,13 @@ class AgentRuntime(object):
                 "origin connect start host=%s port=%s strategy=%s timeout=%s"
                 % (host, port, label, self.open_connect_timeout_seconds)
             )
+            record_event(
+                "origin_connect_attempt",
+                target_host=host,
+                target_port=port,
+                strategy=label,
+                timeout_seconds=self.open_connect_timeout_seconds,
+            )
             started_at = loop.time()
             try:
                 result = await asyncio.wait_for(
@@ -374,10 +524,25 @@ class AgentRuntime(object):
                     "origin connect fail host=%s port=%s strategy=%s elapsed=%0.3f error=%r"
                     % (host, port, label, loop.time() - started_at, error)
                 )
+                record_event(
+                    "origin_connect_failed",
+                    target_host=host,
+                    target_port=port,
+                    strategy=label,
+                    elapsed_ms=int((loop.time() - started_at) * 1000),
+                    error=str(error),
+                )
                 raise
             trace(
                 "origin connect ok host=%s port=%s strategy=%s elapsed=%0.3f"
                 % (host, port, label, loop.time() - started_at)
+            )
+            record_event(
+                "origin_connect_ok",
+                target_host=host,
+                target_port=port,
+                strategy=label,
+                elapsed_ms=int((loop.time() - started_at) * 1000),
             )
             return result
 
@@ -421,6 +586,7 @@ class AgentRuntime(object):
             raise
         except Exception as error:
             trace("open fail stream=%s error=%s" % (stream.stream_id, error))
+            record_event("stream_open_failed", stream_id=stream.stream_id, error=str(error))
             if self.streams.get(stream.stream_id) is stream:
                 await self.transport.send_frame(
                     LANE_CTL,
@@ -434,7 +600,27 @@ def main():
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
     config = load_config(args.config)
-    asyncio.run(AgentRuntime(config).start())
+    configure_runtime_logging(args.config, config)
+    configure_event_logging(args.config, config)
+    sys.excepthook = log_unhandled_exception
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.set_exception_handler(log_asyncio_exception)
+        record_event(
+            "agent_starting",
+            peer_id=config.get("peer_id", "agent"),
+            transport=config.get("transport", "http"),
+        )
+        loop.run_until_complete(AgentRuntime(config).start())
+    except KeyboardInterrupt:
+        LOGGER.info("agent interrupted by user")
+        record_event("agent_interrupted")
+        raise SystemExit(0)
+    except Exception:
+        LOGGER.exception("agent crashed")
+        record_event("agent_crashed")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

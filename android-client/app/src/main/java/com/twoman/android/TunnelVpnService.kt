@@ -18,7 +18,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
 class TunnelVpnService : VpnService() {
-    private val loggerTag = "TwomanSvc"
+    private val loggerTag = BuildConfig.RUNTIME_LOG_TAG
     private var vpnInterface: ParcelFileDescriptor? = null
     private lateinit var stateStore: RuntimeStateStore
     private var activeProfile: ClientProfile? = null
@@ -37,7 +37,7 @@ class TunnelVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             Log.i(loggerTag, "TunnelVpnService stop requested")
-            thread(name = "twoman-vpn-stop", start = true) {
+            thread(name = "vpn-runtime-stop", start = true) {
                 stopTunnel("stop requested")
             }
             return START_NOT_STICKY
@@ -53,15 +53,16 @@ class TunnelVpnService : VpnService() {
             NotificationHelper.VPN_NOTIFICATION_ID,
             NotificationHelper.build(
                 this,
-                getString(R.string.notification_vpn_title),
-                profile.name,
+                getString(R.string.runtime_vpn_title),
+                getString(R.string.status_starting_message),
             ),
         )
         if (!workerStarted) {
             workerStarted = true
-            thread(name = "twoman-vpn-start", start = true) {
+            thread(name = "vpn-runtime-start", start = true) {
                 runCatching { startTunnel(profile) }
                     .onFailure { error ->
+                        val listenState = currentListenState(profile)
                         stateStore.write(
                             RuntimeStatus(
                                 running = false,
@@ -69,8 +70,8 @@ class TunnelVpnService : VpnService() {
                                 profileId = profile.id,
                                 profileName = profile.name,
                                 brokerBaseUrl = profile.brokerBaseUrl,
-                                httpPort = profile.httpPort,
-                                socksPort = profile.socksPort,
+                                httpPort = listenState?.httpPort ?: 0,
+                                socksPort = listenState?.socksPort ?: 0,
                                 logPath = AppFiles.runtimeLogFile(this, profile.id).absolutePath,
                                 message = error.message?.takeIf { it.isNotBlank() }
                                     ?: error.javaClass.simpleName,
@@ -85,7 +86,7 @@ class TunnelVpnService : VpnService() {
 
     private fun startTunnel(profile: ClientProfile) {
         ProxyService.start(this, profile, ProxyService.MODE_VPN)
-        waitForLocalPort(profile.socksPort)
+        val listenState = waitForListenState(profile)
         if (stopRequested) {
             stopTunnel("start cancelled")
             return
@@ -98,7 +99,7 @@ class TunnelVpnService : VpnService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val builder = Builder()
-            .setSession(profile.name)
+            .setSession(BuildConfig.VPN_SESSION_NAME)
             .setMtu(1500)
             .addAddress("198.18.0.1", 32)
             .addRoute("0.0.0.0", 0)
@@ -151,7 +152,7 @@ class TunnelVpnService : VpnService() {
             mark = 0
             mtu = 1500
             device = "fd://${vpnInterface!!.fd}"
-            proxy = "socks5://127.0.0.1:${profile.socksPort}"
+            proxy = "socks5://127.0.0.1:${listenState.socksPort}"
             `interface` = ""
             logLevel = if (profile.traceEnabled) "debug" else "info"
             restAPI = ""
@@ -172,8 +173,8 @@ class TunnelVpnService : VpnService() {
                 profileId = profile.id,
                 profileName = profile.name,
                 brokerBaseUrl = profile.brokerBaseUrl,
-                httpPort = profile.httpPort,
-                socksPort = profile.socksPort,
+                httpPort = listenState.httpPort,
+                socksPort = listenState.socksPort,
                 logPath = AppFiles.runtimeLogFile(this, profile.id).absolutePath,
                 message = "",
             ),
@@ -198,6 +199,7 @@ class TunnelVpnService : VpnService() {
         Log.i(loggerTag, "TunnelVpnService requesting proxy stop")
         ProxyService.stop(this)
         activeProfile?.let { profile ->
+            val listenState = currentListenState(profile)
             stateStore.write(
                 RuntimeStatus(
                     running = true,
@@ -205,8 +207,8 @@ class TunnelVpnService : VpnService() {
                     profileId = profile.id,
                     profileName = profile.name,
                     brokerBaseUrl = profile.brokerBaseUrl,
-                    httpPort = profile.httpPort,
-                    socksPort = profile.socksPort,
+                    httpPort = listenState?.httpPort ?: 0,
+                    socksPort = listenState?.socksPort ?: 0,
                     logPath = AppFiles.runtimeLogFile(this, profile.id).absolutePath,
                     message = getString(R.string.status_stopping_message),
                 ),
@@ -224,17 +226,23 @@ class TunnelVpnService : VpnService() {
         super.onRevoke()
     }
 
-    private fun waitForLocalPort(port: Int) {
-        repeat(50) {
-            runCatching {
-                Socket().use { socket ->
-                    socket.connect(InetSocketAddress("127.0.0.1", port), 250)
-                }
-            }.onSuccess { return }
-            Thread.sleep(200)
+    private fun waitForListenState(profile: ClientProfile): RuntimeListenState {
+        repeat(75) {
+            val listenState = currentListenState(profile)
+            if (listenState != null && listenState.socksPort > 0) {
+                runCatching {
+                    Socket().use { socket ->
+                        socket.connect(InetSocketAddress("127.0.0.1", listenState.socksPort), 250)
+                    }
+                }.onSuccess { return listenState }
+            }
+            Thread.sleep(200L)
         }
         error("local SOCKS proxy did not start")
     }
+
+    private fun currentListenState(profile: ClientProfile): RuntimeListenState? =
+        AppFiles.readRuntimeListenState(this, profile.id)
 
     override fun onDestroy() {
         Log.i(loggerTag, "TunnelVpnService onDestroy")

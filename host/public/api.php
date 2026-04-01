@@ -22,7 +22,7 @@ if (!function_exists('bridge_runtime_ensure')) {
 $action = isset($_GET['action']) ? (string) $_GET['action'] : '';
 
 if ($action === 'health') {
-    $token = trim(relay_header('X-Relay-Token'));
+    $token = relay_auth_token();
     $config = relay_config();
     if (!in_array($token, $config['client_tokens'], true) && !in_array($token, $config['agent_tokens'], true)) {
         relay_fail(403, 'Invalid token');

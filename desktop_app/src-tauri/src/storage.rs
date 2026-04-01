@@ -136,6 +136,10 @@ pub fn helper_pid_path(paths: &AppPaths) -> PathBuf {
     paths.runtime_dir.join("helper.pid")
 }
 
+pub fn helper_listen_state_path(paths: &AppPaths) -> PathBuf {
+    paths.runtime_dir.join("helper-listen-state.json")
+}
+
 pub fn tunnel_log_path(paths: &AppPaths) -> PathBuf {
     paths.logs_dir.join("tunnel.log")
 }
@@ -194,9 +198,6 @@ pub fn validate_profile(profile: &ClientProfile) -> Result<(), String> {
     }
     if profile.client_token.trim().is_empty() {
         return Err("client token is required".into());
-    }
-    if profile.http_port == 0 || profile.socks_port == 0 {
-        return Err("proxy ports must be greater than zero".into());
     }
     Ok(())
 }

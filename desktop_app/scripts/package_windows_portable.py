@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Assemble a portable Windows Twoman desktop bundle.
+"""Assemble a portable Windows desktop bundle.
 
 This script copies a built Windows Tauri executable plus bundled sidecars into
 the repo's private handoff folder and writes the portable-mode markers that the
@@ -9,6 +9,7 @@ app requires to keep state beside the executable.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import zipfile
 from pathlib import Path
@@ -32,9 +33,6 @@ WINDOWS_SIDECAR_CANDIDATES = [
     REPO_ROOT / "private_handoff/desktop_app/windows/portable-ui/Twoman/sidecars/windows",
 ]
 HANDOFF_ROOT = REPO_ROOT / "private_handoff/desktop_app/windows"
-PORTABLE_ROOT = HANDOFF_ROOT / "portable-ui/Twoman"
-PORTABLE_DATA_ROOT = PORTABLE_ROOT / "portable-data"
-SIDECAR_ROOT = PORTABLE_ROOT / "sidecars/windows"
 
 
 def load_app_version() -> str:
@@ -48,8 +46,26 @@ def load_app_version() -> str:
 APP_VERSION = load_app_version()
 
 
+def load_app_display_name() -> str:
+    configured = os.environ.get("TWOMAN_DESKTOP_DISPLAY_NAME", "").strip()
+    if configured:
+        return configured
+    config = json.loads(TAURI_CONFIG_PATH.read_text(encoding="utf-8"))
+    return str(config.get("productName", "")).strip() or "Local Network Bridge"
+
+
+APP_DISPLAY_NAME = load_app_display_name()
+APP_SLUG = APP_DISPLAY_NAME.replace(" ", "_")
+PORTABLE_ROOT = HANDOFF_ROOT / f"portable-ui/{APP_DISPLAY_NAME}"
+PORTABLE_DATA_ROOT = PORTABLE_ROOT / "portable-data"
+SIDECAR_ROOT = PORTABLE_ROOT / "sidecars/windows"
+HELPER_NAME = os.environ.get("TWOMAN_HELPER_BINARY_BASENAME", "local-network-helper").strip() or "local-network-helper"
+GATEWAY_NAME = os.environ.get("TWOMAN_GATEWAY_BINARY_BASENAME", "local-network-bridge").strip() or "local-network-bridge"
+TUNNEL_NAME = os.environ.get("TWOMAN_TUNNEL_BINARY_BASENAME", "standard-system-adapter").strip() or "standard-system-adapter"
+
+
 def windows_artifact_name(suffix: str) -> str:
-    return f"Twoman_{APP_VERSION}_x64{suffix}"
+    return f"{APP_SLUG}_{APP_VERSION}_x64{suffix}"
 
 
 def copy_required_file(source: Path, destination: Path) -> None:
@@ -73,12 +89,12 @@ def resolve_sidecar(name: str) -> Path:
 def write_portable_markers() -> None:
     PORTABLE_DATA_ROOT.mkdir(parents=True, exist_ok=True)
     (PORTABLE_ROOT / "twoman-portable").write_text(
-        "Portable mode marker for Twoman desktop.\n",
+        f"Portable mode marker for {APP_DISPLAY_NAME}.\n",
         encoding="utf-8",
     )
     (PORTABLE_DATA_ROOT / "README.txt").write_text(
         (
-            "Twoman portable runtime data lives here.\n"
+            f"{APP_DISPLAY_NAME} portable runtime data lives here.\n"
             "- config/: saved routes, shares, and settings\n"
             "- runtime/: generated helper/share configs\n"
             "- twoman-logs/: helper, tunnel, and shared proxy logs\n"
@@ -102,7 +118,7 @@ def main() -> None:
     HANDOFF_ROOT.mkdir(parents=True, exist_ok=True)
     copy_required_file(
         WINDOWS_BUILD_ROOT / "desktop_app.exe",
-        PORTABLE_ROOT / "Twoman.exe",
+        PORTABLE_ROOT / f"{APP_DISPLAY_NAME}.exe",
     )
     copy_required_file(
         WINDOWS_BUNDLE_ROOT / f"nsis/{windows_artifact_name('-setup.exe')}",
@@ -113,16 +129,16 @@ def main() -> None:
         HANDOFF_ROOT / windows_artifact_name("_en-US.msi"),
     )
     copy_required_file(
-        resolve_sidecar("twoman-helper.exe"),
-        SIDECAR_ROOT / "twoman-helper.exe",
+        resolve_sidecar(f"{HELPER_NAME}.exe"),
+        SIDECAR_ROOT / f"{HELPER_NAME}.exe",
     )
     copy_required_file(
-        resolve_sidecar("twoman-gateway.exe"),
-        SIDECAR_ROOT / "twoman-gateway.exe",
+        resolve_sidecar(f"{GATEWAY_NAME}.exe"),
+        SIDECAR_ROOT / f"{GATEWAY_NAME}.exe",
     )
     copy_required_file(
-        resolve_sidecar("twoman-tunnel.exe"),
-        SIDECAR_ROOT / "twoman-tunnel.exe",
+        resolve_sidecar(f"{TUNNEL_NAME}.exe"),
+        SIDECAR_ROOT / f"{TUNNEL_NAME}.exe",
     )
     write_portable_markers()
     zip_path = build_zip()
