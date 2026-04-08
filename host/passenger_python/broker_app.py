@@ -190,6 +190,32 @@ class StreamState(object):
         self.last_seen_ms = now_ms()
 
 
+def _normalize_lane_profiles(config):
+    defaults = {
+        LANE_CTL: {"max_bytes": 4096, "max_frames": 8, "hold_ms": 1, "pad_min": 1024},
+        "pri": {"max_bytes": 32768, "max_frames": 16, "hold_ms": 2, "pad_min": 1024},
+        "bulk": {"max_bytes": 262144, "max_frames": 64, "hold_ms": 4, "pad_min": 0},
+    }
+    configured = config.get("lane_profiles", {})
+    if not isinstance(configured, dict):
+        return defaults
+    normalized = dict((lane, dict(profile)) for lane, profile in defaults.items())
+    for lane, profile in normalized.items():
+        override = configured.get(lane)
+        if not isinstance(override, dict):
+            continue
+        for key in ("max_bytes", "max_frames", "hold_ms", "pad_min"):
+            if key not in override:
+                continue
+            try:
+                value = int(override[key])
+            except (TypeError, ValueError):
+                continue
+            minimum = 1 if key in ("max_bytes", "max_frames") else 0
+            profile[key] = max(minimum, value)
+    return normalized
+
+
 class BrokerState(object):
     def __init__(self, config):
         self.config = config
@@ -205,6 +231,7 @@ class BrokerState(object):
             self.max_lane_bytes,
             int(config.get("max_peer_buffered_bytes", min(self.max_lane_bytes * 2, 32 * 1024 * 1024))),
         )
+        self.lane_profiles = _normalize_lane_profiles(config)
         self.peers = {}
         self.streams_by_helper = {}
         self.streams_by_agent = {}
@@ -534,11 +561,7 @@ class BrokerState(object):
             }
 
     def lane_profile(self, lane):
-        if lane == LANE_CTL:
-            return {"max_bytes": 4096, "max_frames": 8, "hold_ms": 1, "pad_min": 1024}
-        if lane == "pri":
-            return {"max_bytes": 16384, "max_frames": 8, "hold_ms": 3, "pad_min": 1024}
-        return {"max_bytes": 65536, "max_frames": 16, "hold_ms": 8, "pad_min": 0}
+        return self.lane_profiles.get(lane, self.lane_profiles["bulk"])
 
     def next_data_payload(self, peer, wait_timeout_seconds=DOWN_POLL_TIMEOUT_SECONDS):
         pri_queue = peer.queues["pri"]

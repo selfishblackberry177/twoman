@@ -2,7 +2,7 @@
 
 return [
     'storage_path' => __DIR__ . '/../storage',
-    'public_base_path' => '/twoman',
+    'public_base_path' => '/rahkar',
     'offload_relative_path' => 'offload',
     'offload_ttl_seconds' => 3600,
     'client_tokens' => [

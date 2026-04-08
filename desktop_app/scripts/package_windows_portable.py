@@ -51,7 +51,7 @@ def load_app_display_name() -> str:
     if configured:
         return configured
     config = json.loads(TAURI_CONFIG_PATH.read_text(encoding="utf-8"))
-    return str(config.get("productName", "")).strip() or "Local Network Bridge"
+    return str(config.get("productName", "")).strip() or "Twoman"
 
 
 APP_DISPLAY_NAME = load_app_display_name()
@@ -59,13 +59,30 @@ APP_SLUG = APP_DISPLAY_NAME.replace(" ", "_")
 PORTABLE_ROOT = HANDOFF_ROOT / f"portable-ui/{APP_DISPLAY_NAME}"
 PORTABLE_DATA_ROOT = PORTABLE_ROOT / "portable-data"
 SIDECAR_ROOT = PORTABLE_ROOT / "sidecars/windows"
-HELPER_NAME = os.environ.get("TWOMAN_HELPER_BINARY_BASENAME", "local-network-helper").strip() or "local-network-helper"
-GATEWAY_NAME = os.environ.get("TWOMAN_GATEWAY_BINARY_BASENAME", "local-network-bridge").strip() or "local-network-bridge"
-TUNNEL_NAME = os.environ.get("TWOMAN_TUNNEL_BINARY_BASENAME", "standard-system-adapter").strip() or "standard-system-adapter"
+HELPER_NAME = os.environ.get("TWOMAN_HELPER_BINARY_BASENAME", "twoman-helper").strip() or "twoman-helper"
+GATEWAY_NAME = os.environ.get("TWOMAN_GATEWAY_BINARY_BASENAME", "twoman-gateway").strip() or "twoman-gateway"
+TUNNEL_NAME = os.environ.get("TWOMAN_TUNNEL_BINARY_BASENAME", "twoman-tunnel").strip() or "twoman-tunnel"
 
 
 def windows_artifact_name(suffix: str) -> str:
     return f"{APP_SLUG}_{APP_VERSION}_x64{suffix}"
+
+
+def windows_bundle_candidates(suffix: str) -> list[Path]:
+    names = [
+        f"{APP_DISPLAY_NAME}_{APP_VERSION}_x64{suffix}",
+        f"{APP_SLUG}_{APP_VERSION}_x64{suffix}",
+    ]
+    bundle_dir = "nsis" if suffix.endswith(".exe") else "msi"
+    return [WINDOWS_BUNDLE_ROOT / bundle_dir / name for name in names]
+
+
+def resolve_windows_bundle(suffix: str) -> Path:
+    for candidate in windows_bundle_candidates(suffix):
+        if candidate.exists():
+            return candidate
+    searched = "\n".join(str(path) for path in windows_bundle_candidates(suffix))
+    raise FileNotFoundError(f"missing required artifact; searched:\n{searched}")
 
 
 def copy_required_file(source: Path, destination: Path) -> None:
@@ -121,11 +138,11 @@ def main() -> None:
         PORTABLE_ROOT / f"{APP_DISPLAY_NAME}.exe",
     )
     copy_required_file(
-        WINDOWS_BUNDLE_ROOT / f"nsis/{windows_artifact_name('-setup.exe')}",
+        resolve_windows_bundle("-setup.exe"),
         HANDOFF_ROOT / windows_artifact_name("-setup.exe"),
     )
     copy_required_file(
-        WINDOWS_BUNDLE_ROOT / f"msi/{windows_artifact_name('_en-US.msi')}",
+        resolve_windows_bundle("_en-US.msi"),
         HANDOFF_ROOT / windows_artifact_name("_en-US.msi"),
     )
     copy_required_file(

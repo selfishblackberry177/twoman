@@ -15,6 +15,7 @@ import socket
 import struct
 import sys
 import threading
+import time
 import urllib.parse
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -41,6 +42,7 @@ from twoman_protocol import (
     parse_error_payload,
     random_peer_id,
 )
+from runtime_diagnostics import DurableEventRecorder, event_log_path, event_log_settings, runtime_log_settings
 from twoman_transport import create_transport
 
 
@@ -51,16 +53,27 @@ WINDOW_FLUSH_BYTES = 16 * 1024
 WINDOW_FLUSH_DELAY = 0.005
 SMALL_WRITE_BYTES = 8 * 1024
 MAX_RECV_REORDER_BYTES = 1024 * 1024
-DNS_QUERY_TIMEOUT = 10.0
+DNS_QUERY_TIMEOUT = max(0.5, float(os.environ.get("TWOMAN_DNS_QUERY_TIMEOUT", "2.5")))
+DNS_CACHE_TTL_SECONDS = max(1.0, float(os.environ.get("TWOMAN_DNS_CACHE_TTL_SECONDS", "20.0")))
+DNS_CACHE_MAX_ENTRIES = max(32, int(os.environ.get("TWOMAN_DNS_CACHE_MAX_ENTRIES", "256")))
+DNS_MAX_INFLIGHT = max(1, int(os.environ.get("TWOMAN_DNS_MAX_INFLIGHT", "8")))
+SHUTDOWN_STREAM_RESET_GRACE_SECONDS = max(
+    0.0,
+    float(os.environ.get("TWOMAN_SHUTDOWN_STREAM_RESET_GRACE_SECONDS", "0.2")),
+)
 DEFAULT_VPN_DNS_SERVERS = ["1.1.1.1", "8.8.8.8"]
 
 TRACE_ENABLED = os.environ.get("TWOMAN_TRACE", "").strip().lower() in ("1", "true", "yes", "on", "debug", "verbose")
 LOGGER = logging.getLogger("twoman.helper")
 RUNTIME_LOG_PATH = ""
+EVENT_LOG_PATH = ""
 FAULT_LOG_HANDLE = None
-STOP_LOOP = None
-STOP_EVENT = None
+PID_FILE_PATH = ""
 LISTEN_STATE_PATH = ""
+EVENT_RECORDER = None
+ACTIVE_LOOP = None
+ACTIVE_STOP_EVENT = None
+ACTIVE_LOOP_LOCK = threading.Lock()
 
 
 def trace(message):
@@ -71,6 +84,15 @@ def trace(message):
         return
     sys.stderr.write("[helper] %s\n" % message)
     sys.stderr.flush()
+
+
+def record_event(kind, **fields):
+    if EVENT_RECORDER is None:
+        return
+    try:
+        EVENT_RECORDER.record(kind, component="helper", **fields)
+    except Exception:
+        LOGGER.exception("helper event log write failed kind=%s", kind)
 
 
 def resolve_log_path(config_path, config):
@@ -95,6 +117,7 @@ def configure_runtime_logging(config_path, config):
     if LOGGER.handlers:
         return
     RUNTIME_LOG_PATH = resolve_log_path(config_path, config)
+    settings = runtime_log_settings(config)
     log_dir = os.path.dirname(RUNTIME_LOG_PATH)
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
@@ -104,88 +127,94 @@ def configure_runtime_logging(config_path, config):
 
     file_handler = RotatingFileHandler(
         RUNTIME_LOG_PATH,
-        maxBytes=5 * 1024 * 1024,
-        backupCount=3,
+        maxBytes=settings["max_bytes"],
+        backupCount=settings["backup_count"],
         encoding="utf-8",
     )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     LOGGER.addHandler(file_handler)
 
-    console_handler = logging.StreamHandler(sys.stderr)
-    console_handler.setLevel(logging.DEBUG if TRACE_ENABLED else logging.WARNING)
-    console_handler.setFormatter(logging.Formatter("[helper] %(levelname)s %(message)s"))
-    LOGGER.addHandler(console_handler)
+    if sys.stderr is not None:
+        console_handler = logging.StreamHandler(sys.stderr)
+        console_handler.setLevel(logging.DEBUG if TRACE_ENABLED else logging.WARNING)
+        console_handler.setFormatter(logging.Formatter("[helper] %(levelname)s %(message)s"))
+        LOGGER.addHandler(console_handler)
 
     FAULT_LOG_HANDLE = open(RUNTIME_LOG_PATH, "a", encoding="utf-8")
     faulthandler.enable(FAULT_LOG_HANDLE, all_threads=True)
     sys.excepthook = log_unhandled_exception
     threading.excepthook = log_thread_exception
-    LOGGER.info("helper logging initialized log_path=%s", RUNTIME_LOG_PATH)
-
-
-def log_unhandled_exception(exc_type, exc_value, exc_traceback):
-    if issubclass(exc_type, KeyboardInterrupt):
-        sys.__excepthook__(exc_type, exc_value, exc_traceback)
-        return
-    LOGGER.critical("unhandled helper exception", exc_info=(exc_type, exc_value, exc_traceback))
-
-
-def log_thread_exception(args):
-    LOGGER.critical(
-        "unhandled helper thread exception thread=%s",
-        getattr(args.thread, "name", "unknown"),
-        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    LOGGER.info(
+        "helper logging initialized log_path=%s max_bytes=%s backup_count=%s",
+        RUNTIME_LOG_PATH,
+        settings["max_bytes"],
+        settings["backup_count"],
     )
 
 
-def log_asyncio_exception(loop, context):
-    del loop
-    exception = context.get("exception")
-    message = context.get("message", "asyncio loop exception")
-    if exception is None:
-        LOGGER.error("asyncio loop exception message=%s", message)
+def configure_event_logging(config_path, config):
+    global EVENT_RECORDER, EVENT_LOG_PATH
+    if EVENT_RECORDER is not None:
         return
-    LOGGER.error("asyncio loop exception message=%s", message, exc_info=(type(exception), exception, exception.__traceback__))
+    EVENT_LOG_PATH = event_log_path(config_path, config, "helper-events.ndjson")
+    settings = event_log_settings(config)
+    EVENT_RECORDER = DurableEventRecorder(
+        EVENT_LOG_PATH,
+        max_bytes=settings["max_bytes"],
+        backup_count=settings["backup_count"],
+        recent_limit=settings["recent_limit"],
+    )
+    LOGGER.info(
+        "helper event logging initialized event_log_path=%s max_bytes=%s backup_count=%s",
+        EVENT_LOG_PATH,
+        settings["max_bytes"],
+        settings["backup_count"],
+    )
 
 
-def handle_shutdown_signal(signum, _frame):
-    signal_name = getattr(signal.Signals(signum), "name", str(signum))
-    LOGGER.warning("helper received shutdown signal=%s", signal_name)
-    raise KeyboardInterrupt()
+def configure_pid_file(config_path, config):
+    global PID_FILE_PATH
+    configured_pid_file = str(config.get("pid_file", "")).strip()
+    if not configured_pid_file:
+        PID_FILE_PATH = ""
+        return
+    if os.path.isabs(configured_pid_file):
+        PID_FILE_PATH = configured_pid_file
+    else:
+        PID_FILE_PATH = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(config_path)), configured_pid_file))
+    pid_dir = os.path.dirname(PID_FILE_PATH)
+    if pid_dir:
+        os.makedirs(pid_dir, exist_ok=True)
 
 
-def request_stop():
-    global STOP_LOOP, STOP_EVENT
-    if STOP_LOOP is None or STOP_EVENT is None:
-        return False
-    STOP_LOOP.call_soon_threadsafe(STOP_EVENT.set)
-    return True
-
-
-def load_config(path):
-    with open(path, "r", encoding="utf-8") as handle:
-        config = json.load(handle)
-    if "broker_base_url" not in config and "broker_v2_base_url" in config:
-        config["broker_base_url"] = config["broker_v2_base_url"]
-    config["__config_path"] = os.path.abspath(path)
-    return config
-
-
-def configure_listen_state_path(config):
+def configure_listen_state_path(config_path, config):
     global LISTEN_STATE_PATH
     configured_path = str(config.get("listen_state_path", "")).strip()
     if not configured_path:
         LISTEN_STATE_PATH = ""
         return
-    config_path = str(config.get("__config_path", "")).strip()
     if os.path.isabs(configured_path):
         LISTEN_STATE_PATH = configured_path
     else:
-        LISTEN_STATE_PATH = os.path.abspath(os.path.join(os.path.dirname(config_path), configured_path))
+        LISTEN_STATE_PATH = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(config_path)), configured_path))
     state_dir = os.path.dirname(LISTEN_STATE_PATH)
     if state_dir:
         os.makedirs(state_dir, exist_ok=True)
+
+
+def write_pid_file():
+    if not PID_FILE_PATH:
+        return
+    with open(PID_FILE_PATH, "w", encoding="utf-8") as handle:
+        handle.write(str(os.getpid()))
+
+
+def remove_pid_file():
+    if not PID_FILE_PATH:
+        return
+    with contextlib.suppress(OSError):
+        os.remove(PID_FILE_PATH)
 
 
 def write_listen_state(payload):
@@ -202,6 +231,44 @@ def remove_listen_state_file():
         return
     with contextlib.suppress(OSError):
         os.remove(LISTEN_STATE_PATH)
+
+
+def register_runtime_control(loop, stop_event):
+    global ACTIVE_LOOP, ACTIVE_STOP_EVENT
+    with ACTIVE_LOOP_LOCK:
+        ACTIVE_LOOP = loop
+        ACTIVE_STOP_EVENT = stop_event
+
+
+def clear_runtime_control(loop=None):
+    global ACTIVE_LOOP, ACTIVE_STOP_EVENT
+    with ACTIVE_LOOP_LOCK:
+        if loop is not None and ACTIVE_LOOP is not loop:
+            return
+        ACTIVE_LOOP = None
+        ACTIVE_STOP_EVENT = None
+
+
+def request_stop():
+    with ACTIVE_LOOP_LOCK:
+        loop = ACTIVE_LOOP
+        stop_event = ACTIVE_STOP_EVENT
+    if loop is None or stop_event is None:
+        return False
+    if loop.is_closed():
+        clear_runtime_control(loop)
+        return False
+
+    def signal_stop():
+        if not stop_event.is_set():
+            stop_event.set()
+
+    try:
+        loop.call_soon_threadsafe(signal_stop)
+        return True
+    except RuntimeError:
+        clear_runtime_control(loop)
+        return False
 
 
 def bound_port(server):
@@ -221,6 +288,77 @@ async def start_bound_servers(hosts, requested_port, handler):
             active_port = bound_port(server)
         servers.append(server)
     return servers, int(active_port or requested_port)
+
+
+def log_unhandled_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    LOGGER.critical("unhandled helper exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+
+def log_thread_exception(args):
+    if is_benign_network_error(getattr(args, "exc_value", None)):
+        return
+    LOGGER.critical(
+        "unhandled helper thread exception thread=%s",
+        getattr(args.thread, "name", "unknown"),
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
+
+def log_asyncio_exception(loop, context):
+    del loop
+    exception = context.get("exception")
+    message = context.get("message", "asyncio loop exception")
+    if exception is None:
+        LOGGER.error("asyncio loop exception message=%s", message)
+        return
+    if is_benign_network_error(exception):
+        return
+    LOGGER.error("asyncio loop exception message=%s", message, exc_info=(type(exception), exception, exception.__traceback__))
+
+
+def is_benign_network_error(error):
+    if error is None:
+        return False
+    if isinstance(error, asyncio.CancelledError):
+        return True
+    if isinstance(error, asyncio.IncompleteReadError):
+        return True
+    if isinstance(error, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+        return True
+    if isinstance(error, OSError) and getattr(error, "winerror", None) in {64, 995, 10053, 10054}:
+        return True
+    nested = getattr(error, "__cause__", None) or getattr(error, "__context__", None)
+    if nested is not None and nested is not error:
+        return is_benign_network_error(nested)
+    return False
+
+
+async def close_writer_quietly(writer):
+    if writer.is_closing():
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
+        return
+    with contextlib.suppress(Exception):
+        writer.close()
+    with contextlib.suppress(Exception):
+        await writer.wait_closed()
+
+
+def handle_shutdown_signal(signum, _frame):
+    signal_name = getattr(signal.Signals(signum), "name", str(signum))
+    LOGGER.warning("helper received shutdown signal=%s", signal_name)
+    raise KeyboardInterrupt()
+
+
+def load_config(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    if "broker_base_url" not in config and "broker_v2_base_url" in config:
+        config["broker_base_url"] = config["broker_v2_base_url"]
+    return config
 
 
 def recv_until_headers(data):
@@ -253,6 +391,9 @@ def target_from_request(request_line, headers):
             path += "?" + parsed.query
         host = parsed.hostname
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        host_header = headers.get("Host", "")
+        if host_header and not authority_matches(host, port, host_header):
+            raise RuntimeError("absolute-form request target does not match Host header")
         rebuilt = "%s %s HTTP/1.1\r\n" % (method, path)
         return host, port, rebuilt
 
@@ -338,23 +479,52 @@ def vpn_dns_servers(config):
     return list(DEFAULT_VPN_DNS_SERVERS)
 
 
+def dns_query_cache_key(payload):
+    data = bytes(payload)
+    if len(data) < 2:
+        return data
+    return data[2:]
+
+
+def dns_transaction_id(payload):
+    data = bytes(payload)
+    if len(data) >= 2:
+        return data[:2]
+    return b"\x00\x00"
+
+
+def with_dns_transaction_id(payload, transaction_id):
+    data = bytes(payload)
+    if len(data) < 2 or len(transaction_id) != 2:
+        return data
+    return bytes(transaction_id) + data[2:]
+
+
+def expire_dns_cache(cache, now_monotonic, max_entries):
+    expired_keys = [key for key, entry in cache.items() if entry["expires_at"] <= now_monotonic]
+    for key in expired_keys:
+        cache.pop(key, None)
+    while len(cache) > max_entries:
+        cache.pop(next(iter(cache)))
+
+
 async def tcp_dns_query(runtime, host, port, payload):
     stream = runtime.new_stream(host, port)
     buffered = bytearray()
     failure = None
     try:
-        await asyncio.wait_for(stream.open(), timeout=DNS_QUERY_TIMEOUT)
+        await asyncio.wait_for(stream.open(), timeout=runtime.dns_query_timeout)
         await stream.send_data(struct.pack("!H", len(payload)) + payload)
         await stream.finish()
         while len(buffered) < 2:
-            chunk = await asyncio.wait_for(stream.recv_queue.get(), timeout=DNS_QUERY_TIMEOUT)
+            chunk = await asyncio.wait_for(stream.recv_queue.get(), timeout=runtime.dns_query_timeout)
             if chunk is None:
                 raise RuntimeError("dns response closed before length")
             buffered.extend(chunk)
             await stream.grant_window(len(chunk))
         response_length = struct.unpack("!H", buffered[:2])[0]
         while len(buffered) - 2 < response_length:
-            chunk = await asyncio.wait_for(stream.recv_queue.get(), timeout=DNS_QUERY_TIMEOUT)
+            chunk = await asyncio.wait_for(stream.recv_queue.get(), timeout=runtime.dns_query_timeout)
             if chunk is None:
                 raise RuntimeError("dns response closed early")
             buffered.extend(chunk)
@@ -368,6 +538,56 @@ async def tcp_dns_query(runtime, host, port, payload):
             with contextlib.suppress(Exception):
                 await stream.reset("dns query failed")
         await runtime.release_stream(stream.stream_id)
+
+
+async def resolve_dns_query(runtime, target_host, payload):
+    cache_key = dns_query_cache_key(payload)
+    transaction_id = dns_transaction_id(payload)
+    owner = False
+    query_task = None
+    now_monotonic = time.monotonic()
+    async with runtime.dns_cache_lock:
+        expire_dns_cache(runtime.dns_cache, now_monotonic, runtime.dns_cache_max_entries)
+        cache_entry = runtime.dns_cache.get(cache_key)
+        if cache_entry is not None:
+            trace("dns cache hit bytes=%s" % len(payload))
+            return with_dns_transaction_id(cache_entry["response"], transaction_id)
+        query_task = runtime.dns_inflight.get(cache_key)
+        if query_task is None:
+            query_task = asyncio.create_task(_resolve_dns_query_uncached(runtime, target_host, payload))
+            runtime.dns_inflight[cache_key] = query_task
+            owner = True
+    try:
+        response = await asyncio.shield(query_task)
+    finally:
+        if owner:
+            async with runtime.dns_cache_lock:
+                if runtime.dns_inflight.get(cache_key) is query_task:
+                    runtime.dns_inflight.pop(cache_key, None)
+    return with_dns_transaction_id(response, transaction_id)
+
+
+async def _resolve_dns_query_uncached(runtime, target_host, payload):
+    upstream_hosts = [target_host]
+    for fallback_host in vpn_dns_servers(runtime.config):
+        if fallback_host not in upstream_hosts:
+            upstream_hosts.append(fallback_host)
+    last_error = None
+    async with runtime.dns_semaphore:
+        for upstream_host in upstream_hosts:
+            try:
+                response = await tcp_dns_query(runtime, upstream_host, 53, payload)
+                async with runtime.dns_cache_lock:
+                    expire_dns_cache(runtime.dns_cache, time.monotonic(), runtime.dns_cache_max_entries)
+                    runtime.dns_cache[dns_query_cache_key(payload)] = {
+                        "expires_at": time.monotonic() + runtime.dns_cache_ttl_seconds,
+                        "response": response,
+                    }
+                trace("dns udp relay target=%s upstream=%s bytes=%s" % (target_host, upstream_host, len(response)))
+                return response
+            except Exception as error:
+                last_error = error
+    raise last_error or RuntimeError("dns query failed")
 
 
 class SocksUdpAssociation(asyncio.DatagramProtocol):
@@ -422,26 +642,103 @@ class SocksUdpAssociation(asyncio.DatagramProtocol):
             return
         if not payload:
             return
-        upstream_hosts = [target_host]
-        for fallback_host in vpn_dns_servers(self.runtime.config):
-            if fallback_host not in upstream_hosts:
-                upstream_hosts.append(fallback_host)
         last_error = None
-        for upstream_host in upstream_hosts:
-            try:
-                response = await tcp_dns_query(self.runtime, upstream_host, 53, payload)
-                packet = build_socks_udp_packet(target_host, target_port, response)
-                self.transport.sendto(packet, addr)
-                trace("dns udp relay target=%s upstream=%s bytes=%s" % (target_host, upstream_host, len(response)))
-                return
-            except Exception as error:
-                last_error = error
+        try:
+            response = await resolve_dns_query(self.runtime, target_host, payload)
+            packet = build_socks_udp_packet(target_host, target_port, response)
+            self.transport.sendto(packet, addr)
+            return
+        except Exception as error:
+            last_error = error
         LOGGER.warning(
             "dns udp relay failed target=%s bytes=%s error=%s",
             target_host,
             len(payload),
             last_error,
         )
+
+
+def authority_matches(expected_host, expected_port, header_value):
+    expected_host = normalize_authority_host(expected_host)
+    actual_host, actual_port = split_authority_header(header_value, expected_port)
+    return expected_host == actual_host and int(expected_port) == int(actual_port)
+
+
+def normalize_authority_host(value):
+    text = str(value or "").strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    return text.lower()
+
+
+def split_authority_header(value, default_port):
+    text = str(value or "").strip()
+    if text.startswith("[") and "]" in text:
+        host, _, remainder = text[1:].partition("]")
+        if remainder.startswith(":"):
+            return normalize_authority_host(host), int(remainder[1:])
+        return normalize_authority_host(host), int(default_port)
+    if text.count(":") == 1:
+        host, port_text = text.rsplit(":", 1)
+        return normalize_authority_host(host), int(port_text)
+    return normalize_authority_host(text), int(default_port)
+
+
+async def read_connect_preamble(reader, timeout_seconds, max_bytes):
+    try:
+        return await asyncio.wait_for(reader.read(int(max_bytes)), timeout=max(0.1, float(timeout_seconds)))
+    except asyncio.TimeoutError:
+        return b""
+
+
+def extract_tls_server_name(payload):
+    if len(payload) < 5 or payload[0] != 22:
+        return ""
+    record_length = struct.unpack("!H", payload[3:5])[0]
+    record = payload[5:5 + record_length]
+    if len(record) < 4 or record[0] != 1:
+        return ""
+    body_length = int.from_bytes(record[1:4], "big")
+    body = record[4:4 + body_length]
+    if len(body) < 34:
+        return ""
+    index = 34
+    if index >= len(body):
+        return ""
+    session_id_length = body[index]
+    index += 1 + session_id_length
+    if index + 2 > len(body):
+        return ""
+    cipher_suites_length = struct.unpack("!H", body[index:index + 2])[0]
+    index += 2 + cipher_suites_length
+    if index >= len(body):
+        return ""
+    compression_methods_length = body[index]
+    index += 1 + compression_methods_length
+    if index + 2 > len(body):
+        return ""
+    extensions_length = struct.unpack("!H", body[index:index + 2])[0]
+    index += 2
+    end = min(len(body), index + extensions_length)
+    while index + 4 <= end:
+        extension_type, extension_size = struct.unpack("!HH", body[index:index + 4])
+        index += 4
+        extension_data = body[index:index + extension_size]
+        index += extension_size
+        if extension_type != 0 or len(extension_data) < 5:
+            continue
+        list_length = struct.unpack("!H", extension_data[:2])[0]
+        names_end = min(len(extension_data), 2 + list_length)
+        name_index = 2
+        while name_index + 3 <= names_end:
+            name_type = extension_data[name_index]
+            name_length = struct.unpack("!H", extension_data[name_index + 1:name_index + 3])[0]
+            name_index += 3
+            name_value = extension_data[name_index:name_index + name_length]
+            name_index += name_length
+            if name_type == 0 and len(name_value) == name_length:
+                return name_value.decode("idna")
+    return ""
 
 
 class ProxyStream(object):
@@ -471,6 +768,12 @@ class ProxyStream(object):
 
     async def open(self):
         trace("open stream=%s target=%s:%s" % (self.stream_id, self.target_host, self.target_port))
+        record_event(
+            "stream_open_requested",
+            stream_id=self.stream_id,
+            target_host=self.target_host,
+            target_port=self.target_port,
+        )
         frame = Frame(
             FRAME_OPEN,
             stream_id=self.stream_id,
@@ -480,8 +783,21 @@ class ProxyStream(object):
         await asyncio.wait_for(self.open_event.wait(), timeout=30)
         if self.open_failed:
             trace("open failed stream=%s error=%s" % (self.stream_id, self.open_failed))
+            record_event(
+                "stream_open_failed",
+                stream_id=self.stream_id,
+                target_host=self.target_host,
+                target_port=self.target_port,
+                error=self.open_failed,
+            )
             raise RuntimeError(self.open_failed)
         trace("open ok stream=%s" % self.stream_id)
+        record_event(
+            "stream_open_ok",
+            stream_id=self.stream_id,
+            target_host=self.target_host,
+            target_port=self.target_port,
+        )
 
     async def on_frame(self, frame):
         if frame.type_id == FRAME_OPEN_OK:
@@ -491,6 +807,7 @@ class ProxyStream(object):
         if frame.type_id == FRAME_OPEN_FAIL:
             self.open_failed = parse_error_payload(frame.payload)
             trace("recv OPEN_FAIL stream=%s error=%s" % (self.stream_id, self.open_failed))
+            record_event("stream_open_fail_frame", stream_id=self.stream_id, error=self.open_failed)
             self.open_event.set()
             await self.recv_queue.put(None)
             return
@@ -517,10 +834,17 @@ class ProxyStream(object):
             if frame.type_id == FRAME_RST and frame.payload:
                 self.open_failed = parse_error_payload(frame.payload)
                 trace("recv RST stream=%s error=%s" % (self.stream_id, self.open_failed))
+                record_event("stream_reset", stream_id=self.stream_id, error=self.open_failed)
                 await self.recv_queue.put(None)
                 return
             self.fin_offset = int(frame.offset)
             trace("recv FIN stream=%s fin_offset=%s recv_offset=%s" % (self.stream_id, self.fin_offset, self.recv_offset))
+            record_event(
+                "stream_fin_received",
+                stream_id=self.stream_id,
+                fin_offset=self.fin_offset,
+                recv_offset=self.recv_offset,
+            )
             if self.recv_offset >= self.fin_offset:
                 await self.recv_queue.put(None)
 
@@ -658,8 +982,7 @@ class ProxyStream(object):
         self.closed = True
 
     def _data_lane(self, chunk_len):
-        del chunk_len
-        if self.send_offset < PRI_LIMIT:
+        if self.send_offset < PRI_LIMIT and (self.send_offset + int(chunk_len)) <= PRI_LIMIT:
             return LANE_PRI
         return LANE_BULK
 
@@ -672,11 +995,20 @@ class HelperRuntime(object):
         self.next_stream_id = max(1, seed | 1)
         self.peer_id = config.get("peer_id") or random_peer_id()
         self.transport = create_transport(config, "helper", self.peer_id, self.on_frame)
+        self.transport.event_handler = self._record_transport_event
+        self.dns_query_timeout = max(0.5, float(config.get("vpn_dns_query_timeout_seconds", DNS_QUERY_TIMEOUT)))
+        self.dns_cache_ttl_seconds = max(1.0, float(config.get("vpn_dns_cache_ttl_seconds", DNS_CACHE_TTL_SECONDS)))
+        self.dns_cache_max_entries = max(32, int(config.get("vpn_dns_cache_max_entries", DNS_CACHE_MAX_ENTRIES)))
+        self.dns_semaphore = asyncio.Semaphore(max(1, int(config.get("vpn_dns_max_inflight", DNS_MAX_INFLIGHT))))
+        self.dns_cache = {}
+        self.dns_inflight = {}
+        self.dns_cache_lock = asyncio.Lock()
 
     async def start(self):
         await self.transport.start()
 
     async def stop(self):
+        await self._reset_active_streams_for_shutdown()
         await self.transport.stop()
 
     async def on_frame(self, frame, _lane):
@@ -694,6 +1026,34 @@ class HelperRuntime(object):
 
     async def release_stream(self, stream_id):
         self.streams.pop(stream_id, None)
+        record_event("stream_released", stream_id=stream_id)
+
+    def _record_transport_event(self, event):
+        record_event(**event)
+
+    async def _reset_active_streams_for_shutdown(self):
+        active_streams = [stream for stream in self.streams.values() if not stream.closed]
+        if not active_streams:
+            return
+        grace_seconds = max(
+            0.0,
+            float(
+                self.config.get(
+                    "shutdown_stream_reset_grace_seconds",
+                    SHUTDOWN_STREAM_RESET_GRACE_SECONDS,
+                )
+            ),
+        )
+        record_event(
+            "helper_shutdown_reset_pending",
+            stream_count=len(active_streams),
+            grace_seconds=grace_seconds,
+        )
+        for stream in active_streams:
+            with contextlib.suppress(Exception):
+                await stream.reset("helper shutdown")
+        if grace_seconds > 0:
+            await asyncio.sleep(grace_seconds)
 
 
 async def relay_stream(runtime, stream, reader, writer, initial_payload=b"", connected_response=None, open_stream=True):
@@ -712,6 +1072,7 @@ async def relay_stream(runtime, stream, reader, writer, initial_payload=b"", con
                 data = await reader.read(READ_CHUNK)
                 if not data:
                     trace("local EOF stream=%s send_offset=%s" % (stream.stream_id, stream.send_offset))
+                    record_event("local_eof", stream_id=stream.stream_id, send_offset=stream.send_offset)
                     await stream.finish()
                     return
                 trace("local read stream=%s bytes=%s" % (stream.stream_id, len(data)))
@@ -730,6 +1091,14 @@ async def relay_stream(runtime, stream, reader, writer, initial_payload=b"", con
                             stream.local_write_bytes,
                             stream.local_write_count,
                         )
+                    )
+                    record_event(
+                        "remote_eof",
+                        stream_id=stream.stream_id,
+                        recv_offset=stream.recv_offset,
+                        local_written=stream.local_write_bytes,
+                        local_writes=stream.local_write_count,
+                        error=stream.open_failed,
                     )
                     with contextlib.suppress(Exception):
                         writer.write_eof()
@@ -795,46 +1164,61 @@ async def relay_stream(runtime, stream, reader, writer, initial_payload=b"", con
             with contextlib.suppress(Exception):
                 await stream.finish()
         await runtime.release_stream(stream.stream_id)
-        writer.close()
-        await writer.wait_closed()
+        await close_writer_quietly(writer)
 
 
 async def handle_http(runtime, reader, writer):
     try:
-        peer = writer.get_extra_info("peername")
         buffer = b""
         while not recv_until_headers(buffer) and len(buffer) < 65536:
             chunk = await reader.read(4096)
             if not chunk:
-                writer.close()
-                await writer.wait_closed()
+                await close_writer_quietly(writer)
                 return
             buffer += chunk
         request_line, headers, rest = parse_request_headers(buffer)
         method = request_line.split(" ", 1)[0].upper()
         if method == "CONNECT":
             host, port, _ = target_from_request(request_line, headers)
+            connected_response = None
             initial_payload = b""
-            connected_response = b"HTTP/1.1 200 Connection Established\r\n\r\n"
+            if runtime.config.get("enforce_connect_sni", True):
+                writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                await writer.drain()
+                initial_payload = await read_connect_preamble(
+                    reader,
+                    timeout_seconds=float(runtime.config.get("connect_sni_timeout_seconds", 1.0)),
+                    max_bytes=int(runtime.config.get("connect_sni_probe_bytes", 4096)),
+                )
+                server_name = extract_tls_server_name(initial_payload)
+                if server_name and normalize_authority_host(server_name) != normalize_authority_host(host):
+                    raise RuntimeError("TLS SNI does not match CONNECT host")
+            else:
+                connected_response = b"HTTP/1.1 200 Connection Established\r\n\r\n"
         else:
             host, port, initial_payload = rebuild_http_request(request_line, headers, rest)
             connected_response = None
-        LOGGER.info("http accept peer=%s method=%s host=%s port=%s connect=%s", peer, method, host, port, method == "CONNECT")
         trace("http request method=%s host=%s port=%s connect=%s" % (method, host, port, method == "CONNECT"))
         stream = runtime.new_stream(host, port)
         await relay_stream(runtime, stream, reader, writer, initial_payload=initial_payload, connected_response=connected_response)
     except Exception as error:
+        if is_benign_network_error(error):
+            await close_writer_quietly(writer)
+            return
         LOGGER.warning("http proxy request failed error=%s", error)
         body = str(error).encode("utf-8", errors="replace")
-        writer.write(
-            b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: "
-            + str(len(body)).encode("ascii")
-            + b"\r\n\r\n"
-            + body
-        )
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
+        try:
+            writer.write(
+                b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: "
+                + str(len(body)).encode("ascii")
+                + b"\r\n\r\n"
+                + body
+            )
+            await writer.drain()
+        except Exception as write_error:
+            if not is_benign_network_error(write_error):
+                LOGGER.warning("http proxy error response failed error=%s", write_error)
+        await close_writer_quietly(writer)
 
 
 async def handle_socks(runtime, reader, writer):
@@ -889,24 +1273,22 @@ async def handle_socks(runtime, reader, writer):
         await writer.drain()
         await relay_stream(runtime, stream, reader, writer, open_stream=False)
     except Exception as error:
-        LOGGER.warning("socks proxy request failed error=%s", error)
+        if not is_benign_network_error(error):
+            LOGGER.warning("socks proxy request failed error=%s", error)
         if stream is not None:
             with contextlib.suppress(Exception):
                 await stream.reset("socks failure")
             await runtime.release_stream(stream.stream_id)
-        with contextlib.suppress(Exception):
-            writer.close()
-            await writer.wait_closed()
+        await close_writer_quietly(writer)
         if udp_association is not None:
             udp_association.close()
 
 
 async def main_async(config):
-    global STOP_LOOP, STOP_EVENT
     loop = asyncio.get_running_loop()
-    STOP_LOOP = loop
-    STOP_EVENT = asyncio.Event()
     loop.set_exception_handler(log_asyncio_exception)
+    stop_event = asyncio.Event()
+    register_runtime_control(loop, stop_event)
     runtime = HelperRuntime(config)
     configured_http_hosts = config.get("http_listen_hosts") or config.get("listen_hosts")
     configured_socks_hosts = config.get("socks_listen_hosts") or config.get("listen_hosts")
@@ -925,7 +1307,7 @@ async def main_async(config):
     http_port = int(config.get("http_listen_port", 8080))
     socks_port = int(config.get("socks_listen_port", 1080))
     LOGGER.info(
-        "helper starting transport=%s http_hosts=%s socks_hosts=%s http_port=%s socks_port=%s trace=%s http2_ctl=%s http2_data=%s",
+        "helper starting transport=%s http_hosts=%s socks_hosts=%s http_port=%s socks_port=%s trace=%s http2_ctl=%s http2_data=%s peer_id=%s transport_session=%s",
         config.get("transport", "http"),
         ",".join(http_listen_hosts),
         ",".join(socks_listen_hosts),
@@ -934,13 +1316,24 @@ async def main_async(config):
         TRACE_ENABLED,
         bool(config.get("http2_enabled", {}).get("ctl", False)),
         bool(config.get("http2_enabled", {}).get("data", False)),
+        runtime.peer_id,
+        runtime.transport.peer_session_id,
     )
-    await runtime.start()
+    record_event(
+        "helper_starting",
+        peer_id=runtime.peer_id,
+        transport_session_id=runtime.transport.peer_session_id,
+        transport=config.get("transport", "http"),
+        http_hosts=http_listen_hosts,
+        socks_hosts=socks_listen_hosts,
+        http_port=http_port,
+        socks_port=socks_port,
+    )
     http_servers = []
     socks_servers = []
     serve_tasks = []
-    stop_task = None
     try:
+        await runtime.start()
         http_servers, active_http_port = await start_bound_servers(
             http_listen_hosts,
             http_port,
@@ -957,29 +1350,47 @@ async def main_async(config):
                 "socks_hosts": socks_listen_hosts,
                 "http_port": active_http_port,
                 "socks_port": active_socks_port,
+                "transport_session_id": runtime.transport.peer_session_id,
             }
         )
         LOGGER.info(
-            "helper started log_path=%s http_port=%s socks_port=%s",
+            "helper started log_path=%s event_log_path=%s transport_session=%s http_port=%s socks_port=%s",
             RUNTIME_LOG_PATH or "stderr-only",
+            EVENT_LOG_PATH or "disabled",
+            runtime.transport.peer_session_id,
             active_http_port,
             active_socks_port,
         )
+        record_event(
+            "helper_started",
+            transport_session_id=runtime.transport.peer_session_id,
+            http_hosts=http_listen_hosts,
+            socks_hosts=socks_listen_hosts,
+            http_port=active_http_port,
+            socks_port=active_socks_port,
+        )
         for server in http_servers + socks_servers:
             serve_tasks.append(asyncio.create_task(server.serve_forever()))
-        stop_task = asyncio.create_task(STOP_EVENT.wait())
-        await stop_task
-    finally:
-        LOGGER.info("helper stopping")
-        if stop_task is not None:
-            stop_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await stop_task
-        for task in serve_tasks:
+        stop_task = asyncio.create_task(stop_event.wait())
+        done, pending = await asyncio.wait(
+            serve_tasks + [stop_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if stop_task in done:
+            LOGGER.info("helper stop requested")
+            record_event("helper_stop_requested", transport_session_id=runtime.transport.peer_session_id)
+        else:
+            for task in done:
+                task.result()
+        for task in pending:
             task.cancel()
-        for task in serve_tasks:
-            with contextlib.suppress(asyncio.CancelledError):
+        for task in pending:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+    finally:
+        clear_runtime_control(loop)
+        LOGGER.info("helper stopping")
+        record_event("helper_stopping", transport_session_id=runtime.transport.peer_session_id)
         for http_server in http_servers:
             http_server.close()
             with contextlib.suppress(Exception):
@@ -990,9 +1401,8 @@ async def main_async(config):
                 await socks_server.wait_closed()
         await runtime.stop()
         remove_listen_state_file()
-        STOP_EVENT = None
-        STOP_LOOP = None
         LOGGER.info("helper stopped")
+        record_event("helper_stopped", transport_session_id=runtime.transport.peer_session_id)
 
 
 def main():
@@ -1001,20 +1411,28 @@ def main():
     args = parser.parse_args()
     config = load_config(args.config)
     configure_runtime_logging(args.config, config)
-    configure_listen_state_path(config)
+    configure_event_logging(args.config, config)
+    configure_pid_file(args.config, config)
+    configure_listen_state_path(args.config, config)
     for signum in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
         if signum is None:
             continue
         with contextlib.suppress(ValueError):
             signal.signal(signum, handle_shutdown_signal)
     try:
+        write_pid_file()
         remove_listen_state_file()
         asyncio.run(main_async(config))
     except KeyboardInterrupt:
         LOGGER.info("helper interrupted by user")
+        record_event("helper_interrupted")
+        raise SystemExit(0)
     except Exception:
         LOGGER.exception("helper crashed")
-        raise
+        record_event("helper_crashed")
+        raise SystemExit(1)
+    finally:
+        remove_pid_file()
 
 
 if __name__ == "__main__":

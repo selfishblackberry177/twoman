@@ -11,12 +11,12 @@ val releaseStoreFile = providers.environmentVariable("TWOMAN_ANDROID_KEYSTORE_FI
 val releaseStorePassword = providers.environmentVariable("TWOMAN_ANDROID_KEYSTORE_PASSWORD").orNull
 val releaseKeyAlias = providers.environmentVariable("TWOMAN_ANDROID_KEY_ALIAS").orNull
 val releaseKeyPassword = providers.environmentVariable("TWOMAN_ANDROID_KEY_PASSWORD").orNull
-val androidAppLabel = providers.environmentVariable("TWOMAN_ANDROID_APP_LABEL").orElse("Local Network Bridge").get()
-val androidProxyTitle = providers.environmentVariable("TWOMAN_ANDROID_PROXY_TITLE").orElse("Local Network Bridge").get()
-val androidVpnTitle = providers.environmentVariable("TWOMAN_ANDROID_VPN_TITLE").orElse("Standard System Adapter").get()
-val androidChannelName = providers.environmentVariable("TWOMAN_ANDROID_CHANNEL_NAME").orElse("Local Network Bridge").get()
-val androidVpnSessionName = providers.environmentVariable("TWOMAN_ANDROID_VPN_SESSION_NAME").orElse("Standard System Adapter").get()
-val androidLogTag = providers.environmentVariable("TWOMAN_ANDROID_LOG_TAG").orElse("LocalBridgeSvc").get()
+val androidAppLabel = providers.environmentVariable("TWOMAN_ANDROID_APP_LABEL").orElse("Twoman").get()
+val androidProxyTitle = providers.environmentVariable("TWOMAN_ANDROID_PROXY_TITLE").orElse("Twoman Proxy").get()
+val androidVpnTitle = providers.environmentVariable("TWOMAN_ANDROID_VPN_TITLE").orElse("Twoman VPN").get()
+val androidChannelName = providers.environmentVariable("TWOMAN_ANDROID_CHANNEL_NAME").orElse("Twoman Runtime").get()
+val androidVpnSessionName = providers.environmentVariable("TWOMAN_ANDROID_VPN_SESSION_NAME").orElse("Twoman VPN").get()
+val androidLogTag = providers.environmentVariable("TWOMAN_ANDROID_LOG_TAG").orElse("TwomanSvc").get()
 val hasReleaseSigning =
     !releaseStoreFile.isNullOrBlank() &&
         !releaseStorePassword.isNullOrBlank() &&
@@ -31,8 +31,8 @@ android {
         applicationId = "com.twoman.android"
         minSdk = 24
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.5.0"
+        versionCode = 7
+        versionName = "0.6.0"
         buildConfigField("String", "RUNTIME_LOG_TAG", quoteForGradle(androidLogTag))
         buildConfigField("String", "VPN_SESSION_NAME", quoteForGradle(androidVpnSessionName))
         resValue("string", "runtime_app_name", quoteForGradle(androidAppLabel))

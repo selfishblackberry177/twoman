@@ -91,13 +91,14 @@
   html,
   body,
   #root {
-    height: 100%;
-    overflow: hidden;
+    min-height: 100%;
   }
 
   body {
     margin: 0;
     @apply bg-background font-sans text-foreground antialiased;
+    overflow-x: hidden;
+    overflow-y: auto;
     background-image:
       radial-gradient(circle at top left, rgba(255, 255, 255, 0.08), transparent 24%),
       radial-gradient(circle at top right, rgba(255, 255, 255, 0.03), transparent 28%),
@@ -144,11 +145,11 @@
 
 @layer components {
   .app-shell {
-    @apply h-full overflow-hidden;
+    @apply min-h-full;
   }
 
   .app-frame {
-    @apply mx-auto grid h-full max-w-[1540px] min-w-0 gap-3 overflow-hidden px-3 py-3 lg:grid-cols-[332px_minmax(0,1fr)];
+    @apply mx-auto grid min-h-full max-w-[1540px] min-w-0 content-start gap-3 px-3 py-3 lg:grid-cols-[332px_minmax(0,1fr)];
   }
 
   .app-sidebar,

@@ -53,6 +53,10 @@ Current status:
 - end-to-end tunnel is proven on the audited managed host
 - browser-grade smoke tests are passing on the current profile
 - raw public WebSocket upgrade is still not assumed
+- camouflage deploys should publish the same generated `404.html` at both the
+  site slug and the root `public_html` when `TWOMAN_CAMOUFLAGE_SITE_ROOT_INDEX=true`
+- camouflage deploys should also install matching `.htaccess` `ErrorDocument`
+  rules so unknown Apache-served paths use that same themed 404 page
 
 Primary files:
 
@@ -77,6 +81,13 @@ Current status:
 - `/health` is served relative to the configured Passenger base URI
 - `LSAPI_CHILDREN=1` and `LSAPI_AVOID_FORK=1` are required baseline settings
 - full broker traffic now expects Passenger-managed routing rather than `.htaccess` loopback proxying
+- current Passenger deploy defaults use `down_wait_ms={"ctl":250,"data":250}`
+- current Passenger deploy defaults keep `streaming_data_down_helper=false`
+- reason: long-lived helper `data/down` streams can monopolize the public Passenger
+  worker and starve helper control traffic on the audited CloudLinux host
+- current deploy defaults size broker lanes as `ctl=4096/8/1ms`, `pri=32768/16/2ms`, and `bulk=262144/64/4ms`
+- current public-host naming guidance is documented in
+  `docs/HOST_APP_MAPPINGS.md`
 
 Primary files:
 

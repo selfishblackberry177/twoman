@@ -1,5 +1,10 @@
 <resources>
-    <string name="app_name">Local Network Bridge</string>
+    <string name="app_name">Twoman</string>
+    <string name="runtime_app_name">Twoman</string>
+    <string name="runtime_channel_name">Twoman Runtime</string>
+    <string name="runtime_proxy_title">Twoman Proxy</string>
+    <string name="runtime_vpn_title">Twoman VPN</string>
+    <string name="label_http">HTTP/2 control</string>
     <string name="status_stopped">Stopped</string>
     <string name="status_proxy">Proxy</string>
     <string name="status_vpn">VPN</string>

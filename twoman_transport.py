@@ -37,6 +37,7 @@ from twoman_protocol import (
     LANE_PRI,
     encode_frame,
 )
+from twoman_crypto import TransportCipher
 
 TRACE_ENABLED = os.environ.get("TWOMAN_TRACE", "").strip().lower() in ("1", "true", "yes", "on", "debug", "verbose")
 
@@ -201,10 +202,17 @@ class LaneTransport(object):
                     batch_frames.append(frame)
                     batch.append(encoded)
                     total += len(encoded)
+                
+                # Encrypt outer payload with hop-by-hop cipher
+                batch_payload = b"".join(batch)
+                iv = os.urandom(16)
+                cipher = TransportCipher(self.token.encode('utf-8'), iv)
+                encrypted_payload = iv + cipher.process(batch_payload)
+
                 response = await self.clients[(lane, "up")].post(
                     self._lane_url(lane, "up"),
                     headers=self._headers(binary_request=True),
-                    content=b"".join(batch),
+                    content=encrypted_payload,
                 )
                 response.raise_for_status()
                 self._validate_ack_response(response)
@@ -213,6 +221,9 @@ class LaneTransport(object):
             except asyncio.CancelledError:
                 raise
             except Exception as error:
+                err_str = repr(error)
+                if hasattr(error, 'response') and error.response is not None:
+                    err_str += " BODY: " + error.response.text
                 await self._requeue_frames_front(lane, batch_frames)
                 await self._reset_client(lane, "up")
                 delay = self._backoff_after_error("up", lane)
@@ -220,10 +231,10 @@ class LaneTransport(object):
                     "transport_up_error",
                     lane=lane,
                     delay_seconds=delay,
-                    error=repr(error),
+                    error=err_str,
                     queued_frames=len(batch_frames),
                 )
-                trace("%s/%s@%s up error lane=%s delay=%0.3f error=%r" % (self.role, self.peer_label, self.peer_session_id, lane, delay, error))
+                trace("%s/%s@%s up error lane=%s delay=%0.3f error=%s" % (self.role, self.peer_label, self.peer_session_id, lane, delay, err_str))
                 if delay > 0:
                     await asyncio.sleep(delay)
 
@@ -237,11 +248,29 @@ class LaneTransport(object):
                     self._validate_binary_response(response)
                     self._mark_success("down", lane)
                     trace("%s/%s@%s down open lane=%s status=%s" % (self.role, self.peer_label, self.peer_session_id, lane, response.status_code))
+                    
+                    cipher = None
+                    iv_buffer = b""
+                    
                     async for chunk in response.aiter_bytes():
                         if not chunk:
                             continue
+                            
+                        # Extract the 16-byte IV from the front of the stream
+                        if cipher is None:
+                            needed_iv = 16 - len(iv_buffer)
+                            iv_buffer += chunk[:needed_iv]
+                            chunk = chunk[needed_iv:]
+                            if len(iv_buffer) == 16:
+                                cipher = TransportCipher(self.token.encode('utf-8'), iv_buffer)
+                            if not chunk:
+                                continue
+
                         trace("%s/%s@%s down chunk lane=%s bytes=%s" % (self.role, self.peer_label, self.peer_session_id, lane, len(chunk)))
-                        for frame in decoder.feed(chunk):
+                        
+                        plaintext_chunk = cipher.process(chunk)
+                        
+                        for frame in decoder.feed(plaintext_chunk):
                             if frame.type_id != FRAME_PING:
                                 saw_non_ping = True
                                 trace("%s/%s@%s down frame lane=%s type=%s stream=%s payload=%s" % (self.role, self.peer_label, self.peer_session_id, lane, frame.type_id, frame.stream_id, len(frame.payload)))
@@ -346,9 +375,20 @@ class LaneTransport(object):
                 delays[LANE_DATA] = max(0.0, float(values.get("pri", 0.0) or values.get("bulk", 0.0)))
             return delays
         if idle_repoll_delay_seconds is None:
-            default_value = 0.0
-        else:
-            default_value = max(0.0, float(idle_repoll_delay_seconds))
+            configured = self.protocol_config.get("idle_repoll_delay_seconds")
+            if isinstance(configured, dict):
+                return self._normalize_idle_repoll_delay_seconds(configured)
+            if configured is not None:
+                try:
+                    default_value = max(0.0, float(configured))
+                except (TypeError, ValueError):
+                    default_value = 0.05 if LANE_CTL in external_lanes else 0.1
+                return dict((lane, default_value) for lane in external_lanes)
+            defaults = {}
+            for lane in external_lanes:
+                defaults[lane] = 0.05 if lane == LANE_CTL else 0.1
+            return defaults
+        default_value = max(0.0, float(idle_repoll_delay_seconds))
         return dict((lane, default_value) for lane in external_lanes)
 
     def _default_data_upload_profile(self):
@@ -407,10 +447,9 @@ class LaneTransport(object):
         return self.data_queue.get_nowait()
 
     async def _requeue_frame(self, lane, frame):
-        if lane != LANE_DATA:
-            await self.queues[lane].put(frame)
-            return
-        await self.data_queue.put(frame)
+        # Preserve lane order when a batch overflows its byte budget.
+        replay = self.replay_queues.setdefault(lane, collections.deque())
+        replay.appendleft(frame)
 
     async def _requeue_frames_front(self, lane, frames):
         if not frames:
@@ -466,7 +505,15 @@ class LaneTransport(object):
                     break
                 batch.append(encoded)
                 total += len(encoded)
-            yield b"".join(batch)
+                
+            batch_payload = b"".join(batch)
+            if not getattr(self, '_streaming_cipher', None) or getattr(self, '_streaming_lane', None) != lane:
+                iv = os.urandom(16)
+                self._streaming_cipher = TransportCipher(self.token.encode('utf-8'), iv)
+                self._streaming_lane = lane
+                yield iv + self._streaming_cipher.process(batch_payload)
+            else:
+                yield self._streaming_cipher.process(batch_payload)
 
     def _build_client(self, lane):
         limits = httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=120)
@@ -649,8 +696,13 @@ class WebSocketLaneTransport(object):
                 ) as websocket:
                     self._mark_success("ws", lane)
                     trace("%s/%s@%s ws open lane=%s" % (self.role, self.peer_label, self.peer_session_id, lane))
-                    recv_task = asyncio.create_task(self._recv_loop(websocket, lane))
-                    send_task = asyncio.create_task(self._send_loop(websocket, lane))
+                    
+                    iv = os.urandom(16)
+                    send_cipher = TransportCipher(self.token.encode('utf-8'), iv)
+                    recv_cipher = None
+                    
+                    recv_task = asyncio.create_task(self._recv_loop(websocket, lane, recv_cipher=recv_cipher))
+                    send_task = asyncio.create_task(self._send_loop(websocket, lane, send_cipher=send_cipher, send_iv=iv))
                     done, pending = await asyncio.wait(
                         [recv_task, send_task],
                         return_when=asyncio.FIRST_EXCEPTION,
@@ -670,26 +722,47 @@ class WebSocketLaneTransport(object):
                 if delay > 0:
                     await asyncio.sleep(delay)
 
-    async def _send_loop(self, websocket, lane):
+    async def _send_loop(self, websocket, lane, send_cipher, send_iv):
+        first_frame = True
         while not self.stop_event.is_set():
             frame = await self._next_outbound_frame(lane)
             payload = encode_frame(frame)
+            
             try:
-                await websocket.send(payload)
+                encrypted_payload = send_cipher.process(payload)
+                if first_frame:
+                    encrypted_payload = send_iv + encrypted_payload
+                    first_frame = False
+                    
+                await websocket.send(encrypted_payload)
                 if frame.type_id != FRAME_PING:
                     trace("%s/%s@%s ws send lane=%s type=%s stream=%s payload=%s" % (self.role, self.peer_label, self.peer_session_id, lane, frame.type_id, frame.stream_id, len(frame.payload)))
             except Exception:
                 await self._requeue_frame_front(lane, frame)
                 raise
 
-    async def _recv_loop(self, websocket, lane):
+    async def _recv_loop(self, websocket, lane, recv_cipher):
         decoder = FrameDecoder()
+        iv_buffer = b""
         async for message in websocket:
             if isinstance(message, str):
                 message = message.encode("utf-8")
             if not message:
                 continue
-            for frame in decoder.feed(message):
+                
+            # Extract the 16-byte IV from the front of the stream
+            if recv_cipher is None:
+                needed_iv = 16 - len(iv_buffer)
+                iv_buffer += message[:needed_iv]
+                message = message[needed_iv:]
+                if len(iv_buffer) == 16:
+                    recv_cipher = TransportCipher(self.token.encode('utf-8'), iv_buffer)
+                if not message:
+                    continue
+
+            plaintext_message = recv_cipher.process(message)
+            
+            for frame in decoder.feed(plaintext_message):
                 logical_lane = self._logical_lane(lane, frame)
                 if frame.type_id != FRAME_PING:
                     trace("%s/%s@%s ws recv lane=%s type=%s stream=%s payload=%s" % (self.role, self.peer_label, self.peer_session_id, logical_lane, frame.type_id, frame.stream_id, len(frame.payload)))

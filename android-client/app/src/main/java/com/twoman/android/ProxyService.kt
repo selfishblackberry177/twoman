@@ -3,6 +3,8 @@ package com.twoman.android
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
 import android.os.Process
 import android.os.IBinder
 import android.util.Log
@@ -45,14 +47,20 @@ class ProxyService : Service() {
         currentProfile = profile
         stopRequested = false
         NotificationHelper.ensureChannel(this)
-        startForeground(
-            NotificationHelper.PROXY_NOTIFICATION_ID,
-            NotificationHelper.build(
-                this,
-                getString(R.string.runtime_proxy_title),
-                getString(R.string.status_starting_message),
-            ),
+        val notification = NotificationHelper.build(
+            this,
+            getString(R.string.runtime_proxy_title),
+            getString(R.string.status_starting_message),
         )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NotificationHelper.PROXY_NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+            )
+        } else {
+            startForeground(NotificationHelper.PROXY_NOTIFICATION_ID, notification)
+        }
         if (helperThread == null) {
             helperThread = thread(name = "local-runtime-helper", start = true) {
                 runHelper(profile, mode)
@@ -195,7 +203,7 @@ class ProxyService : Service() {
                     )
                 }
                 stopSelf()
-                Process.killProcess(Process.myPid())
+                terminateProxyProcess("helper thread stop timeout")
                 return@thread
             }
             currentProfile?.let { profile ->
@@ -214,7 +222,13 @@ class ProxyService : Service() {
                 )
             }
             stopSelf()
+            terminateProxyProcess("helper stopped cleanly")
         }
+    }
+
+    private fun terminateProxyProcess(reason: String) {
+        Log.i(loggerTag, "ProxyService terminating process reason=$reason")
+        Process.killProcess(Process.myPid())
     }
 
     override fun onDestroy() {

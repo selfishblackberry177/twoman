@@ -127,6 +127,19 @@ function connectionModeLabel(mode: ConnectionMode) {
   }
 }
 
+function desktopClientLabel(os?: string) {
+  switch ((os ?? "").toLowerCase()) {
+    case "windows":
+      return "Windows client";
+    case "linux":
+      return "Linux client";
+    case "macos":
+      return "macOS client";
+    default:
+      return "Desktop client";
+  }
+}
+
 function formatShareAddress(protocol: SharedProxyProtocol, address: string) {
   return protocol === "http" ? `http://${address}` : address;
 }
@@ -290,7 +303,7 @@ function App() {
   }
 
   async function handleConnectToggle() {
-    if (!snapshot) {
+    if (!snapshot || connection?.phase === "disconnecting") {
       return;
     }
     if (connection?.phase === "connected" || connection?.phase === "connecting") {
@@ -359,8 +372,8 @@ function App() {
         ) : null}
 
         <div className="app-frame">
-          <aside className="app-sidebar overflow-hidden">
-            <div className="flex h-full min-h-0 flex-col gap-3 overflow-hidden">
+          <aside className="app-sidebar">
+            <div className="flex min-h-0 flex-col gap-3 lg:overflow-hidden">
               <Card className="panel-shell shrink-0">
                 <CardContent className="space-y-3 p-4">
                   <div className="flex items-center gap-4">
@@ -376,7 +389,9 @@ function App() {
                         </h1>
                         <StatusBadge phase={connection?.phase ?? "disconnected"} />
                       </div>
-                      <p className="mt-1 text-sm text-white/68">Windows client</p>
+                      <p className="mt-1 text-sm text-white/68">
+                        {desktopClientLabel(snapshot?.platform.os)}
+                      </p>
                     </div>
                   </div>
 
@@ -520,7 +535,7 @@ function App() {
             </div>
           </aside>
 
-          <section className="app-workspace flex min-h-0 flex-col gap-4 overflow-hidden">
+          <section className="app-workspace flex min-h-0 flex-col gap-4">
             <Card className="panel-shell shrink-0">
               <CardContent className="space-y-4 p-5">
                 <div className="flex flex-wrap items-start justify-between gap-4">
@@ -635,7 +650,7 @@ function App() {
             </Card>
 
             <div className="grid min-h-0 flex-1 gap-3 lg:grid-cols-[minmax(0,1fr)_350px]">
-              <Card className="panel-shell min-h-0 h-full">
+              <Card className="panel-shell min-h-0 h-full overflow-hidden">
                 <CardHeader className="pb-3">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div>
@@ -689,7 +704,7 @@ function App() {
                   </div>
                 </CardHeader>
                 <CardContent className="min-h-0 flex-1 overflow-hidden">
-                    <div className="h-full min-h-[220px] max-h-[340px] overflow-y-auto rounded-[24px] border border-white/8 bg-[#0b0c0f] lg:max-h-none">
+                    <div className="h-full min-h-[220px] max-h-[38vh] overflow-y-auto overscroll-contain rounded-[24px] border border-white/8 bg-[#0b0c0f]">
                       <pre className="min-h-full select-text whitespace-pre-wrap break-words p-4 font-mono text-xs leading-6 text-white/86">
                         {activeLogTail || "No output yet."}
                       </pre>
@@ -697,7 +712,7 @@ function App() {
                 </CardContent>
               </Card>
 
-              <div className="flex min-h-0 flex-col gap-3 overflow-hidden">
+              <div className="flex min-h-0 flex-col gap-3">
                 <Card className="panel-shell min-h-0 h-full">
                   <CardHeader className="pb-3">
                     <div className="flex items-center justify-between gap-3">
@@ -1102,7 +1117,7 @@ function ProfileDialog(props: {
 
   return (
     <Dialog onOpenChange={(open) => !open && props.onClose()} open>
-      <DialogContent className="sm:max-w-[620px]">
+      <DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-[620px]">
         <DialogHeader>
           <DialogTitle>{props.state.mode === "create" ? "Add profile" : "Edit profile"}</DialogTitle>
           <DialogDescription>Broker settings and local ports.</DialogDescription>
@@ -1206,7 +1221,7 @@ function ImportProfileDialog(props: {
 
   return (
     <Dialog onOpenChange={(open) => !open && props.onClose()} open>
-      <DialogContent className="sm:max-w-[560px]">
+      <DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-[560px]">
         <DialogHeader>
           <DialogTitle>Import profile</DialogTitle>
           <DialogDescription>Paste profile text or raw JSON.</DialogDescription>
@@ -1251,7 +1266,7 @@ function ShareDialog(props: {
 
   return (
     <Dialog onOpenChange={(open) => !open && props.onClose()} open>
-      <DialogContent className="sm:max-w-[560px]">
+      <DialogContent className="max-h-[92vh] overflow-y-auto sm:max-w-[560px]">
         <DialogHeader>
           <DialogTitle>
             {props.state.mode === "create" ? "Add public proxy" : "Edit public proxy"}

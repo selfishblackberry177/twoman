@@ -1,8 +1,49 @@
 const fs = require("fs");
 const http = require("http");
 const net = require("net");
+const crypto = require("crypto");
 const path = require("path");
 const { WebSocketServer, WebSocket } = require("ws");
+
+class TransportCipher {
+  constructor(keyBuffer, ivBuffer) {
+    if (!keyBuffer || keyBuffer.length === 0) {
+      keyBuffer = Buffer.from("twoman-default-key");
+    }
+    this.key = crypto.createHash("sha256").update(keyBuffer).digest();
+    this.iv = ivBuffer.length < 16 ? Buffer.concat([ivBuffer, Buffer.alloc(16 - ivBuffer.length)]) : ivBuffer.subarray(0, 16);
+    this.blockIndex = 0n;
+    this.keystreamBuffer = Buffer.alloc(0);
+    this.streamOffset = 0;
+  }
+
+  _generateBlock() {
+    const indexBuf = Buffer.alloc(8);
+    indexBuf.writeBigUInt64BE(this.blockIndex, 0);
+    this.blockIndex += 1n;
+    const counterBytes = Buffer.concat([this.iv, indexBuf]);
+    return crypto.createHmac("sha256", this.key).update(counterBytes).digest();
+  }
+
+  process(data) {
+    if (!data || data.length === 0) return Buffer.alloc(0);
+    const output = Buffer.alloc(data.length);
+    let processed = 0;
+    while (processed < data.length) {
+      if (this.keystreamBuffer.length === 0) {
+        this.keystreamBuffer = this._generateBlock();
+      }
+      const chunkSize = Math.min(data.length - processed, this.keystreamBuffer.length);
+      for (let i = 0; i < chunkSize; i++) {
+        output[processed + i] = data[processed + i] ^ this.keystreamBuffer[i];
+      }
+      this.keystreamBuffer = this.keystreamBuffer.subarray(chunkSize);
+      processed += chunkSize;
+    }
+    this.streamOffset += data.length;
+    return output;
+  }
+}
 
 const ROOT_DIR = path.resolve(__dirname, "..", "..");
 const CONFIG_PATH = process.env.TWOMAN_CONFIG_PATH || path.join(__dirname, "config.json");
@@ -105,6 +146,45 @@ function appendRotatedLine(filePath, maxBytes, backupCount, line) {
   } catch (_error) {
     // Best-effort diagnostics only.
   }
+}
+
+function normalizeLaneProfiles(config) {
+  const defaults = {
+    ctl: { maxBytes: 4096, maxFrames: 8, holdMs: 1, padMin: 1024 },
+    pri: { maxBytes: 32768, maxFrames: 16, holdMs: 2, padMin: 1024 },
+    bulk: { maxBytes: 262144, maxFrames: 64, holdMs: 4, padMin: 0 }
+  };
+  const configured = (config && typeof config.lane_profiles === "object" && config.lane_profiles) || {};
+  const normalized = {
+    ctl: { ...defaults.ctl },
+    pri: { ...defaults.pri },
+    bulk: { ...defaults.bulk }
+  };
+  const aliasFor = {
+    maxBytes: "max_bytes",
+    maxFrames: "max_frames",
+    holdMs: "hold_ms",
+    padMin: "pad_min"
+  };
+  for (const lane of Object.keys(normalized)) {
+    const override = configured[lane];
+    if (!override || typeof override !== "object") {
+      continue;
+    }
+    for (const key of Object.keys(aliasFor)) {
+      const rawValue = override[key] ?? override[aliasFor[key]];
+      if (rawValue === undefined || rawValue === null) {
+        continue;
+      }
+      const numeric = Number(rawValue);
+      if (!Number.isFinite(numeric)) {
+        continue;
+      }
+      const minimum = (key === "maxBytes" || key === "maxFrames") ? 1 : 0;
+      normalized[lane][key] = Math.max(minimum, Math.trunc(numeric));
+    }
+  }
+  return normalized;
 }
 
 function runtimeLog(message) {
@@ -324,6 +404,7 @@ class BrokerState {
     this.dataReplayResendMs = Math.max(50, Number(config.data_replay_resend_ms || DEFAULT_DATA_REPLAY_RESEND_MS));
     this.downWaitMs = this.normalizeDownWaitMs(config.down_wait_ms || {});
     this.streamingDataDownHelper = Boolean(config.streaming_data_down_helper);
+    this.laneProfiles = normalizeLaneProfiles(config);
     this.peers = new Map();
     this.streamsByHelper = new Map();
     this.streamsByAgent = new Map();
@@ -531,13 +612,7 @@ class BrokerState {
   }
 
   laneProfile(lane) {
-    if (lane === LANE_CTL) {
-      return { maxBytes: 4096, maxFrames: 8, holdMs: 1, padMin: 1024 };
-    }
-    if (lane === "pri") {
-      return { maxBytes: 16384, maxFrames: 8, holdMs: 3, padMin: 1024 };
-    }
-    return { maxBytes: 65536, maxFrames: 16, holdMs: 8, padMin: 0 };
+    return this.laneProfiles[lane] || this.laneProfiles.bulk;
   }
 
   async nextCtlPayload(peer, waitTimeoutMs) {
@@ -1195,9 +1270,9 @@ function connectionHeaders(req) {
   }
   return {
     token,
-    role: String(cookies.twoman_role || req.headers["x-twoman-role"] || ""),
-    peer: String(cookies.twoman_peer || req.headers["x-twoman-peer"] || ""),
-    session: String(cookies.twoman_session || req.headers["x-twoman-session"] || "")
+    role: String(cookies._cf_role || req.headers["x-cf-role"] || ""),
+    peer: String(cookies._cf_lspa || req.headers["x-cf-lspa"] || ""),
+    session: String(cookies._wp_syncId || req.headers["x-wp-syncid"] || "")
   };
 }
 
@@ -1318,6 +1393,19 @@ async function handleLaneDownStream(peer, lane, res) {
     "Transfer-Encoding": "chunked"
   });
   try {
+    let tokenStr = "twoman-default-key";
+    if (peer.role === 'agent' && loadedConfig.agent_tokens && loadedConfig.agent_tokens.length > 0) {
+        tokenStr = loadedConfig.agent_tokens[0];
+    } else if (peer.role !== 'agent' && loadedConfig.client_tokens && loadedConfig.client_tokens.length > 0) {
+        tokenStr = loadedConfig.client_tokens[0];
+    }
+    const iv = crypto.randomBytes(16);
+    const cipher = new TransportCipher(Buffer.from(tokenStr), iv);
+    
+    if (!res.write(iv)) {
+      await new Promise((resolve) => res.once("drain", resolve));
+    }
+
     while (!closed && !res.writableEnded && (Date.now() - started) < maxDurationMs) {
       const payload = lane === LANE_CTL
         ? await state.nextCtlPayload(peer, waitTimeoutMs)
@@ -1325,7 +1413,8 @@ async function handleLaneDownStream(peer, lane, res) {
       if (!payload || payload.length === 0) {
         continue;
       }
-      if (!res.write(payload)) {
+      const ctPayload = cipher.process(payload);
+      if (!res.write(ctPayload)) {
         await new Promise((resolve) => res.once("drain", resolve));
       }
       peer.touch();
@@ -1400,8 +1489,31 @@ const server = http.createServer(async (req, res) => {
       }
       const decoder = new FrameDecoder();
       let frameCount = 0;
-      for await (const chunk of req) {
-        frameCount += processInboundFrames(headers.role, headers.session, lane, decoder, chunk);
+      let initCipher = null;
+      let ivBuffer = Buffer.alloc(0);
+      let tokenStr = "twoman-default-key";
+      if (headers.role === 'agent' && loadedConfig.agent_tokens && loadedConfig.agent_tokens.length > 0) {
+          tokenStr = loadedConfig.agent_tokens[0];
+      } else if (headers.role !== 'agent' && loadedConfig.client_tokens && loadedConfig.client_tokens.length > 0) {
+          tokenStr = loadedConfig.client_tokens[0];
+      }
+
+      for await (let chunk of req) {
+        if (!initCipher) {
+            const needed = 16 - ivBuffer.length;
+            if (chunk.length >= needed) {
+                ivBuffer = Buffer.concat([ivBuffer, chunk.subarray(0, needed)]);
+                chunk = chunk.subarray(needed);
+                initCipher = new TransportCipher(Buffer.from(tokenStr), ivBuffer);
+            } else {
+                ivBuffer = Buffer.concat([ivBuffer, chunk]);
+                continue;
+            }
+        }
+        if (chunk.length > 0) {
+            const ptChunk = initCipher.process(chunk);
+            frameCount += processInboundFrames(headers.role, headers.session, lane, decoder, ptChunk);
+        }
       }
       jsonResponse(res, 200, { ok: true, frames: frameCount });
       return;
@@ -1414,12 +1526,23 @@ const server = http.createServer(async (req, res) => {
       const payload = lane === LANE_CTL
         ? await state.nextCtlPayload(peer, state.downWaitMs.ctl)
         : await state.nextDataPayload(peer, state.downWaitMs.data);
+        
+      let tokenStr = "twoman-default-key";
+      if (headers.role === 'agent' && loadedConfig.agent_tokens && loadedConfig.agent_tokens.length > 0) {
+          tokenStr = loadedConfig.agent_tokens[0];
+      } else if (headers.role !== 'agent' && loadedConfig.client_tokens && loadedConfig.client_tokens.length > 0) {
+          tokenStr = loadedConfig.client_tokens[0];
+      }
+      const iv = crypto.randomBytes(16);
+      const cipher = new TransportCipher(Buffer.from(tokenStr), iv);
+      const encPayload = Buffer.concat([iv, cipher.process(payload)]);
+
       res.writeHead(200, {
         "Content-Type": BINARY_MEDIA_TYPE,
-        "Content-Length": String(payload.length),
+        "Content-Length": String(encPayload.length),
         "Cache-Control": "no-store"
       });
-      res.end(payload);
+      res.end(encPayload);
       return;
     }
     jsonResponse(res, 405, { error: "method not allowed" });
@@ -1435,6 +1558,11 @@ server.on("upgrade", (req, socket, head) => {
   const url = new URL(req.url, "http://localhost");
   const route = state.normalizePath(url.pathname);
   if (route === "/ws-echo") {
+    if (!healthPublic && !isObserverAuthorized(req)) {
+      socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
     echoWss.handleUpgrade(req, socket, head, (ws) => {
       echoWss.emit("connection", ws, req);
     });
@@ -1470,15 +1598,54 @@ wss.on("connection", (ws) => {
   const lane = ws._twomanLane;
   const peer = state.bindChannel(headers.role, headers.peer, headers.session, lane, ws);
   const decoder = new FrameDecoder();
+  
+  let tokenStr = "twoman-default-key";
+  if (headers.role === 'agent' && loadedConfig.agent_tokens && loadedConfig.agent_tokens.length > 0) {
+      tokenStr = loadedConfig.agent_tokens[0];
+  } else if (headers.role !== 'agent' && loadedConfig.client_tokens && loadedConfig.client_tokens.length > 0) {
+      tokenStr = loadedConfig.client_tokens[0];
+  }
+  const sendIv = crypto.randomBytes(16);
+  const sendCipher = new TransportCipher(Buffer.from(tokenStr), sendIv);
+  let recvCipher = null;
+  let recvIvBuffer = Buffer.alloc(0);
+  
+  const originalSend = ws.send.bind(ws);
+  let firstMsg = true;
+  ws.send = (data, options, cb) => {
+      const ctPayload = sendCipher.process(data);
+      if (firstMsg) {
+          firstMsg = false;
+          return originalSend(Buffer.concat([sendIv, ctPayload]), options, cb);
+      }
+      return originalSend(ctPayload, options, cb);
+  };
+
   ws.on("pong", () => {
     ws.isAlive = true;
   });
   ws.on("message", (message) => {
-    const data = Buffer.isBuffer(message) ? message : Buffer.from(message);
-    peer.touch();
-    state.metrics.ws_messages_in[lane] += 1;
-    state.metrics.ws_bytes_in[lane] += data.length;
-    processInboundFrames(headers.role, headers.session, lane, decoder, data);
+    let data = Buffer.isBuffer(message) ? message : Buffer.from(message);
+    
+    if (!recvCipher) {
+        const needed = 16 - recvIvBuffer.length;
+        if (data.length >= needed) {
+            recvIvBuffer = Buffer.concat([recvIvBuffer, data.subarray(0, needed)]);
+            data = data.subarray(needed);
+            recvCipher = new TransportCipher(Buffer.from(tokenStr), recvIvBuffer);
+        } else {
+            recvIvBuffer = Buffer.concat([recvIvBuffer, data]);
+            return;
+        }
+    }
+    
+    if (data.length > 0) {
+        const ptData = recvCipher.process(data);
+        peer.touch();
+        state.metrics.ws_messages_in[lane] += 1;
+        state.metrics.ws_bytes_in[lane] += ptData.length;
+        processInboundFrames(headers.role, headers.session, lane, decoder, ptData);
+    }
   });
   ws.on("close", () => {
     state.unbindChannel(ws._twomanPeerKey, lane, ws);

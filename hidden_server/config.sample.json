@@ -20,6 +20,16 @@
   "backoff_max_delay_seconds": 5,
   "flush_delay_seconds": 0.01,
   "max_batch_bytes": 65536,
+  "upload_profiles": {
+    "data": {
+      "max_batch_bytes": 131072,
+      "flush_delay_seconds": 0.006
+    }
+  },
+  "idle_repoll_delay_seconds": {
+    "ctl": 0.05,
+    "data": 0.1
+  },
   "peer_id": "agent-main",
   "http2_enabled": {
     "ctl": false,

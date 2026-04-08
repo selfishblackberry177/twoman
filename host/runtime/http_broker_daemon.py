@@ -39,6 +39,7 @@ from twoman_protocol import (
     encode_frame,
     make_error_payload,
 )
+from twoman_crypto import TransportCipher
 from runtime_diagnostics import (
     DurableEventRecorder,
     configure_component_logger,
@@ -153,14 +154,31 @@ def padded_payload(payload, minimum_size=1024):
 class LaneQueue(object):
     def __init__(self):
         self.queue = asyncio.Queue()
+        self.replay = deque()
         self.buffered_bytes = 0
 
     async def put(self, payload):
         self.buffered_bytes += len(payload)
         await self.queue.put(payload)
 
+    def putleft(self, payload):
+        self.buffered_bytes += len(payload)
+        self.replay.appendleft(payload)
+
     async def get(self):
-        payload = await self.queue.get()
+        if self.replay:
+            payload = self.replay.popleft()
+        else:
+            payload = await self.queue.get()
+        self.buffered_bytes = max(0, self.buffered_bytes - len(payload))
+        return payload
+
+    def get_nowait(self):
+        if self.replay:
+            payload = self.replay.popleft()
+            self.buffered_bytes = max(0, self.buffered_bytes - len(payload))
+            return payload
+        payload = self.queue.get_nowait()
         self.buffered_bytes = max(0, self.buffered_bytes - len(payload))
         return payload
 
@@ -198,6 +216,32 @@ class StreamState(object):
         self.last_seen_ms = now_ms()
 
 
+def _normalize_lane_profiles(config):
+    defaults = {
+        LANE_CTL: {"max_bytes": 4096, "max_frames": 8, "hold_ms": 1, "pad_min": 1024},
+        "pri": {"max_bytes": 32768, "max_frames": 16, "hold_ms": 2, "pad_min": 1024},
+        "bulk": {"max_bytes": 262144, "max_frames": 64, "hold_ms": 4, "pad_min": 0},
+    }
+    configured = config.get("lane_profiles", {})
+    if not isinstance(configured, dict):
+        return defaults
+    normalized = dict((lane, dict(profile)) for lane, profile in defaults.items())
+    for lane, profile in normalized.items():
+        override = configured.get(lane)
+        if not isinstance(override, dict):
+            continue
+        for key in ("max_bytes", "max_frames", "hold_ms", "pad_min"):
+            if key not in override:
+                continue
+            try:
+                value = int(override[key])
+            except (TypeError, ValueError):
+                continue
+            minimum = 1 if key in ("max_bytes", "max_frames") else 0
+            profile[key] = max(minimum, value)
+    return normalized
+
+
 class BrokerState(object):
     def __init__(self, config):
         self.config = config
@@ -213,6 +257,7 @@ class BrokerState(object):
             self.max_lane_bytes,
             int(config.get("max_peer_buffered_bytes", min(self.max_lane_bytes * 2, 32 * 1024 * 1024))),
         )
+        self.lane_profiles = _normalize_lane_profiles(config)
         self.peers = {}
         self.streams_by_helper = {}
         self.streams_by_agent = {}
@@ -583,11 +628,7 @@ class BrokerState(object):
             }
 
     def lane_profile(self, lane):
-        if lane == LANE_CTL:
-            return {"max_bytes": 4096, "max_frames": 8, "hold_ms": 1, "pad_min": 1024}
-        if lane == "pri":
-            return {"max_bytes": 16384, "max_frames": 8, "hold_ms": 3, "pad_min": 1024}
-        return {"max_bytes": 65536, "max_frames": 16, "hold_ms": 8, "pad_min": 0}
+        return self.lane_profiles.get(lane, self.lane_profiles["bulk"])
 
 
 class AsyncBrokerServer(object):
@@ -628,6 +669,7 @@ class AsyncBrokerServer(object):
                 parsed.path,
                 self.config.get("base_uri") or self.config.get("route_base_path"),
             )
+            
             if is_health_path(request_path, self.config.get("health_template")):
                 identity = extract_connection_identity(headers, self.config)
                 token = identity["token"]
@@ -635,20 +677,20 @@ class AsyncBrokerServer(object):
                 if not health_public and not (
                     await self.state.auth("helper", token) or await self.state.auth("agent", token)
                 ):
-                    await self._send_json(writer, 403, {"error": "forbidden"})
+                    await self._send_camouflage_html(writer, 403)
                     return
                 await self._send_json(writer, 200, {"ok": True, "stats": await self.state.stats()})
                 return
 
             route = parse_lane_path(request_path, self.config.get("route_template"))
             if route is None:
-                await self._send_json(writer, 404, {"error": "not found"})
+                await self._send_camouflage_html(writer, 404)
                 return
 
             lane = route.get("lane", "")
             direction = route.get("direction", "")
             if lane not in (list(LANES) + [LANE_DATA]) or direction not in ("up", "down"):
-                await self._send_json(writer, 404, {"error": "not found"})
+                await self._send_camouflage_html(writer, 404)
                 return
             identity = extract_connection_identity(headers, self.config)
             role = identity["role"]
@@ -656,7 +698,7 @@ class AsyncBrokerServer(object):
             peer_session_id = identity["peer_session_id"]
             token = identity["token"]
             if not role or not peer_label or not peer_session_id or not await self.state.auth(role, token):
-                await self._send_json(writer, 403, {"error": "invalid role or token"})
+                await self._send_camouflage_html(writer, 403)
                 return
             peer = await self.state.ensure_peer(role, peer_label, peer_session_id)
             if method == "GET" and direction == "down":
@@ -674,9 +716,20 @@ class AsyncBrokerServer(object):
                 return
             if method == "POST" and direction == "up":
                 validate_binary_media_type(headers.get("content-type", ""), self.config)
-                await self._handle_up(writer, role, peer_session_id, lane, body)
+                
+                # Check for hop-by-hop cipher IV
+                if len(body) < 16:
+                    raise ValueError("payload too short for iv")
+                iv = body[:16]
+                ciphertext = body[16:]
+                cipher = TransportCipher(self.config.get("agent_tokens", ["twoman-default-key"])[0].encode('utf-8') if role == 'agent' else self.config.get("client_tokens", ["twoman-default-key"])[0].encode('utf-8'), iv)
+                plaintext_body = cipher.process(ciphertext)
+
+                await self._handle_up(writer, role, peer_session_id, lane, plaintext_body)
                 return
-            await self._send_json(writer, 405, {"error": "method not allowed"})
+            
+            trace("405 method not allowed: method=%r direction=%r lane=%r path=%r" % (method, direction, lane, request_path))
+            await self._send_json(writer, 405, {"error": "method not allowed", "method": method, "direction": direction})
         except asyncio.IncompleteReadError:
             pass
         except Exception as error:
@@ -751,8 +804,14 @@ class AsyncBrokerServer(object):
         padded = padded_payload(body, minimum_size=int(profile["pad_min"])) if int(profile["pad_min"]) > 0 else body
         pad_bytes = max(0, len(padded) - len(body))
         if pad_bytes:
-            trace("pad lane=%s role=%s peer=%s session=%s from=%s to=%s" % (lane, peer.role, peer.peer_label, peer.peer_session_id, len(body), len(padded)))
+            pass # trace disabled
         body = padded
+        
+        iv = os.urandom(16)
+        token_str = self.state.config.get("agent_tokens", ["twoman-default-key"])[0] if peer.role == 'agent' else self.state.config.get("client_tokens", ["twoman-default-key"])[0]
+        cipher = TransportCipher(token_str.encode('utf-8'), iv)
+        encrypted_body = iv + cipher.process(body)
+
         hold_ms = max(0, int((asyncio.get_event_loop().time() - hold_started) * 1000))
         self.state.metrics["down_responses"][lane] += 1
         self.state.metrics["down_frames"][lane] += frames
@@ -766,9 +825,9 @@ class AsyncBrokerServer(object):
                 + ("Content-Type: %s\r\n" % self.binary_media_type).encode("ascii")
                 + b"Cache-Control: no-store\r\n"
                 + b"Connection: close\r\n"
-                + ("Content-Length: %d\r\n\r\n" % len(body)).encode("ascii")
+                + ("Content-Length: %d\r\n\r\n" % len(encrypted_body)).encode("ascii")
             )
-            writer.write(body)
+            writer.write(encrypted_body)
             await writer.drain()
         except Exception as error:
             trace("down error role=%s peer=%s session=%s lane=%s error=%r" % (peer.role, peer.peer_label, peer.peer_session_id, lane, error))
@@ -794,6 +853,7 @@ class AsyncBrokerServer(object):
             )
             await writer.drain()
             last_send = asyncio.get_event_loop().time()
+            stream_cipher = None
             while True:
                 payload, source_lane, frames, hold_ms, pad_bytes = await self._next_data_payload(
                     peer,
@@ -801,7 +861,13 @@ class AsyncBrokerServer(object):
                 )
                 if payload is None:
                     heartbeat = padded_payload(encode_frame(Frame(FRAME_PING, offset=now_ms())), minimum_size=1024)
-                    await self._write_chunk(writer, heartbeat)
+                    if stream_cipher is None:
+                        iv = os.urandom(16)
+                        token_str = self.state.config.get("agent_tokens", ["twoman-default-key"])[0] if peer.role == 'agent' else self.state.config.get("client_tokens", ["twoman-default-key"])[0]
+                        stream_cipher = TransportCipher(token_str.encode('utf-8'), iv)
+                        await self._write_chunk(writer, iv + stream_cipher.process(heartbeat))
+                    else:
+                        await self._write_chunk(writer, stream_cipher.process(heartbeat))
                     last_send = asyncio.get_event_loop().time()
                     continue
                 self.state.metrics["down_responses"][source_lane] += 1
@@ -818,7 +884,15 @@ class AsyncBrokerServer(object):
                     len(payload),
                     hold_ms,
                 ))
-                await self._write_chunk(writer, payload)
+                
+                if stream_cipher is None:
+                    iv = os.urandom(16)
+                    token_str = self.state.config.get("agent_tokens", ["twoman-default-key"])[0] if peer.role == 'agent' else self.state.config.get("client_tokens", ["twoman-default-key"])[0]
+                    stream_cipher = TransportCipher(token_str.encode('utf-8'), iv)
+                    await self._write_chunk(writer, iv + stream_cipher.process(payload))
+                else:
+                    await self._write_chunk(writer, stream_cipher.process(payload))
+                    
                 last_send = asyncio.get_event_loop().time()
         except Exception as error:
             trace("down stream error role=%s peer=%s session=%s lane=data error=%r" % (peer.role, peer.peer_label, peer.peer_session_id, error))
@@ -858,13 +932,19 @@ class AsyncBrokerServer(object):
             len(payload),
             hold_ms,
         ))
+        
+        iv = os.urandom(16)
+        token_str = self.state.config.get("agent_tokens", ["twoman-default-key"])[0] if peer.role == 'agent' else self.state.config.get("client_tokens", ["twoman-default-key"])[0]
+        cipher = TransportCipher(token_str.encode('utf-8'), iv)
+        encrypted_payload = iv + cipher.process(payload)
+        
         writer.write(
             b"HTTP/1.1 200 OK\r\n"
             + ("Content-Type: %s\r\n" % self.binary_media_type).encode("ascii")
             + b"Cache-Control: no-store\r\n"
-            + ("Content-Length: %d\r\n\r\n" % len(payload)).encode("ascii")
+            + ("Content-Length: %d\r\n\r\n" % len(encrypted_payload)).encode("ascii")
         )
-        writer.write(payload)
+        writer.write(encrypted_payload)
         await writer.drain()
 
     async def _handle_ctl_down(self, writer, peer):
@@ -873,13 +953,19 @@ class AsyncBrokerServer(object):
         self.state.metrics["down_responses"][LANE_CTL] += 1
         self.state.metrics["down_frames"][LANE_CTL] += 1
         self.state.metrics["down_bytes"][LANE_CTL] += len(payload)
+        
+        iv = os.urandom(16)
+        token_str = self.state.config.get("agent_tokens", ["twoman-default-key"])[0] if peer.role == 'agent' else self.state.config.get("client_tokens", ["twoman-default-key"])[0]
+        cipher = TransportCipher(token_str.encode('utf-8'), iv)
+        encrypted_payload = iv + cipher.process(payload)
+        
         writer.write(
             b"HTTP/1.1 200 OK\r\n"
             + ("Content-Type: %s\r\n" % self.binary_media_type).encode("ascii")
             + b"Cache-Control: no-store\r\n"
-            + ("Content-Length: %d\r\n\r\n" % len(payload)).encode("ascii")
+            + ("Content-Length: %d\r\n\r\n" % len(encrypted_payload)).encode("ascii")
         )
-        writer.write(payload)
+        writer.write(encrypted_payload)
         await writer.drain()
 
     async def _handle_helper_ctl_down(self, writer, peer):
@@ -894,6 +980,7 @@ class AsyncBrokerServer(object):
                 + b"Connection: close\r\n\r\n"
             )
             await writer.drain()
+            stream_cipher = None
             while True:
                 try:
                     payload = await self._next_ctl_payload(peer, self.down_wait_ms["ctl"])
@@ -906,10 +993,25 @@ class AsyncBrokerServer(object):
                         peer.peer_session_id,
                         len(payload),
                     ))
-                    await self._write_chunk(writer, payload)
+                    
+                    if stream_cipher is None:
+                        iv = os.urandom(16)
+                        token_str = self.state.config.get("agent_tokens", ["twoman-default-key"])[0] if peer.role == 'agent' else self.state.config.get("client_tokens", ["twoman-default-key"])[0]
+                        stream_cipher = TransportCipher(token_str.encode('utf-8'), iv)
+                        await self._write_chunk(writer, iv + stream_cipher.process(payload))
+                    else:
+                        await self._write_chunk(writer, stream_cipher.process(payload))
+
                 except asyncio.TimeoutError:
                     heartbeat = padded_payload(encode_frame(Frame(FRAME_PING, offset=now_ms())), minimum_size=1024)
-                    await self._write_chunk(writer, heartbeat)
+                    if stream_cipher is None:
+                        iv = os.urandom(16)
+                        token_str = self.state.config.get("agent_tokens", ["twoman-default-key"])[0] if peer.role == 'agent' else self.state.config.get("client_tokens", ["twoman-default-key"])[0]
+                        stream_cipher = TransportCipher(token_str.encode('utf-8'), iv)
+                        await self._write_chunk(writer, iv + stream_cipher.process(heartbeat))
+                    else:
+                        await self._write_chunk(writer, stream_cipher.process(heartbeat))
+
         except Exception as error:
             trace("down stream error role=%s peer=%s session=%s lane=ctl error=%r" % (peer.role, peer.peer_label, peer.peer_session_id, error))
             record_event(
@@ -928,13 +1030,11 @@ class AsyncBrokerServer(object):
         profile = None
         source_lane = None
         try:
-            first = pri_queue.queue.get_nowait()
-            pri_queue.buffered_bytes = max(0, pri_queue.buffered_bytes - len(first))
+            first = pri_queue.get_nowait()
             source_lane = "pri"
         except asyncio.QueueEmpty:
             try:
-                first = bulk_queue.queue.get_nowait()
-                bulk_queue.buffered_bytes = max(0, bulk_queue.buffered_bytes - len(first))
+                first = bulk_queue.get_nowait()
                 source_lane = "bulk"
             except asyncio.QueueEmpty:
                 loop = asyncio.get_event_loop()
@@ -947,11 +1047,22 @@ class AsyncBrokerServer(object):
                 )
                 for task in pending:
                     task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
                 if not done:
                     return None, None, 0, 0, 0
-                completed = done.pop()
-                first = completed.result()
-                source_lane = "pri" if completed is pri_task else "bulk"
+                pri_ready = pri_task.done() and not pri_task.cancelled()
+                bulk_ready = bulk_task.done() and not bulk_task.cancelled()
+                if pri_ready:
+                    first = pri_task.result()
+                    source_lane = "pri"
+                    if bulk_ready:
+                        bulk_queue.putleft(bulk_task.result())
+                elif bulk_ready:
+                    first = bulk_task.result()
+                    source_lane = "bulk"
+                else:
+                    return None, None, 0, 0, 0
         peer.touch()
         profile = self.state.lane_profile(source_lane)
         payloads = [first]
@@ -1022,6 +1133,74 @@ class AsyncBrokerServer(object):
             + ("Content-Length: %d\r\n" % len(body)).encode("ascii")
             + b"Connection: close\r\n\r\n"
             + body
+        )
+        await writer.drain()
+
+    async def _send_camouflage_html(self, writer, status):
+        """Return a realistic Persian HTML page for unauthenticated probes."""
+        status_text = {403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed"}.get(status, "Error")
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        candidate_paths = []
+        explicit_path = str(os.environ.get("TWOMAN_CAMOUFLAGE_404_PATH", "")).strip()
+        if explicit_path:
+            candidate_paths.append(os.path.abspath(explicit_path))
+        candidate_paths.extend(
+            [
+                os.path.join(current_dir, "runtime", "camouflage_404.html"),
+                os.path.join(current_dir, "camouflage_404.html"),
+                os.path.join(os.path.expanduser("~"), "public_html", "404.html"),
+            ]
+        )
+        seen_paths = set()
+        for candidate_path in candidate_paths:
+            normalized_path = os.path.abspath(candidate_path)
+            if normalized_path in seen_paths:
+                continue
+            seen_paths.add(normalized_path)
+            try:
+                if os.path.exists(normalized_path):
+                    with open(normalized_path, "rb") as handle:
+                        body_bytes = handle.read()
+                    writer.write(
+                        ("HTTP/1.1 %d %s\r\n" % (status, status_text)).encode("ascii")
+                        + b"Content-Type: text/html; charset=utf-8\r\n"
+                        + ("Content-Length: %d\r\n" % len(body_bytes)).encode("ascii")
+                        + b"Cache-Control: no-store\r\n"
+                        + b"Connection: close\r\n\r\n"
+                        + body_bytes
+                    )
+                    await writer.drain()
+                    return
+            except Exception:
+                continue
+
+        body = (
+            '<!doctype html>'
+            '<html lang="fa" dir="rtl">'
+            '<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>%d - %s</title>'
+            '<style>'
+            'body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;'
+            'font-family:Vazirmatn,Tahoma,sans-serif;background:linear-gradient(135deg,#0F2027,#203A43,#2C5364);color:#dfe6e9}'
+            '.c{text-align:center;padding:60px 40px;max-width:500px}'
+            'h1{font-size:72px;margin:0 0 10px;opacity:.15}'
+            'p{font-size:18px;opacity:.7;line-height:1.8}'
+            'a{color:#00b894;text-decoration:none}'
+            '</style></head>'
+            '<body><div class="c">'
+            '<h1>%d</h1>'
+            '<p>صفحه‌ای که به دنبال آن هستید در دسترس نیست یا دسترسی شما محدود شده است.</p>'
+            '<p><a href="/">بازگشت به صفحه اصلی</a></p>'
+            '</div></body></html>'
+        ) % (status, status_text, status)
+        body_bytes = body.encode("utf-8")
+        writer.write(
+            ("HTTP/1.1 %d %s\r\n" % (status, status_text)).encode("ascii")
+            + b"Content-Type: text/html; charset=utf-8\r\n"
+            + ("Content-Length: %d\r\n" % len(body_bytes)).encode("ascii")
+            + b"Cache-Control: no-store\r\n"
+            + b"Connection: close\r\n\r\n"
+            + body_bytes
         )
         await writer.drain()
 

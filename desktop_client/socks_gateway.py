@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import ipaddress
 import json
@@ -15,6 +16,7 @@ from typing import Iterable
 
 
 LOGGER = logging.getLogger("twoman.desktop.gateway")
+HTTP_HEADER_LIMIT = 64 * 1024
 
 
 def configure_logging(log_path: str) -> None:
@@ -60,10 +62,11 @@ async def _relay_streams(reader: asyncio.StreamReader, writer: asyncio.StreamWri
 
 
 class AuthenticatedSocksGateway:
-    """SOCKS5 listener with username/password auth that forwards via a local upstream SOCKS5 proxy."""
+    """Authenticated SOCKS5 or HTTP proxy listener that forwards into a local Twoman proxy."""
 
     def __init__(
         self,
+        protocol: str,
         listen_host: str,
         listen_port: int,
         username: str,
@@ -71,6 +74,7 @@ class AuthenticatedSocksGateway:
         target_host: str,
         target_port: int,
     ) -> None:
+        self.protocol = protocol.strip().lower()
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.username = username
@@ -82,7 +86,8 @@ class AuthenticatedSocksGateway:
     async def start(self) -> None:
         self.server = await asyncio.start_server(self.handle_client, self.listen_host, self.listen_port)
         LOGGER.info(
-            "gateway started listen=%s:%s upstream=%s:%s",
+            "gateway started protocol=%s listen=%s:%s upstream=%s:%s",
+            self.protocol,
             self.listen_host,
             self.listen_port,
             self.target_host,
@@ -104,6 +109,12 @@ class AuthenticatedSocksGateway:
         LOGGER.info("gateway stopped listen=%s:%s", self.listen_host, self.listen_port)
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if self.protocol == "http":
+            await self.handle_http_client(reader, writer)
+            return
+        await self.handle_socks_client(reader, writer)
+
+    async def handle_socks_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
         try:
             version, method_count = await reader.readexactly(2)
@@ -178,9 +189,144 @@ class AuthenticatedSocksGateway:
                 writer.close()
                 await writer.wait_closed()
 
+    async def handle_http_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        peer = writer.get_extra_info("peername")
+        upstream_writer = None
+        try:
+            request_line, headers, rest = await self._read_http_request(reader)
+            username, password = self._read_http_proxy_auth(headers)
+            if username != self.username or password != self.password:
+                LOGGER.warning("gateway http auth failed peer=%s user=%s", peer, username)
+                await self._write_http_error(
+                    writer,
+                    407,
+                    "Proxy Authentication Required",
+                    [
+                        ("Proxy-Authenticate", 'Basic realm="Twoman"'),
+                        ("Content-Length", "0"),
+                    ],
+                )
+                return
+
+            upstream_reader, upstream_writer = await asyncio.open_connection(self.target_host, self.target_port)
+            upstream_writer.write(self._build_upstream_http_request(request_line, headers, rest))
+            await upstream_writer.drain()
+            LOGGER.info("gateway http ok peer=%s request=%s", peer, request_line)
+            await asyncio.gather(
+                _relay_streams(reader, upstream_writer),
+                _relay_streams(upstream_reader, writer),
+            )
+        except asyncio.IncompleteReadError:
+            LOGGER.warning("gateway client disconnected early peer=%s", peer)
+        except RuntimeError as error:
+            LOGGER.warning("gateway request failed peer=%s error=%s", peer, error)
+            with contextlib.suppress(Exception):
+                await self._write_http_error(
+                    writer,
+                    407 if "proxy auth" in str(error).lower() else 400,
+                    "Proxy Authentication Required" if "proxy auth" in str(error).lower() else "Bad Request",
+                    [
+                        ("Proxy-Authenticate", 'Basic realm="Twoman"'),
+                        ("Content-Length", "0"),
+                    ]
+                    if "proxy auth" in str(error).lower()
+                    else [("Content-Length", "0")],
+                )
+        except Exception as error:
+            LOGGER.warning("gateway request failed peer=%s error=%s", peer, error)
+            with contextlib.suppress(Exception):
+                await self._write_http_error(
+                    writer,
+                    502,
+                    "Bad Gateway",
+                    [("Content-Length", "0")],
+                )
+        finally:
+            if upstream_writer is not None:
+                with contextlib.suppress(Exception):
+                    upstream_writer.close()
+                    await upstream_writer.wait_closed()
+            with contextlib.suppress(Exception):
+                writer.close()
+                await writer.wait_closed()
+
     async def _reply_error(self, writer: asyncio.StreamWriter, error_code: int) -> None:
         writer.write(b"\x05" + bytes([error_code]) + b"\x00\x01" + socket.inet_aton("0.0.0.0") + struct.pack("!H", 0))
         await writer.drain()
+
+    async def _write_http_error(
+        self,
+        writer: asyncio.StreamWriter,
+        status_code: int,
+        reason: str,
+        headers: list[tuple[str, str]],
+    ) -> None:
+        lines = [f"HTTP/1.1 {status_code} {reason}\r\n"]
+        for name, value in headers:
+            lines.append(f"{name}: {value}\r\n")
+        lines.append("Connection: close\r\n\r\n")
+        writer.write("".join(lines).encode("iso-8859-1"))
+        await writer.drain()
+
+    async def _read_http_request(
+        self,
+        reader: asyncio.StreamReader,
+    ) -> tuple[str, list[tuple[str, str]], bytes]:
+        payload = bytearray()
+        while b"\r\n\r\n" not in payload:
+            chunk = await reader.read(4096)
+            if not chunk:
+                raise RuntimeError("client closed before sending request headers")
+            payload.extend(chunk)
+            if len(payload) > HTTP_HEADER_LIMIT:
+                raise RuntimeError("http request headers too large")
+        header_block, _, rest = bytes(payload).partition(b"\r\n\r\n")
+        lines = header_block.decode("iso-8859-1").split("\r\n")
+        if not lines or not lines[0]:
+            raise RuntimeError("missing http request line")
+        headers: list[tuple[str, str]] = []
+        for line in lines[1:]:
+            if not line:
+                continue
+            if ":" not in line:
+                raise RuntimeError("invalid http header")
+            name, value = line.split(":", 1)
+            headers.append((name.strip(), value.strip()))
+        return lines[0], headers, rest
+
+    def _read_http_proxy_auth(self, headers: list[tuple[str, str]]) -> tuple[str, str]:
+        auth_value = ""
+        for name, value in headers:
+            if name.lower() == "proxy-authorization":
+                auth_value = value
+                break
+        if not auth_value:
+            raise RuntimeError("missing proxy authorization")
+        scheme, _, encoded = auth_value.partition(" ")
+        if scheme.lower() != "basic" or not encoded.strip():
+            raise RuntimeError("unsupported proxy auth scheme")
+        try:
+            decoded = base64.b64decode(encoded.strip(), validate=True).decode("utf-8")
+        except Exception as error:
+            raise RuntimeError("invalid proxy auth encoding") from error
+        username, separator, password = decoded.partition(":")
+        if not separator:
+            raise RuntimeError("invalid proxy auth payload")
+        return username, password
+
+    def _build_upstream_http_request(
+        self,
+        request_line: str,
+        headers: list[tuple[str, str]],
+        rest: bytes,
+    ) -> bytes:
+        filtered_headers = []
+        for name, value in headers:
+            if name.lower() in {"proxy-authorization"}:
+                continue
+            filtered_headers.append(f"{name}: {value}\r\n")
+        payload = request_line + "\r\n" + "".join(filtered_headers) + "\r\n"
+        return payload.encode("iso-8859-1") + rest
 
     async def _read_address(
         self,
@@ -205,6 +351,7 @@ def run_gateway_from_config(config_path: str) -> None:
         config = json.load(handle)
     configure_logging(str(config["log_path"]))
     gateway = AuthenticatedSocksGateway(
+        protocol=str(config.get("protocol", "socks")),
         listen_host=str(config["listen_host"]),
         listen_port=int(config["listen_port"]),
         username=str(config["username"]),
@@ -232,4 +379,3 @@ def main(argv: Iterable[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

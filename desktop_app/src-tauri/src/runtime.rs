@@ -566,6 +566,7 @@ impl DesktopRuntime {
         } else {
             let _ = SystemProxyManager::cleanup_stale_proxy(&self.paths);
         }
+        let _ = fs::remove_file(helper_listen_state_path(&self.paths));
         state.phase = ConnectionPhase::Disconnected;
         state.message = "Disconnected".into();
         Ok(())
@@ -618,6 +619,23 @@ impl DesktopRuntime {
         terminate_pid_file(&pid_path);
         let _ = fs::remove_file(&pid_path);
         let _ = fs::remove_file(&listen_state_path);
+        kill_twoman_port_owners(&[profile.http_port, profile.socks_port]);
+        let port_conflicts = [("HTTP", profile.http_port), ("SOCKS", profile.socks_port)]
+            .iter()
+            .filter_map(|(label, port)| {
+                if port_bound("127.0.0.1", *port) {
+                    Some(format!("{label} {port}"))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if !port_conflicts.is_empty() {
+            return Err(format!(
+                "configured local port already in use: {}\nUpdate the profile or stop the conflicting process.",
+                port_conflicts.join(", ")
+            ));
+        }
         fs::write(
             &config_path,
             serde_json::to_vec_pretty(&json!({
@@ -625,8 +643,8 @@ impl DesktopRuntime {
                 "broker_base_url": profile.broker_base_url,
                 "client_token": profile.client_token,
                 "listen_host": "127.0.0.1",
-                "http_listen_port": 0,
-                "socks_listen_port": 0,
+                "http_listen_port": profile.http_port,
+                "socks_listen_port": profile.socks_port,
                 "listen_state_path": listen_state_path,
                 "log_path": log_path,
                 "pid_file": pid_path,
@@ -674,6 +692,18 @@ impl DesktopRuntime {
                 read_log_tail(&log_path, LOG_TAIL_LINES)
             ));
         };
+        if listen_state.http_port != profile.http_port || listen_state.socks_port != profile.socks_port
+        {
+            terminate_child(&mut child);
+            terminate_pid_file(&pid_path);
+            return Err(format!(
+                "helper bound unexpected local ports (expected HTTP {} / SOCKS {}, got HTTP {} / SOCKS {})",
+                profile.http_port,
+                profile.socks_port,
+                listen_state.http_port,
+                listen_state.socks_port
+            ));
+        }
 
         Ok(SpawnedProcess {
             child,
@@ -1106,20 +1136,20 @@ fn parse_profile_upstream_host_port(base_url: &str) -> Result<(String, u16), Str
 }
 
 fn desktop_display_name() -> &'static str {
-    option_env!("TWOMAN_DESKTOP_DISPLAY_NAME").unwrap_or("Local Network Bridge")
+    option_env!("TWOMAN_DESKTOP_DISPLAY_NAME").unwrap_or("Twoman")
 }
 
 fn tunnel_interface_name() -> String {
     option_env!("TWOMAN_TUNNEL_INTERFACE_NAME")
-        .unwrap_or("Standard System Adapter")
+        .unwrap_or("Twoman Tunnel")
         .to_string()
 }
 
 fn sidecar_basename(kind: &str) -> &'static str {
     match kind {
-        "helper" => option_env!("TWOMAN_HELPER_BINARY_BASENAME").unwrap_or("local-network-helper"),
-        "gateway" => option_env!("TWOMAN_GATEWAY_BINARY_BASENAME").unwrap_or("local-network-bridge"),
-        "tunnel" => option_env!("TWOMAN_TUNNEL_BINARY_BASENAME").unwrap_or("standard-system-adapter"),
+        "helper" => option_env!("TWOMAN_HELPER_BINARY_BASENAME").unwrap_or("twoman-helper"),
+        "gateway" => option_env!("TWOMAN_GATEWAY_BINARY_BASENAME").unwrap_or("twoman-gateway"),
+        "tunnel" => option_env!("TWOMAN_TUNNEL_BINARY_BASENAME").unwrap_or("twoman-tunnel"),
         _ => "runtime-helper",
     }
 }

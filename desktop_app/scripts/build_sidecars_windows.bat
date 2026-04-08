@@ -7,9 +7,9 @@ set BUILD_ROOT=%APP_ROOT%\build\windows-sidecars
 set DIST_DIR=%APP_ROOT%\src-tauri\resources\sidecars\windows
 set STAGE_DIR=%BUILD_ROOT%\dist
 set TUNNEL_DIR=%BUILD_ROOT%\tunnel
-if "%TWOMAN_HELPER_BINARY_BASENAME%"=="" set TWOMAN_HELPER_BINARY_BASENAME=local-network-helper
-if "%TWOMAN_GATEWAY_BINARY_BASENAME%"=="" set TWOMAN_GATEWAY_BINARY_BASENAME=local-network-bridge
-if "%TWOMAN_TUNNEL_BINARY_BASENAME%"=="" set TWOMAN_TUNNEL_BINARY_BASENAME=standard-system-adapter
+if "%TWOMAN_HELPER_BINARY_BASENAME%"=="" set TWOMAN_HELPER_BINARY_BASENAME=twoman-helper
+if "%TWOMAN_GATEWAY_BINARY_BASENAME%"=="" set TWOMAN_GATEWAY_BINARY_BASENAME=twoman-gateway
+if "%TWOMAN_TUNNEL_BINARY_BASENAME%"=="" set TWOMAN_TUNNEL_BINARY_BASENAME=twoman-tunnel
 
 if exist "%BUILD_ROOT%" rmdir /s /q "%BUILD_ROOT%"
 mkdir "%BUILD_ROOT%"

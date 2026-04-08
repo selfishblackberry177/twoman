@@ -412,8 +412,7 @@ class RemoteStream(object):
             self.agent.release_stream(self.stream_id, self)
 
     def _data_lane(self, chunk_len):
-        del chunk_len
-        if self.send_offset < PRI_LIMIT:
+        if self.send_offset < PRI_LIMIT and (self.send_offset + int(chunk_len)) <= PRI_LIMIT:
             return LANE_PRI
         return LANE_BULK
 

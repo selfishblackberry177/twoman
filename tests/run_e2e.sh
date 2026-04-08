@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$ROOT/tests/tmp"
 
-rm -rf "$TMP_DIR"
+#rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR" "$ROOT/tests/certs"
 
 cat > "$TMP_DIR/broker-config.json" <<'JSON'
@@ -83,7 +83,7 @@ cleanup() {
   for pid in "${PIDS[@]:-}"; do
     wait "$pid" >/dev/null 2>&1 || true
   done
-  rm -rf "$TMP_DIR" "$ROOT/tests/certs" >/dev/null 2>&1 || true
+  #rm -rf "$TMP_DIR" "$ROOT/tests/certs" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 PIDS=()

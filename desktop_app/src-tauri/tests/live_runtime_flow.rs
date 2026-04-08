@@ -159,6 +159,12 @@ fn live_connect_share_disconnect_flow() {
         .connection
         .socks_port
         .expect("socks port should be present while connected");
+    assert_eq!(active_http_port, profile.http_port, "helper should honor configured HTTP port");
+    assert_eq!(
+        active_socks_port,
+        profile.socks_port,
+        "helper should honor configured SOCKS port"
+    );
 
     let direct_ip = curl_via_proxy(&format!("socks5h://127.0.0.1:{active_socks_port}"));
     assert!(!direct_ip.is_empty(), "direct socks returned empty output");

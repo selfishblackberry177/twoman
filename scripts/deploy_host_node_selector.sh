@@ -38,9 +38,10 @@ delete_remote_file() {
   local remote_dir="$1"
   local remote_name="$2"
   curl -sk --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
-    --data-urlencode "dir=${remote_dir}" \
-    --data-urlencode "files=${remote_name}" \
-    "${TWOMAN_CPANEL_BASE_URL}/execute/Fileman/delete_files" >/dev/null || true
+    --data-urlencode "op=trash" \
+    --data-urlencode "sourcefiles=${remote_name}" \
+    --data-urlencode "metadata=${remote_dir}" \
+    "${TWOMAN_CPANEL_BASE_URL}/execute/Fileman/file_op" >/dev/null || true
 }
 
 mkdir_api() {
@@ -111,16 +112,16 @@ npx --yes esbuild host/node_selector/broker.js \
   --format=cjs \
   --outfile="${TWOMAN_NODE_BUNDLE_PATH}" >/dev/null
 
-TWOMAN_NODE_APP_ROOT="${TWOMAN_NODE_APP_ROOT:-${TWOMAN_CPANEL_HOME}/cltwoman}"
-TWOMAN_NODE_APP_URI="${TWOMAN_NODE_APP_URI:-/twoman-node}"
+TWOMAN_NODE_APP_ROOT="${TWOMAN_NODE_APP_ROOT:-${TWOMAN_CPANEL_HOME}/rahkar_node}"
+TWOMAN_NODE_APP_URI="${TWOMAN_NODE_APP_URI:-/rahkar-node}"
 TWOMAN_NODE_VERSION="${TWOMAN_NODE_VERSION:-20}"
 TWOMAN_NODE_APP_MODE="${TWOMAN_NODE_APP_MODE:-production}"
-TWOMAN_ADMIN_SCRIPT_NAME="${TWOMAN_ADMIN_SCRIPT_NAME:-fw_twoman_node_admin.php}"
+TWOMAN_ADMIN_SCRIPT_NAME="${TWOMAN_ADMIN_SCRIPT_NAME:-rahkar_negahban.php}"
 TWOMAN_TRACE="${TWOMAN_TRACE:-0}"
 TWOMAN_DEBUG_STATS="${TWOMAN_DEBUG_STATS:-0}"
 TWOMAN_DOWN_WAIT_CTL_MS="${TWOMAN_DOWN_WAIT_CTL_MS:-1000}"
 TWOMAN_DOWN_WAIT_DATA_MS="${TWOMAN_DOWN_WAIT_DATA_MS:-1000}"
-TWOMAN_STREAMING_DATA_DOWN_HELPER="${TWOMAN_STREAMING_DATA_DOWN_HELPER:-false}"
+TWOMAN_STREAMING_DATA_DOWN_HELPER="${TWOMAN_STREAMING_DATA_DOWN_HELPER:-true}"
 
 json_get() {
   local json_path="$1"
@@ -153,7 +154,7 @@ PY
     python3 scripts/generate_camouflage_site.py \
       --deployment-id "${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID}" > "${CAMOUFLAGE_MANIFEST_PATH}"
   fi
-  if [ -z "${TWOMAN_NODE_APP_URI:-}" ] || [ "${TWOMAN_NODE_APP_URI}" = "/twoman-node" ]; then
+  if [ -z "${TWOMAN_NODE_APP_URI:-}" ] || [ "${TWOMAN_NODE_APP_URI}" = "/rahkar-node" ]; then
     TWOMAN_NODE_APP_URI="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "node_base_path")"
   fi
 fi
@@ -163,11 +164,36 @@ ensure_remote_dir "${APP_RELATIVE}"
 ensure_remote_dir "logs"
 if [ -n "${CAMOUFLAGE_MANIFEST_PATH}" ]; then
   CAMOUFLAGE_SITE_SLUG="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "site_slug")"
-  CAMOUFLAGE_SITE_HTML="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "landing_html")"
+  CAMOUFLAGE_INDEX="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "landing_html")"
+  CAMOUFLAGE_ABOUT="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "about_html")"
+  CAMOUFLAGE_CONTACT="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "contact_html")"
+  CAMOUFLAGE_404="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "404_html")"
+  CAMOUFLAGE_ROBOTS="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "robots_txt")"
+  CAMOUFLAGE_SITEMAP="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "sitemap_xml")"
+  CAMOUFLAGE_SLUG_HTACCESS="$(cat <<EOF
+DirectoryIndex index.html
+ErrorDocument 404 /${CAMOUFLAGE_SITE_SLUG}/404.html
+EOF
+)"
+  CAMOUFLAGE_ROOT_HTACCESS="$(cat <<'EOF'
+DirectoryIndex index.html
+ErrorDocument 404 /404.html
+EOF
+)"
   ensure_remote_dir "public_html/${CAMOUFLAGE_SITE_SLUG}"
-  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "index.html" "${CAMOUFLAGE_SITE_HTML}"
+  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "index.html" "${CAMOUFLAGE_INDEX}"
+  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "about.html" "${CAMOUFLAGE_ABOUT}"
+  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "contact.html" "${CAMOUFLAGE_CONTACT}"
+  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "404.html" "${CAMOUFLAGE_404}"
+  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" ".htaccess" "${CAMOUFLAGE_SLUG_HTACCESS}"
   if [ "${TWOMAN_CAMOUFLAGE_SITE_ROOT_INDEX}" = "true" ]; then
-    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "index.html" "${CAMOUFLAGE_SITE_HTML}"
+    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "index.html" "${CAMOUFLAGE_INDEX}"
+    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "about.html" "${CAMOUFLAGE_ABOUT}"
+    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "contact.html" "${CAMOUFLAGE_CONTACT}"
+    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "404.html" "${CAMOUFLAGE_404}"
+    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "robots.txt" "${CAMOUFLAGE_ROBOTS}"
+    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "sitemap.xml" "${CAMOUFLAGE_SITEMAP}"
+    upload_content "${TWOMAN_CPANEL_HOME}/public_html" ".htaccess" "${CAMOUFLAGE_ROOT_HTACCESS}"
   fi
 fi
 
@@ -190,6 +216,11 @@ CONFIG_JSON="$(cat <<EOF
     "data": ${TWOMAN_DOWN_WAIT_DATA_MS}
   },
   "streaming_data_down_helper": ${TWOMAN_STREAMING_DATA_DOWN_HELPER},
+  "lane_profiles": {
+    "ctl": { "max_bytes": 4096, "max_frames": 8, "hold_ms": 1, "pad_min": 1024 },
+    "pri": { "max_bytes": 32768, "max_frames": 16, "hold_ms": 2, "pad_min": 1024 },
+    "bulk": { "max_bytes": 262144, "max_frames": 64, "hold_ms": 4, "pad_min": 0 }
+  },
   "trace_enabled": ${TWOMAN_TRACE},
   "debug_stats_enabled": ${TWOMAN_DEBUG_STATS}
 }

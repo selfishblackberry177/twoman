@@ -38,7 +38,7 @@ class DesktopClientTuiTest(unittest.IsolatedAsyncioTestCase):
     async def test_profile_import_modal_accepts_android_share_text(self) -> None:
         share_text = ClientProfile(
             name="Imported",
-            broker_base_url="https://example.com/twoman",
+            broker_base_url="https://example.com/rahkar",
             client_token="token-import",
         ).to_share_text()
 

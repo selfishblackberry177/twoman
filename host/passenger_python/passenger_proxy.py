@@ -28,6 +28,10 @@ PID_PATH = _absolute_path(os.environ.get("TWOMAN_PASSENGER_DAEMON_PID"), os.path
 LOCK_PATH = _absolute_path(os.environ.get("TWOMAN_PASSENGER_DAEMON_LOCK"), os.path.join(RUNTIME_DIR, "broker.lock"))
 START_TIMEOUT_SECONDS = max(1.0, float(os.environ.get("TWOMAN_PASSENGER_DAEMON_START_TIMEOUT_SECONDS", "8")))
 CONNECT_TIMEOUT_SECONDS = max(1.0, float(os.environ.get("TWOMAN_PASSENGER_PROXY_TIMEOUT_SECONDS", "35")))
+DAEMON_HEALTH_CACHE_SECONDS = max(
+    0.0,
+    float(os.environ.get("TWOMAN_PASSENGER_DAEMON_HEALTH_CACHE_SECONDS", "2.0")),
+)
 HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -39,6 +43,8 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+LAST_DAEMON_CHECK_AT = 0.0
+LAST_DAEMON_CHECK_PID = 0
 
 
 def _allowed_observer_tokens():
@@ -181,17 +187,32 @@ def ping_daemon(timeout_seconds=1.5):
         return False
 
 
-def ensure_daemon_running():
-    if ping_daemon():
-        return
+def ensure_daemon_running(perform_healthcheck=True):
+    global LAST_DAEMON_CHECK_AT, LAST_DAEMON_CHECK_PID
     ensure_runtime_dir()
     with open(LOCK_PATH, "a+", encoding="utf-8") as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        if ping_daemon():
-            return
         pid = read_pid()
+        now_monotonic = time.monotonic()
+        if process_is_alive(pid) and os.path.exists(SOCKET_PATH):
+            if not perform_healthcheck:
+                LAST_DAEMON_CHECK_PID = pid
+                LAST_DAEMON_CHECK_AT = now_monotonic
+                return
+            if (
+                pid == LAST_DAEMON_CHECK_PID
+                and DAEMON_HEALTH_CACHE_SECONDS > 0.0
+                and (now_monotonic - LAST_DAEMON_CHECK_AT) <= DAEMON_HEALTH_CACHE_SECONDS
+            ):
+                return
+            if ping_daemon():
+                LAST_DAEMON_CHECK_PID = pid
+                LAST_DAEMON_CHECK_AT = now_monotonic
+                return
         if process_is_alive(pid):
             stop_pid(pid)
+        LAST_DAEMON_CHECK_PID = 0
+        LAST_DAEMON_CHECK_AT = 0.0
         with contextlib.suppress(OSError):
             os.remove(SOCKET_PATH)
         command = [
@@ -215,7 +236,7 @@ def ensure_daemon_running():
                 python_path_entries.append(candidate)
         environment = dict(os.environ)
         environment["PYTHONPATH"] = os.pathsep.join(python_path_entries)
-        with open(os.devnull, "ab", buffering=0) as devnull:
+        with open(os.path.join(RUNTIME_DIR, "broker_stderr.log"), "ab", buffering=0) as devnull:
             process = subprocess.Popen(
                 command,
                 cwd=CURRENT_DIR,
@@ -230,11 +251,20 @@ def ensure_daemon_running():
         deadline = time.time() + START_TIMEOUT_SECONDS
         while time.time() < deadline:
             if ping_daemon():
+                LAST_DAEMON_CHECK_PID = process.pid
+                LAST_DAEMON_CHECK_AT = time.monotonic()
                 return
             if process.poll() is not None:
                 raise RuntimeError("Passenger broker daemon exited during startup")
             time.sleep(0.1)
         raise RuntimeError("Passenger broker daemon did not become healthy")
+
+
+def _connect_daemon_client():
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(CONNECT_TIMEOUT_SECONDS)
+    client.connect(SOCKET_PATH)
+    return client
 
 
 def request_path_from_environ(environ):
@@ -279,13 +309,15 @@ def request_body_from_environ(environ):
 
 
 def send_request_to_daemon(environ):
-    ensure_daemon_running()
+    ensure_daemon_running(perform_healthcheck=_observer_path(environ))
     method = str(environ.get("REQUEST_METHOD", "GET")).upper()
     raw_path = request_path_from_environ(environ)
     body = request_body_from_environ(environ)
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client.settimeout(CONNECT_TIMEOUT_SECONDS)
-    client.connect(SOCKET_PATH)
+    try:
+        client = _connect_daemon_client()
+    except OSError:
+        ensure_daemon_running(perform_healthcheck=True)
+        client = _connect_daemon_client()
     header_lines = ["%s: %s" % (name, value) for name, value in request_headers_from_environ(environ)]
     payload = (
         ("%s %s HTTP/1.1\r\n" % (method, raw_path)).encode("iso-8859-1")
@@ -396,32 +428,94 @@ class ProxyBodyIterator(object):
             return payload
 
 
+def _camouflage_html(status_code):
+    """Generate a Persian HTML error page for unauthenticated probes."""
+    candidate_paths = []
+    explicit_path = str(os.environ.get("TWOMAN_CAMOUFLAGE_404_PATH", "")).strip()
+    if explicit_path:
+        candidate_paths.append(os.path.abspath(explicit_path))
+    candidate_paths.extend(
+        [
+            os.path.join(RUNTIME_DIR, "camouflage_404.html"),
+            os.path.join(CURRENT_DIR, "runtime", "camouflage_404.html"),
+            os.path.join(CURRENT_DIR, "camouflage_404.html"),
+            os.path.join(os.path.expanduser("~"), "public_html", "404.html"),
+        ]
+    )
+    seen_paths = set()
+    for candidate_path in candidate_paths:
+        normalized_path = os.path.abspath(candidate_path)
+        if normalized_path in seen_paths:
+            continue
+        seen_paths.add(normalized_path)
+        try:
+            if os.path.exists(normalized_path):
+                with open(normalized_path, "rb") as handle:
+                    return handle.read()
+        except Exception:
+            continue
+
+    status_text = {403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed", 502: "Bad Gateway"}.get(status_code, "Error")
+    html = (
+        '<!doctype html>'
+        '<html lang="fa" dir="rtl">'
+        '<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<title>%d - %s</title>'
+        '<style>'
+        'body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;'
+        'font-family:Vazirmatn,Tahoma,sans-serif;background:linear-gradient(135deg,#0F2027,#203A43,#2C5364);color:#dfe6e9}'
+        '.c{text-align:center;padding:60px 40px;max-width:500px}'
+        'h1{font-size:72px;margin:0 0 10px;opacity:.15}'
+        'p{font-size:18px;opacity:.7;line-height:1.8}'
+        'a{color:#00b894;text-decoration:none}'
+        '</style></head>'
+        '<body><div class="c">'
+        '<h1>%d</h1>'
+        '<p>\u0635\u0641\u062d\u0647\u200c\u0627\u06cc \u06a9\u0647 \u0628\u0647 \u062f\u0646\u0628\u0627\u0644 \u0622\u0646 \u0647\u0633\u062a\u06cc\u062f \u062f\u0631 \u062f\u0633\u062a\u0631\u0633 \u0646\u06cc\u0633\u062a \u06cc\u0627 \u062f\u0633\u062a\u0631\u0633\u06cc \u0634\u0645\u0627 \u0645\u062d\u062f\u0648\u062f \u0634\u062f\u0647 \u0627\u0633\u062a.</p>'
+        '<p><a href="/">\u0628\u0627\u0632\u06af\u0634\u062a \u0628\u0647 \u0635\u0641\u062d\u0647 \u0627\u0635\u0644\u06cc</a></p>'
+        '</div></body></html>'
+    ) % (status_code, status_text, status_code)
+    return html.encode("utf-8")
+
+
 def application(environ, start_response):
     try:
-        if _observer_path(environ):
+        path = str(environ.get("PATH_INFO", "") or "/")
+        if _observer_path(environ) or path == "/dump-log":
             token = _extract_bearer_token(environ)
             if token not in _allowed_observer_tokens():
-                body = b'{"error":"forbidden"}'
+                body = _camouflage_html(403)
                 start_response(
                     "403 Forbidden",
                     [
-                        ("Content-Type", "application/json"),
+                        ("Content-Type", "text/html; charset=utf-8"),
                         ("Content-Length", str(len(body))),
                         ("Cache-Control", "no-store"),
                     ],
                 )
                 return [body]
+
+        if path == "/dump-log":
+            log_path = os.path.join(os.path.dirname(CURRENT_DIR), "logs", "http-broker.log")
+            if os.path.exists(log_path):
+                with open(log_path, "r", encoding="utf-8") as f:
+                    body = f.read().encode("utf-8")
+            else:
+                body = b"Log not found"
+            start_response("200 OK", [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))])
+            return [body]
+
         client, response_file = send_request_to_daemon(environ)
         status, headers, header_map = parse_response_headers(response_file)
         iterator = ProxyBodyIterator(client, response_file, header_map)
         start_response(status, headers)
         return iterator
     except Exception as error:
-        body = str(error).encode("utf-8", errors="replace")
+        body = _camouflage_html(502)
         start_response(
             "502 Bad Gateway",
             [
-                ("Content-Type", "text/plain; charset=utf-8"),
+                ("Content-Type", "text/html; charset=utf-8"),
                 ("Content-Length", str(len(body))),
                 ("Cache-Control", "no-store"),
             ],

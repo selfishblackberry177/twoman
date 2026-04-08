@@ -93,9 +93,12 @@ TWOMAN_CAMOUFLAGE_SITE_ENABLED="${TWOMAN_CAMOUFLAGE_SITE_ENABLED:-false}"
 TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID="${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID:-}"
 TWOMAN_CAMOUFLAGE_SITE_NAME="${TWOMAN_CAMOUFLAGE_SITE_NAME:-}"
 TWOMAN_CAMOUFLAGE_SITE_ROOT_INDEX="${TWOMAN_CAMOUFLAGE_SITE_ROOT_INDEX:-true}"
-TWOMAN_PUBLIC_BASE_PATH="${TWOMAN_PUBLIC_BASE_PATH:-/twoman}"
-TWOMAN_APP_NAME="${TWOMAN_APP_NAME:-twoman_py}"
-TWOMAN_APP_ROOT="${TWOMAN_APP_ROOT:-${TWOMAN_CPANEL_HOME}/twoman_passenger}"
+TWOMAN_PUBLIC_BASE_PATH="${TWOMAN_PUBLIC_BASE_PATH:-/rahkar}"
+TWOMAN_APP_NAME="${TWOMAN_APP_NAME:-rahkar}"
+TWOMAN_APP_ROOT="${TWOMAN_APP_ROOT:-${TWOMAN_CPANEL_HOME}/rahkar}"
+TWOMAN_DOWN_WAIT_CTL_MS="${TWOMAN_DOWN_WAIT_CTL_MS:-250}"
+TWOMAN_DOWN_WAIT_DATA_MS="${TWOMAN_DOWN_WAIT_DATA_MS:-250}"
+TWOMAN_STREAMING_DATA_DOWN_HELPER="${TWOMAN_STREAMING_DATA_DOWN_HELPER:-false}"
 if [ -z "${TWOMAN_ROUTE_TEMPLATE:-}" ]; then
   TWOMAN_ROUTE_TEMPLATE='/{lane}/{direction}'
 fi
@@ -139,7 +142,7 @@ PY
     python3 scripts/generate_camouflage_site.py \
       --deployment-id "${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID}" > "${CAMOUFLAGE_MANIFEST_PATH}"
   fi
-  if [ -z "${TWOMAN_PUBLIC_BASE_PATH:-}" ] || [ "${TWOMAN_PUBLIC_BASE_PATH}" = "/twoman" ]; then
+  if [ -z "${TWOMAN_PUBLIC_BASE_PATH:-}" ] || [ "${TWOMAN_PUBLIC_BASE_PATH}" = "/rahkar" ]; then
     TWOMAN_PUBLIC_BASE_PATH="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "passenger_base_path")"
   fi
 fi
@@ -157,11 +160,16 @@ CONFIG_JSON="$(cat <<EOF
   "route_template": "${TWOMAN_ROUTE_TEMPLATE}",
   "health_template": "${TWOMAN_HEALTH_TEMPLATE}",
   "down_wait_ms": {
-    "ctl": 100,
-    "data": 100
+    "ctl": ${TWOMAN_DOWN_WAIT_CTL_MS},
+    "data": ${TWOMAN_DOWN_WAIT_DATA_MS}
   },
   "streaming_ctl_down_helper": false,
-  "streaming_data_down_helper": false,
+  "streaming_data_down_helper": ${TWOMAN_STREAMING_DATA_DOWN_HELPER},
+  "lane_profiles": {
+    "ctl": { "max_bytes": 4096, "max_frames": 8, "hold_ms": 1, "pad_min": 1024 },
+    "pri": { "max_bytes": 32768, "max_frames": 16, "hold_ms": 2, "pad_min": 1024 },
+    "bulk": { "max_bytes": 262144, "max_frames": 64, "hold_ms": 4, "pad_min": 0 }
+  },
   "peer_ttl_seconds": 90,
   "stream_ttl_seconds": 300,
   "max_lane_bytes": 16777216,
@@ -173,28 +181,64 @@ CONFIG_JSON="$(cat <<EOF
 EOF
 )"
 
-echo "Uploading Passenger host app files..."
-if [ -n "${CAMOUFLAGE_MANIFEST_PATH}" ]; then
-  CAMOUFLAGE_SITE_SLUG="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "site_slug")"
-  CAMOUFLAGE_SITE_HTML="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "landing_html")"
-  ensure_remote_dir "public_html/${CAMOUFLAGE_SITE_SLUG}"
-  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "index.html" "${CAMOUFLAGE_SITE_HTML}"
-  if [ "${TWOMAN_CAMOUFLAGE_SITE_ROOT_INDEX}" = "true" ]; then
-    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "index.html" "${CAMOUFLAGE_SITE_HTML}"
-  fi
-fi
 ensure_remote_dir "${APP_RELATIVE}"
 ensure_remote_dir "${APP_RELATIVE}/tmp"
 ensure_remote_dir "${APP_RELATIVE}/logs"
 ensure_remote_dir "${APP_RELATIVE}/runtime"
+
+echo "Uploading Passenger host app files..."
+if [ -n "${CAMOUFLAGE_MANIFEST_PATH}" ]; then
+  CAMOUFLAGE_SITE_SLUG="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "site_slug")"
+  CAMOUFLAGE_INDEX="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "landing_html")"
+  CAMOUFLAGE_ABOUT="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "about_html")"
+  CAMOUFLAGE_CONTACT="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "contact_html")"
+  CAMOUFLAGE_404="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "404_html")"
+  CAMOUFLAGE_ROBOTS="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "robots_txt")"
+  CAMOUFLAGE_SITEMAP="$(json_get "${CAMOUFLAGE_MANIFEST_PATH}" "sitemap_xml")"
+  CAMOUFLAGE_SLUG_HTACCESS="$(cat <<EOF
+DirectoryIndex index.html
+ErrorDocument 404 /${CAMOUFLAGE_SITE_SLUG}/404.html
+EOF
+)"
+  CAMOUFLAGE_ROOT_HTACCESS="$(cat <<'EOF'
+DirectoryIndex index.html
+ErrorDocument 404 /404.html
+EOF
+)"
+  
+  ensure_remote_dir "public_html/${CAMOUFLAGE_SITE_SLUG}"
+  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "index.html" "${CAMOUFLAGE_INDEX}"
+  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "about.html" "${CAMOUFLAGE_ABOUT}"
+  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "contact.html" "${CAMOUFLAGE_CONTACT}"
+  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "404.html" "${CAMOUFLAGE_404}"
+  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" ".htaccess" "${CAMOUFLAGE_SLUG_HTACCESS}"
+  
+  if [ "${TWOMAN_CAMOUFLAGE_SITE_ROOT_INDEX}" = "true" ]; then
+    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "index.html" "${CAMOUFLAGE_INDEX}"
+    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "about.html" "${CAMOUFLAGE_ABOUT}"
+    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "contact.html" "${CAMOUFLAGE_CONTACT}"
+    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "404.html" "${CAMOUFLAGE_404}"
+    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "robots.txt" "${CAMOUFLAGE_ROBOTS}"
+    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "sitemap.xml" "${CAMOUFLAGE_SITEMAP}"
+    upload_content "${TWOMAN_CPANEL_HOME}/public_html" ".htaccess" "${CAMOUFLAGE_ROOT_HTACCESS}"
+  fi
+  
+  # Crucial for proxy camouflage: upload the themed 404 to the passenger runtime root
+  upload_content "${TWOMAN_APP_ROOT}/runtime" "camouflage_404.html" "${CAMOUFLAGE_404}"
+fi
+
 upload_file "runtime_diagnostics.py" "${TWOMAN_APP_ROOT}" "runtime_diagnostics.py"
 upload_file "twoman_http.py" "${TWOMAN_APP_ROOT}" "twoman_http.py"
 upload_file "twoman_protocol.py" "${TWOMAN_APP_ROOT}" "twoman_protocol.py"
+upload_file "twoman_crypto.py" "${TWOMAN_APP_ROOT}" "twoman_crypto.py"
 upload_file "host/runtime/http_broker_daemon.py" "${TWOMAN_APP_ROOT}" "http_broker_daemon.py"
 upload_content "${TWOMAN_APP_ROOT}" "broker_app.py" "$(cat host/passenger_python/broker_app.py)"
 upload_content "${TWOMAN_APP_ROOT}" "passenger_proxy.py" "$(cat host/passenger_python/passenger_proxy.py)"
 upload_content "${TWOMAN_APP_ROOT}" "passenger_wsgi.py" "$(cat host/passenger_python/passenger_wsgi.py)"
 upload_content "${TWOMAN_APP_ROOT}" "config.json" "${CONFIG_JSON}"
+# Force Passenger to respawn the detached broker daemon on the next request so
+# updated broker code actually takes effect.
+upload_content "${TWOMAN_APP_ROOT}/runtime" "broker.pid" "0"
 
 HOST_DOMAIN="${TWOMAN_PUBLIC_ORIGIN#https://}"
 HOST_DOMAIN="${HOST_DOMAIN#http://}"

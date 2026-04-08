@@ -3,6 +3,7 @@ package com.twoman.android
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.InetAddresses
 import android.net.IpPrefix
 import android.net.VpnService
@@ -20,6 +21,7 @@ import kotlin.concurrent.thread
 class TunnelVpnService : VpnService() {
     private val loggerTag = BuildConfig.RUNTIME_LOG_TAG
     private var vpnInterface: ParcelFileDescriptor? = null
+    private var vpnInterfaceFd: Int? = null
     private lateinit var stateStore: RuntimeStateStore
     private var activeProfile: ClientProfile? = null
     @Volatile
@@ -49,14 +51,20 @@ class TunnelVpnService : VpnService() {
         stopRequested = false
         stopOnce.set(false)
         NotificationHelper.ensureChannel(this)
-        startForeground(
-            NotificationHelper.VPN_NOTIFICATION_ID,
-            NotificationHelper.build(
-                this,
-                getString(R.string.runtime_vpn_title),
-                getString(R.string.status_starting_message),
-            ),
+        val notification = NotificationHelper.build(
+            this,
+            getString(R.string.runtime_vpn_title),
+            getString(R.string.status_starting_message),
         )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NotificationHelper.VPN_NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+            )
+        } else {
+            startForeground(NotificationHelper.VPN_NOTIFICATION_ID, notification)
+        }
         if (!workerStarted) {
             workerStarted = true
             thread(name = "vpn-runtime-start", start = true) {
@@ -148,10 +156,14 @@ class TunnelVpnService : VpnService() {
             return
         }
 
+        val interfaceFd = vpnInterface!!.detachFd()
+        vpnInterfaceFd = interfaceFd
+        vpnInterface = null
+
         val key = Key().apply {
             mark = 0
             mtu = 1500
-            device = "fd://${vpnInterface!!.fd}"
+            device = "fd://$interfaceFd"
             proxy = "socks5://127.0.0.1:${listenState.socksPort}"
             `interface` = ""
             logLevel = if (profile.traceEnabled) "debug" else "info"
@@ -190,8 +202,15 @@ class TunnelVpnService : VpnService() {
         Log.i(loggerTag, "TunnelVpnService stopTunnel reason=$reason")
         val interfaceToClose = vpnInterface
         vpnInterface = null
-        Log.i(loggerTag, "TunnelVpnService closing vpn interface")
-        runCatching { interfaceToClose?.close() }.onFailure { Log.w(loggerTag, "vpnInterface close failed", it) }
+        val interfaceFd = vpnInterfaceFd
+        vpnInterfaceFd = null
+        if (interfaceToClose != null) {
+            Log.i(loggerTag, "TunnelVpnService closing pending vpn interface")
+            runCatching { interfaceToClose.close() }.onFailure { Log.w(loggerTag, "vpnInterface close failed", it) }
+        } else if (interfaceFd != null) {
+            // The VPN tun fd ownership was detached and handed to the engine.
+            Log.i(loggerTag, "TunnelVpnService stopping engine-owned vpn fd=$interfaceFd")
+        }
         workerStarted = false
         synchronized(ENGINE_LOCK) {
             runCatching { Engine.stop() }.onFailure { Log.w(loggerTag, "Engine.stop failed", it) }
@@ -252,6 +271,7 @@ class TunnelVpnService : VpnService() {
             workerStarted = false
             runCatching { vpnInterface?.close() }
             vpnInterface = null
+            vpnInterfaceFd = null
             stopForeground(STOP_FOREGROUND_REMOVE)
         }
         super.onDestroy()

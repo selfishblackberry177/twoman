@@ -15,6 +15,7 @@ import socket
 import struct
 import sys
 import threading
+import time
 import urllib.parse
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -52,6 +53,15 @@ WINDOW_FLUSH_BYTES = 16 * 1024
 WINDOW_FLUSH_DELAY = 0.005
 SMALL_WRITE_BYTES = 8 * 1024
 MAX_RECV_REORDER_BYTES = 1024 * 1024
+DNS_QUERY_TIMEOUT = max(0.5, float(os.environ.get("TWOMAN_DNS_QUERY_TIMEOUT", "2.5")))
+DNS_CACHE_TTL_SECONDS = max(1.0, float(os.environ.get("TWOMAN_DNS_CACHE_TTL_SECONDS", "20.0")))
+DNS_CACHE_MAX_ENTRIES = max(32, int(os.environ.get("TWOMAN_DNS_CACHE_MAX_ENTRIES", "256")))
+DNS_MAX_INFLIGHT = max(1, int(os.environ.get("TWOMAN_DNS_MAX_INFLIGHT", "8")))
+SHUTDOWN_STREAM_RESET_GRACE_SECONDS = max(
+    0.0,
+    float(os.environ.get("TWOMAN_SHUTDOWN_STREAM_RESET_GRACE_SECONDS", "0.2")),
+)
+DEFAULT_VPN_DNS_SERVERS = ["1.1.1.1", "8.8.8.8"]
 
 TRACE_ENABLED = os.environ.get("TWOMAN_TRACE", "").strip().lower() in ("1", "true", "yes", "on", "debug", "verbose")
 LOGGER = logging.getLogger("twoman.helper")
@@ -61,6 +71,9 @@ FAULT_LOG_HANDLE = None
 PID_FILE_PATH = ""
 LISTEN_STATE_PATH = ""
 EVENT_RECORDER = None
+ACTIVE_LOOP = None
+ACTIVE_STOP_EVENT = None
+ACTIVE_LOOP_LOCK = threading.Lock()
 
 
 def trace(message):
@@ -220,11 +233,61 @@ def remove_listen_state_file():
         os.remove(LISTEN_STATE_PATH)
 
 
+def register_runtime_control(loop, stop_event):
+    global ACTIVE_LOOP, ACTIVE_STOP_EVENT
+    with ACTIVE_LOOP_LOCK:
+        ACTIVE_LOOP = loop
+        ACTIVE_STOP_EVENT = stop_event
+
+
+def clear_runtime_control(loop=None):
+    global ACTIVE_LOOP, ACTIVE_STOP_EVENT
+    with ACTIVE_LOOP_LOCK:
+        if loop is not None and ACTIVE_LOOP is not loop:
+            return
+        ACTIVE_LOOP = None
+        ACTIVE_STOP_EVENT = None
+
+
+def request_stop():
+    with ACTIVE_LOOP_LOCK:
+        loop = ACTIVE_LOOP
+        stop_event = ACTIVE_STOP_EVENT
+    if loop is None or stop_event is None:
+        return False
+    if loop.is_closed():
+        clear_runtime_control(loop)
+        return False
+
+    def signal_stop():
+        if not stop_event.is_set():
+            stop_event.set()
+
+    try:
+        loop.call_soon_threadsafe(signal_stop)
+        return True
+    except RuntimeError:
+        clear_runtime_control(loop)
+        return False
+
+
 def bound_port(server):
     sockets = getattr(server, "sockets", None) or []
     if not sockets:
         raise RuntimeError("server sockets are unavailable")
     return int(sockets[0].getsockname()[1])
+
+
+async def start_bound_servers(hosts, requested_port, handler):
+    servers = []
+    active_port = None
+    for listen_host in hosts:
+        bind_port = requested_port if active_port is None else active_port
+        server = await asyncio.start_server(handler, listen_host, bind_port)
+        if active_port is None:
+            active_port = bound_port(server)
+        servers.append(server)
+    return servers, int(active_port or requested_port)
 
 
 def log_unhandled_exception(exc_type, exc_value, exc_traceback):
@@ -356,6 +419,243 @@ def rebuild_http_request(request_line, headers, rest):
     outgoing_headers.append("Connection: close\r\n")
     payload = rebuilt_request_line + "".join(outgoing_headers) + "\r\n"
     return host, port, payload.encode("iso-8859-1") + rest
+
+
+def parse_socks_target(address_type, data, offset=0):
+    if address_type == 1:
+        host = socket.inet_ntoa(data[offset : offset + 4])
+        offset += 4
+    elif address_type == 3:
+        host_length = data[offset]
+        offset += 1
+        host = data[offset : offset + host_length].decode("utf-8")
+        offset += host_length
+    elif address_type == 4:
+        host = str(ipaddress.IPv6Address(data[offset : offset + 16]))
+        offset += 16
+    else:
+        raise RuntimeError("unsupported socks address type")
+    port = struct.unpack("!H", data[offset : offset + 2])[0]
+    offset += 2
+    return host, port, offset
+
+
+def encode_socks_address(host, port):
+    try:
+        ip = ipaddress.ip_address(host)
+        if isinstance(ip, ipaddress.IPv4Address):
+            return b"\x01" + socket.inet_aton(str(ip)) + struct.pack("!H", int(port))
+        return b"\x04" + ip.packed + struct.pack("!H", int(port))
+    except ValueError:
+        encoded_host = host.encode("utf-8")
+        if len(encoded_host) > 255:
+            raise RuntimeError("socks host too long")
+        return b"\x03" + bytes([len(encoded_host)]) + encoded_host + struct.pack("!H", int(port))
+
+
+def parse_socks_udp_packet(packet):
+    if len(packet) < 4:
+        raise RuntimeError("short socks udp packet")
+    if packet[0:2] != b"\x00\x00":
+        raise RuntimeError("unsupported socks udp reserved bytes")
+    fragment = packet[2]
+    if fragment != 0:
+        raise RuntimeError("fragmented socks udp is unsupported")
+    address_type = packet[3]
+    host, port, offset = parse_socks_target(address_type, packet, 4)
+    return host, port, packet[offset:]
+
+
+def build_socks_udp_packet(host, port, payload):
+    return b"\x00\x00\x00" + encode_socks_address(host, port) + payload
+
+
+def vpn_dns_servers(config):
+    configured = config.get("vpn_dns_servers")
+    if isinstance(configured, list):
+        values = [str(item).strip() for item in configured if str(item).strip()]
+        if values:
+            return values
+    return list(DEFAULT_VPN_DNS_SERVERS)
+
+
+def dns_query_cache_key(payload):
+    data = bytes(payload)
+    if len(data) < 2:
+        return data
+    return data[2:]
+
+
+def dns_transaction_id(payload):
+    data = bytes(payload)
+    if len(data) >= 2:
+        return data[:2]
+    return b"\x00\x00"
+
+
+def with_dns_transaction_id(payload, transaction_id):
+    data = bytes(payload)
+    if len(data) < 2 or len(transaction_id) != 2:
+        return data
+    return bytes(transaction_id) + data[2:]
+
+
+def expire_dns_cache(cache, now_monotonic, max_entries):
+    expired_keys = [key for key, entry in cache.items() if entry["expires_at"] <= now_monotonic]
+    for key in expired_keys:
+        cache.pop(key, None)
+    while len(cache) > max_entries:
+        cache.pop(next(iter(cache)))
+
+
+async def tcp_dns_query(runtime, host, port, payload):
+    stream = runtime.new_stream(host, port)
+    buffered = bytearray()
+    failure = None
+    try:
+        await asyncio.wait_for(stream.open(), timeout=runtime.dns_query_timeout)
+        await stream.send_data(struct.pack("!H", len(payload)) + payload)
+        await stream.finish()
+        while len(buffered) < 2:
+            chunk = await asyncio.wait_for(stream.recv_queue.get(), timeout=runtime.dns_query_timeout)
+            if chunk is None:
+                raise RuntimeError("dns response closed before length")
+            buffered.extend(chunk)
+            await stream.grant_window(len(chunk))
+        response_length = struct.unpack("!H", buffered[:2])[0]
+        while len(buffered) - 2 < response_length:
+            chunk = await asyncio.wait_for(stream.recv_queue.get(), timeout=runtime.dns_query_timeout)
+            if chunk is None:
+                raise RuntimeError("dns response closed early")
+            buffered.extend(chunk)
+            await stream.grant_window(len(chunk))
+        return bytes(buffered[2 : 2 + response_length])
+    except Exception as error:
+        failure = error
+        raise
+    finally:
+        if failure is not None:
+            with contextlib.suppress(Exception):
+                await stream.reset("dns query failed")
+        await runtime.release_stream(stream.stream_id)
+
+
+async def resolve_dns_query(runtime, target_host, payload):
+    cache_key = dns_query_cache_key(payload)
+    transaction_id = dns_transaction_id(payload)
+    owner = False
+    query_task = None
+    now_monotonic = time.monotonic()
+    async with runtime.dns_cache_lock:
+        expire_dns_cache(runtime.dns_cache, now_monotonic, runtime.dns_cache_max_entries)
+        cache_entry = runtime.dns_cache.get(cache_key)
+        if cache_entry is not None:
+            trace("dns cache hit bytes=%s" % len(payload))
+            return with_dns_transaction_id(cache_entry["response"], transaction_id)
+        query_task = runtime.dns_inflight.get(cache_key)
+        if query_task is None:
+            query_task = asyncio.create_task(_resolve_dns_query_uncached(runtime, target_host, payload))
+            runtime.dns_inflight[cache_key] = query_task
+            owner = True
+    try:
+        response = await asyncio.shield(query_task)
+    finally:
+        if owner:
+            async with runtime.dns_cache_lock:
+                if runtime.dns_inflight.get(cache_key) is query_task:
+                    runtime.dns_inflight.pop(cache_key, None)
+    return with_dns_transaction_id(response, transaction_id)
+
+
+async def _resolve_dns_query_uncached(runtime, target_host, payload):
+    upstream_hosts = [target_host]
+    for fallback_host in vpn_dns_servers(runtime.config):
+        if fallback_host not in upstream_hosts:
+            upstream_hosts.append(fallback_host)
+    last_error = None
+    async with runtime.dns_semaphore:
+        for upstream_host in upstream_hosts:
+            try:
+                response = await tcp_dns_query(runtime, upstream_host, 53, payload)
+                async with runtime.dns_cache_lock:
+                    expire_dns_cache(runtime.dns_cache, time.monotonic(), runtime.dns_cache_max_entries)
+                    runtime.dns_cache[dns_query_cache_key(payload)] = {
+                        "expires_at": time.monotonic() + runtime.dns_cache_ttl_seconds,
+                        "response": response,
+                    }
+                trace("dns udp relay target=%s upstream=%s bytes=%s" % (target_host, upstream_host, len(response)))
+                return response
+            except Exception as error:
+                last_error = error
+    raise last_error or RuntimeError("dns query failed")
+
+
+class SocksUdpAssociation(asyncio.DatagramProtocol):
+    def __init__(self, runtime):
+        self.runtime = runtime
+        self.transport = None
+        self.client_addr = None
+        self.tasks = set()
+
+    @classmethod
+    async def create(cls, runtime):
+        loop = asyncio.get_running_loop()
+        protocol = cls(runtime)
+        transport, _ = await loop.create_datagram_endpoint(
+            lambda: protocol,
+            local_addr=("127.0.0.1", 0),
+        )
+        protocol.transport = transport
+        return protocol
+
+    def sockname(self):
+        if self.transport is None:
+            raise RuntimeError("udp association is not ready")
+        return self.transport.get_extra_info("sockname")
+
+    def close(self):
+        for task in list(self.tasks):
+            task.cancel()
+        self.tasks.clear()
+        if self.transport is not None:
+            self.transport.close()
+            self.transport = None
+
+    def datagram_received(self, data, addr):
+        if self.client_addr is None:
+            self.client_addr = addr
+        elif addr != self.client_addr:
+            trace("udp association ignoring packet from unexpected addr=%s" % (addr,))
+            return
+        task = asyncio.create_task(self._handle_datagram(data, addr))
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    async def _handle_datagram(self, data, addr):
+        try:
+            target_host, target_port, payload = parse_socks_udp_packet(data)
+        except Exception as error:
+            LOGGER.debug("invalid socks udp packet error=%s", error)
+            return
+        if target_port != 53:
+            trace("drop udp packet host=%s port=%s bytes=%s" % (target_host, target_port, len(payload)))
+            return
+        if not payload:
+            return
+        last_error = None
+        try:
+            response = await resolve_dns_query(self.runtime, target_host, payload)
+            packet = build_socks_udp_packet(target_host, target_port, response)
+            self.transport.sendto(packet, addr)
+            return
+        except Exception as error:
+            last_error = error
+        LOGGER.warning(
+            "dns udp relay failed target=%s bytes=%s error=%s",
+            target_host,
+            len(payload),
+            last_error,
+        )
 
 
 def authority_matches(expected_host, expected_port, header_value):
@@ -682,8 +982,7 @@ class ProxyStream(object):
         self.closed = True
 
     def _data_lane(self, chunk_len):
-        del chunk_len
-        if self.send_offset < PRI_LIMIT:
+        if self.send_offset < PRI_LIMIT and (self.send_offset + int(chunk_len)) <= PRI_LIMIT:
             return LANE_PRI
         return LANE_BULK
 
@@ -697,11 +996,19 @@ class HelperRuntime(object):
         self.peer_id = config.get("peer_id") or random_peer_id()
         self.transport = create_transport(config, "helper", self.peer_id, self.on_frame)
         self.transport.event_handler = self._record_transport_event
+        self.dns_query_timeout = max(0.5, float(config.get("vpn_dns_query_timeout_seconds", DNS_QUERY_TIMEOUT)))
+        self.dns_cache_ttl_seconds = max(1.0, float(config.get("vpn_dns_cache_ttl_seconds", DNS_CACHE_TTL_SECONDS)))
+        self.dns_cache_max_entries = max(32, int(config.get("vpn_dns_cache_max_entries", DNS_CACHE_MAX_ENTRIES)))
+        self.dns_semaphore = asyncio.Semaphore(max(1, int(config.get("vpn_dns_max_inflight", DNS_MAX_INFLIGHT))))
+        self.dns_cache = {}
+        self.dns_inflight = {}
+        self.dns_cache_lock = asyncio.Lock()
 
     async def start(self):
         await self.transport.start()
 
     async def stop(self):
+        await self._reset_active_streams_for_shutdown()
         await self.transport.stop()
 
     async def on_frame(self, frame, _lane):
@@ -723,6 +1030,30 @@ class HelperRuntime(object):
 
     def _record_transport_event(self, event):
         record_event(**event)
+
+    async def _reset_active_streams_for_shutdown(self):
+        active_streams = [stream for stream in self.streams.values() if not stream.closed]
+        if not active_streams:
+            return
+        grace_seconds = max(
+            0.0,
+            float(
+                self.config.get(
+                    "shutdown_stream_reset_grace_seconds",
+                    SHUTDOWN_STREAM_RESET_GRACE_SECONDS,
+                )
+            ),
+        )
+        record_event(
+            "helper_shutdown_reset_pending",
+            stream_count=len(active_streams),
+            grace_seconds=grace_seconds,
+        )
+        for stream in active_streams:
+            with contextlib.suppress(Exception):
+                await stream.reset("helper shutdown")
+        if grace_seconds > 0:
+            await asyncio.sleep(grace_seconds)
 
 
 async def relay_stream(runtime, stream, reader, writer, initial_payload=b"", connected_response=None, open_stream=True):
@@ -892,8 +1223,15 @@ async def handle_http(runtime, reader, writer):
 
 async def handle_socks(runtime, reader, writer):
     stream = None
+    udp_association = None
     try:
-        version, method_count = (await reader.readexactly(2))
+        peer = writer.get_extra_info("peername")
+        try:
+            version, method_count = (await reader.readexactly(2))
+        except asyncio.IncompleteReadError as error:
+            if not error.partial:
+                return
+            raise
         if version != 5:
             raise RuntimeError("unsupported socks version")
         methods = await reader.readexactly(method_count)
@@ -905,18 +1243,30 @@ async def handle_socks(runtime, reader, writer):
         await writer.drain()
         header = await reader.readexactly(4)
         version, command, _reserved, address_type = header
-        if version != 5 or command != 1:
-            raise RuntimeError("only socks connect is supported")
+        if version != 5:
+            raise RuntimeError("unsupported socks version")
         if address_type == 1:
-            host = socket.inet_ntoa(await reader.readexactly(4))
+            address_data = await reader.readexactly(4 + 2)
         elif address_type == 3:
             host_length = (await reader.readexactly(1))[0]
-            host = (await reader.readexactly(host_length)).decode("utf-8")
+            address_data = bytes([host_length]) + await reader.readexactly(host_length + 2)
         elif address_type == 4:
-            host = str(ipaddress.IPv6Address(await reader.readexactly(16)))
+            address_data = await reader.readexactly(16 + 2)
         else:
             raise RuntimeError("unsupported socks address type")
-        port = struct.unpack("!H", await reader.readexactly(2))[0]
+        host, port, _offset = parse_socks_target(address_type, address_data)
+        if command == 3:
+            udp_association = await SocksUdpAssociation.create(runtime)
+            bind_host, bind_port = udp_association.sockname()
+            LOGGER.info("socks udp accept peer=%s bind=%s:%s target=%s:%s", peer, bind_host, bind_port, host, port)
+            writer.write(b"\x05\x00\x00" + encode_socks_address(bind_host, bind_port))
+            await writer.drain()
+            trace("socks udp association bind=%s:%s target=%s:%s" % (bind_host, bind_port, host, port))
+            await reader.read()
+            return
+        if command != 1:
+            raise RuntimeError("unsupported socks command")
+        LOGGER.info("socks accept peer=%s host=%s port=%s", peer, host, port)
         stream = runtime.new_stream(host, port)
         await stream.open()
         writer.write(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + struct.pack("!H", 0))
@@ -930,19 +1280,37 @@ async def handle_socks(runtime, reader, writer):
                 await stream.reset("socks failure")
             await runtime.release_stream(stream.stream_id)
         await close_writer_quietly(writer)
+        if udp_association is not None:
+            udp_association.close()
 
 
 async def main_async(config):
     loop = asyncio.get_running_loop()
     loop.set_exception_handler(log_asyncio_exception)
+    stop_event = asyncio.Event()
+    register_runtime_control(loop, stop_event)
     runtime = HelperRuntime(config)
-    listen_host = config.get("listen_host", "127.0.0.1")
+    configured_http_hosts = config.get("http_listen_hosts") or config.get("listen_hosts")
+    configured_socks_hosts = config.get("socks_listen_hosts") or config.get("listen_hosts")
+    if isinstance(configured_http_hosts, list):
+        http_listen_hosts = [str(value).strip() for value in configured_http_hosts if str(value).strip()]
+    else:
+        http_listen_hosts = [str(config.get("listen_host", "127.0.0.1")).strip()]
+    if isinstance(configured_socks_hosts, list):
+        socks_listen_hosts = [str(value).strip() for value in configured_socks_hosts if str(value).strip()]
+    else:
+        socks_listen_hosts = [str(config.get("listen_host", "127.0.0.1")).strip()]
+    if not http_listen_hosts:
+        http_listen_hosts = ["127.0.0.1"]
+    if not socks_listen_hosts:
+        socks_listen_hosts = ["127.0.0.1"]
     http_port = int(config.get("http_listen_port", 8080))
     socks_port = int(config.get("socks_listen_port", 1080))
     LOGGER.info(
-        "helper starting transport=%s listen_host=%s http_port=%s socks_port=%s trace=%s http2_ctl=%s http2_data=%s peer_id=%s transport_session=%s",
+        "helper starting transport=%s http_hosts=%s socks_hosts=%s http_port=%s socks_port=%s trace=%s http2_ctl=%s http2_data=%s peer_id=%s transport_session=%s",
         config.get("transport", "http"),
-        listen_host,
+        ",".join(http_listen_hosts),
+        ",".join(socks_listen_hosts),
         http_port,
         socks_port,
         TRACE_ENABLED,
@@ -956,29 +1324,30 @@ async def main_async(config):
         peer_id=runtime.peer_id,
         transport_session_id=runtime.transport.peer_session_id,
         transport=config.get("transport", "http"),
-        listen_host=listen_host,
+        http_hosts=http_listen_hosts,
+        socks_hosts=socks_listen_hosts,
         http_port=http_port,
         socks_port=socks_port,
     )
-    await runtime.start()
-    http_server = None
-    socks_server = None
+    http_servers = []
+    socks_servers = []
+    serve_tasks = []
     try:
-        http_server = await asyncio.start_server(
-            lambda r, w: handle_http(runtime, r, w),
-            listen_host,
+        await runtime.start()
+        http_servers, active_http_port = await start_bound_servers(
+            http_listen_hosts,
             http_port,
+            lambda r, w: handle_http(runtime, r, w),
         )
-        socks_server = await asyncio.start_server(
-            lambda r, w: handle_socks(runtime, r, w),
-            listen_host,
+        socks_servers, active_socks_port = await start_bound_servers(
+            socks_listen_hosts,
             socks_port,
+            lambda r, w: handle_socks(runtime, r, w),
         )
-        active_http_port = bound_port(http_server)
-        active_socks_port = bound_port(socks_server)
         write_listen_state(
             {
-                "listen_host": listen_host,
+                "http_hosts": http_listen_hosts,
+                "socks_hosts": socks_listen_hosts,
                 "http_port": active_http_port,
                 "socks_port": active_socks_port,
                 "transport_session_id": runtime.transport.peer_session_id,
@@ -995,20 +1364,38 @@ async def main_async(config):
         record_event(
             "helper_started",
             transport_session_id=runtime.transport.peer_session_id,
-            listen_host=listen_host,
+            http_hosts=http_listen_hosts,
+            socks_hosts=socks_listen_hosts,
             http_port=active_http_port,
             socks_port=active_socks_port,
         )
-        async with http_server, socks_server:
-            await asyncio.gather(http_server.serve_forever(), socks_server.serve_forever())
+        for server in http_servers + socks_servers:
+            serve_tasks.append(asyncio.create_task(server.serve_forever()))
+        stop_task = asyncio.create_task(stop_event.wait())
+        done, pending = await asyncio.wait(
+            serve_tasks + [stop_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if stop_task in done:
+            LOGGER.info("helper stop requested")
+            record_event("helper_stop_requested", transport_session_id=runtime.transport.peer_session_id)
+        else:
+            for task in done:
+                task.result()
+        for task in pending:
+            task.cancel()
+        for task in pending:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
     finally:
+        clear_runtime_control(loop)
         LOGGER.info("helper stopping")
         record_event("helper_stopping", transport_session_id=runtime.transport.peer_session_id)
-        if http_server is not None:
+        for http_server in http_servers:
             http_server.close()
             with contextlib.suppress(Exception):
                 await http_server.wait_closed()
-        if socks_server is not None:
+        for socks_server in socks_servers:
             socks_server.close()
             with contextlib.suppress(Exception):
                 await socks_server.wait_closed()

@@ -4,7 +4,7 @@ Use this guide when the scripted install path fails or when you want to inspect 
 
 ## 1. cPanel host
 
-Target layout under your public base path, for example `/home/<user>/public_html/twoman`:
+Target layout under your public base path, for example `/home/<user>/public_html/rahkar`:
 
 - `api.php`
 - `health.php`
@@ -48,8 +48,8 @@ Minimal example:
 <?php
 
 return [
-    'storage_path' => '/home/USER/public_html/twoman/storage',
-    'public_base_path' => '/twoman',
+    'storage_path' => '/home/USER/public_html/rahkar/storage',
+    'public_base_path' => '/rahkar',
     'offload_relative_path' => 'offload',
     'offload_ttl_seconds' => 3600,
     'client_tokens' => ['replace-with-client-token'],
@@ -75,7 +75,7 @@ return [
 Open:
 
 ```text
-https://your-host.example/twoman/api.php?action=health
+https://your-host.example/rahkar/api.php?action=health
 ```
 
 with a valid `Authorization: Bearer ...` token from either the client token or the agent token.
@@ -113,13 +113,39 @@ Example:
   "http_timeout_seconds": 30,
   "flush_delay_seconds": 0.01,
   "max_batch_bytes": 65536,
+  "upload_profiles": {
+    "data": {
+      "max_batch_bytes": 131072,
+      "flush_delay_seconds": 0.006
+    }
+  },
+  "idle_repoll_delay_seconds": {
+    "ctl": 0.05,
+    "data": 0.1
+  },
   "peer_id": "agent-main",
   "http2_enabled": {
-    "ctl": true,
+    "ctl": false,
     "data": false
   }
 }
 ```
+
+Use HTTP/1.1 for the hidden-agent control lane by default on the current public
+Passenger path. In live validation, `ctl=true` on the hidden agent caused
+repeated transport timeouts and stalled client streams, while `ctl=false,
+data=false` restored stable end-to-end traffic.
+
+On the public Passenger host, keep `streaming_data_down_helper=false`
+and `down_wait_ms={"ctl":250,"data":250}`. That avoids long-lived helper
+`data/down` requests monopolizing the Passenger worker while still keeping
+latency materially lower than the older `500 ms` polling setting.
+
+Use broker lane profiles close to:
+
+- `ctl`: `4096` bytes / `8` frames / `1ms` / `pad_min 1024`
+- `pri`: `32768` bytes / `16` frames / `2ms` / `pad_min 1024`
+- `bulk`: `262144` bytes / `64` frames / `4ms` / `pad_min 0`
 
 ### Start agent directly
 
@@ -188,7 +214,7 @@ Example:
   "flush_delay_seconds": 0.01,
   "max_batch_bytes": 65536,
   "http2_enabled": {
-    "ctl": false,
+    "ctl": true,
     "data": false
   }
 }
@@ -217,7 +243,7 @@ Bridge health:
 
 ```bash
 curl -H 'Authorization: Bearer YOUR_CLIENT_TOKEN' \
-  'https://your-host.example/twoman/api.php?action=health'
+  'https://your-host.example/rahkar/api.php?action=health'
 ```
 
 SOCKS egress:
