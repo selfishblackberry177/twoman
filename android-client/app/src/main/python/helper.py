@@ -53,6 +53,7 @@ WINDOW_FLUSH_BYTES = 16 * 1024
 WINDOW_FLUSH_DELAY = 0.005
 SMALL_WRITE_BYTES = 8 * 1024
 MAX_RECV_REORDER_BYTES = 1024 * 1024
+DNS_CTL_LANE_LIMIT = 2048
 DNS_QUERY_TIMEOUT = max(0.5, float(os.environ.get("TWOMAN_DNS_QUERY_TIMEOUT", "2.5")))
 DNS_CACHE_TTL_SECONDS = max(1.0, float(os.environ.get("TWOMAN_DNS_CACHE_TTL_SECONDS", "20.0")))
 DNS_CACHE_MAX_ENTRIES = max(32, int(os.environ.get("TWOMAN_DNS_CACHE_MAX_ENTRIES", "256")))
@@ -62,6 +63,7 @@ SHUTDOWN_STREAM_RESET_GRACE_SECONDS = max(
     float(os.environ.get("TWOMAN_SHUTDOWN_STREAM_RESET_GRACE_SECONDS", "0.2")),
 )
 DEFAULT_VPN_DNS_SERVERS = ["1.1.1.1", "8.8.8.8"]
+DNS_TYPE_AAAA = 28
 
 TRACE_ENABLED = os.environ.get("TWOMAN_TRACE", "").strip().lower() in ("1", "true", "yes", "on", "debug", "verbose")
 LOGGER = logging.getLogger("twoman.helper")
@@ -470,6 +472,58 @@ def build_socks_udp_packet(host, port, payload):
     return b"\x00\x00\x00" + encode_socks_address(host, port) + payload
 
 
+def config_flag(config, key, default=False):
+    value = config.get(key, default)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return bool(default)
+
+
+def vpn_filter_aaaa(config):
+    if "vpn_filter_aaaa" in config:
+        return config_flag(config, "vpn_filter_aaaa", False)
+    return config_flag(config, "vpn_prefer_ipv4", True)
+
+
+def dns_question_type(payload):
+    data = bytes(payload)
+    if len(data) < 12:
+        return None
+    question_count = struct.unpack("!H", data[4:6])[0]
+    if question_count != 1:
+        return None
+    index = 12
+    while True:
+        if index >= len(data):
+            return None
+        label_length = data[index]
+        index += 1
+        if label_length == 0:
+            break
+        if label_length & 0xC0:
+            return None
+        index += label_length
+        if index > len(data):
+            return None
+    if index + 4 > len(data):
+        return None
+    return struct.unpack("!H", data[index : index + 2])[0]
+
+
+def synthesize_empty_dns_response(payload):
+    data = bytes(payload)
+    if len(data) < 12:
+        return data
+    flags = struct.unpack("!H", data[2:4])[0]
+    response_flags = 0x8000 | (flags & 0x7910) | 0x0080
+    return data[:2] + struct.pack("!H", response_flags) + data[4:6] + b"\x00\x00\x00\x00" + data[10:]
+
+
 def vpn_dns_servers(config):
     configured = config.get("vpn_dns_servers")
     if isinstance(configured, list):
@@ -477,6 +531,10 @@ def vpn_dns_servers(config):
         if values:
             return values
     return list(DEFAULT_VPN_DNS_SERVERS)
+
+
+def vpn_dns_proxy_ip(config):
+    return str(config.get("vpn_dns_proxy_ip", "")).strip()
 
 
 def dns_query_cache_key(payload):
@@ -543,6 +601,10 @@ async def tcp_dns_query(runtime, host, port, payload):
 async def resolve_dns_query(runtime, target_host, payload):
     cache_key = dns_query_cache_key(payload)
     transaction_id = dns_transaction_id(payload)
+    if vpn_filter_aaaa(runtime.config) and dns_question_type(payload) == DNS_TYPE_AAAA:
+        trace("dns synthetic nodata type=AAAA bytes=%s" % len(payload))
+        record_event("dns_query_synthesized", query_type="AAAA", reason="ipv4-preferred")
+        return with_dns_transaction_id(synthesize_empty_dns_response(payload), transaction_id)
     owner = False
     query_task = None
     now_monotonic = time.monotonic()
@@ -568,7 +630,10 @@ async def resolve_dns_query(runtime, target_host, payload):
 
 
 async def _resolve_dns_query_uncached(runtime, target_host, payload):
-    upstream_hosts = [target_host]
+    upstream_hosts = []
+    proxy_ip = vpn_dns_proxy_ip(runtime.config)
+    if target_host and target_host != proxy_ip:
+        upstream_hosts.append(target_host)
     for fallback_host in vpn_dns_servers(runtime.config):
         if fallback_host not in upstream_hosts:
             upstream_hosts.append(fallback_host)
@@ -651,8 +716,9 @@ class SocksUdpAssociation(asyncio.DatagramProtocol):
         except Exception as error:
             last_error = error
         LOGGER.warning(
-            "dns udp relay failed target=%s bytes=%s error=%s",
+            "dns udp relay failed target=%s qtype=%s bytes=%s error=%s",
             target_host,
+            dns_question_type(payload),
             len(payload),
             last_error,
         )
@@ -982,6 +1048,10 @@ class ProxyStream(object):
         self.closed = True
 
     def _data_lane(self, chunk_len):
+        # Keep small DNS exchanges on ctl so OPEN/DATA/FIN stay ordered while
+        # the collapsed data lane warms up under VPN startup bursts.
+        if self.target_port == 53 and (self.send_offset + int(chunk_len)) <= DNS_CTL_LANE_LIMIT:
+            return LANE_CTL
         if self.send_offset < PRI_LIMIT and (self.send_offset + int(chunk_len)) <= PRI_LIMIT:
             return LANE_PRI
         return LANE_BULK

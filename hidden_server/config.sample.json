@@ -31,6 +31,9 @@
     "data": 0.1
   },
   "peer_id": "agent-main",
+  "prefer_ipv4": true,
+  "disable_ipv6_origin": false,
+  "happy_eyeballs_delay_seconds": 0.25,
   "http2_enabled": {
     "ctl": false,
     "data": false

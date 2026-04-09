@@ -124,6 +124,9 @@ Example:
     "data": 0.1
   },
   "peer_id": "agent-main",
+  "prefer_ipv4": true,
+  "disable_ipv6_origin": true,
+  "happy_eyeballs_delay_seconds": 0.25,
   "http2_enabled": {
     "ctl": false,
     "data": false
@@ -135,6 +138,10 @@ Use HTTP/1.1 for the hidden-agent control lane by default on the current public
 Passenger path. In live validation, `ctl=true` on the hidden agent caused
 repeated transport timeouts and stalled client streams, while `ctl=false,
 data=false` restored stable end-to-end traffic.
+
+Keep `prefer_ipv4=true` on the hidden agent. On networks where hidden-server
+IPv6 egress is unreliable, also set `disable_ipv6_origin=true` so literal IPv6
+targets fail fast instead of burning the full open-connect timeout window.
 
 On the public Passenger host, keep `streaming_data_down_helper=false`
 and `down_wait_ms={"ctl":250,"data":250}`. That avoids long-lived helper

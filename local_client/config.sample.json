@@ -25,6 +25,8 @@
   "flush_delay_seconds": 0.01,
   "max_batch_bytes": 65536,
   "enforce_connect_sni": true,
+  "vpn_prefer_ipv4": true,
+  "vpn_filter_aaaa": true,
   "http2_enabled": {
     "ctl": false,
     "data": false

@@ -7,6 +7,6 @@
 - Verify no real tokens are present in tracked files
 - Verify `host/storage/` is empty or absent
 - Verify `TWOMAN_TRACE` is not enabled in production
-- Verify broker health responds on the configured public base URI, for example `/api/v1/telemetry/health`
+- Verify broker health responds on the configured public base URI, for example `https://host.example.com/<public-base-uri>/health`
 - Verify SOCKS egress through the helper
 - Verify HTTP egress through the helper

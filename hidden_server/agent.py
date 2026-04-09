@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import contextlib
+import ipaddress
 import json
 import logging
 import os
@@ -51,6 +52,7 @@ WINDOW_FLUSH_BYTES = 16 * 1024
 WINDOW_FLUSH_DELAY = 0.005
 SMALL_WRITE_BYTES = 8 * 1024
 MAX_RECV_REORDER_BYTES = 1024 * 1024
+DNS_CTL_LANE_LIMIT = 2048
 
 TRACE_ENABLED = os.environ.get("TWOMAN_TRACE", "").strip().lower() in ("1", "true", "yes", "on", "debug", "verbose")
 DEFAULT_OPEN_CONNECT_TIMEOUT_SECONDS = 12.0
@@ -153,6 +155,8 @@ class RemoteStream(object):
         self.stream_id = int(stream_id)
         self.reader = None
         self.writer = None
+        self.target_host = ""
+        self.target_port = 0
         self.remote_task = None
         self.send_credit = INITIAL_WINDOW
         self.send_credit_event = asyncio.Event()
@@ -172,6 +176,8 @@ class RemoteStream(object):
     async def open(self, host, port, mode):
         if mode != MODE_TCP:
             raise RuntimeError("unsupported open mode")
+        self.target_host = str(host)
+        self.target_port = int(port)
         trace("open stream=%s target=%s:%s" % (self.stream_id, host, port))
         record_event(
             "stream_open_requested",
@@ -412,6 +418,10 @@ class RemoteStream(object):
             self.agent.release_stream(self.stream_id, self)
 
     def _data_lane(self, chunk_len):
+        # Keep short DNS exchanges on ctl so OPEN/DATA/FIN stay ordered while
+        # the collapsed data lane warms up under tunnel startup load.
+        if self.target_port == 53 and (self.send_offset + int(chunk_len)) <= DNS_CTL_LANE_LIMIT:
+            return LANE_CTL
         if self.send_offset < PRI_LIMIT and (self.send_offset + int(chunk_len)) <= PRI_LIMIT:
             return LANE_PRI
         return LANE_BULK
@@ -431,6 +441,7 @@ class AgentRuntime(object):
             float(config.get("happy_eyeballs_delay_seconds", DEFAULT_HAPPY_EYEBALLS_DELAY_SECONDS)),
         )
         self.prefer_ipv4 = bool(config.get("prefer_ipv4", True))
+        self.disable_ipv6_origin = bool(config.get("disable_ipv6_origin", False))
 
     async def start(self):
         await self.transport.start()
@@ -496,9 +507,6 @@ class AgentRuntime(object):
 
     async def open_origin_connection(self, host, port):
         loop = asyncio.get_running_loop()
-        infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        has_ipv4 = any(info[0] == socket.AF_INET for info in infos)
-        has_ipv6 = any(info[0] == socket.AF_INET6 for info in infos)
 
         async def attempt(label, **kwargs):
             trace(
@@ -547,19 +555,45 @@ class AgentRuntime(object):
 
         last_error = None
         attempts = []
-        if self.prefer_ipv4 and has_ipv4:
-            attempts.append(("ipv4", {"family": socket.AF_INET}))
-        attempts.append(
-            (
-                "happy",
-                {
-                    "happy_eyeballs_delay": self.happy_eyeballs_delay_seconds,
-                    "interleave": 1,
-                },
+        literal_ip = None
+        with contextlib.suppress(ValueError):
+            literal_ip = ipaddress.ip_address(host)
+        if isinstance(literal_ip, ipaddress.IPv4Address):
+            attempts.append(("ipv4-literal", {"family": socket.AF_INET}))
+        elif isinstance(literal_ip, ipaddress.IPv6Address):
+            if self.disable_ipv6_origin:
+                error = RuntimeError("ipv6 origin disabled")
+                trace(
+                    "origin connect fail host=%s port=%s strategy=ipv6-literal-disabled elapsed=0.000 error=%r"
+                    % (host, port, error)
+                )
+                record_event(
+                    "origin_connect_failed",
+                    target_host=host,
+                    target_port=port,
+                    strategy="ipv6-literal-disabled",
+                    elapsed_ms=0,
+                    error=str(error),
+                )
+                raise error
+            attempts.append(("ipv6-literal", {"family": socket.AF_INET6}))
+        else:
+            infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+            has_ipv4 = any(info[0] == socket.AF_INET for info in infos)
+            has_ipv6 = any(info[0] == socket.AF_INET6 for info in infos)
+            if self.prefer_ipv4 and has_ipv4:
+                attempts.append(("ipv4", {"family": socket.AF_INET}))
+            attempts.append(
+                (
+                    "happy",
+                    {
+                        "happy_eyeballs_delay": self.happy_eyeballs_delay_seconds,
+                        "interleave": 1,
+                    },
+                )
             )
-        )
-        if has_ipv6:
-            attempts.append(("ipv6", {"family": socket.AF_INET6}))
+            if has_ipv6:
+                attempts.append(("ipv6", {"family": socket.AF_INET6}))
 
         seen = set()
         for label, kwargs in attempts:
