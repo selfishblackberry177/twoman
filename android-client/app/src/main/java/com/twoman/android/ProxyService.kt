@@ -15,6 +15,9 @@ import kotlin.concurrent.thread
 
 class ProxyService : Service() {
     private val loggerTag = BuildConfig.RUNTIME_LOG_TAG
+    // Give the helper enough time to unwind active transport reads and stream
+    // resets on normal shutdown before falling back to a hard process kill.
+    private val helperStopJoinTimeoutMs = 12_000L
     private var helperThread: Thread? = null
     private var listenWatcherThread: Thread? = null
     private lateinit var stateStore: RuntimeStateStore
@@ -77,10 +80,13 @@ class ProxyService : Service() {
         val logFile = AppFiles.runtimeLogFile(this, profile.id)
         val listenStateFile = AppFiles.runtimeListenStateFile(this, profile.id)
         listenStateFile.delete()
-        configFile.writeText(
-            profile.toRuntimeConfig(logFile.absolutePath, listenStateFile.absolutePath).toString(2),
-            Charsets.UTF_8,
-        )
+        val runtimeConfig = profile.toRuntimeConfig(logFile.absolutePath, listenStateFile.absolutePath).apply {
+            put("vpn_filter_aaaa", mode == MODE_VPN)
+            if (mode == MODE_VPN) {
+                put("vpn_dns_query_timeout_seconds", 8.0)
+            }
+        }
+        configFile.writeText(runtimeConfig.toString(2), Charsets.UTF_8)
         stateStore.write(
             RuntimeStatus(
                 running = true,
@@ -170,6 +176,7 @@ class ProxyService : Service() {
             )
         }
         val threadToJoin = helperThread
+        val watcherToJoin = listenWatcherThread
         thread(name = "local-runtime-stop", start = true) {
             val stopped = runCatching {
                 if (!Python.isStarted()) {
@@ -183,9 +190,14 @@ class ProxyService : Service() {
             }
             Log.i(loggerTag, "ProxyService stop helper signalled=$stopped")
             if (threadToJoin != null) {
-                runCatching { threadToJoin.join(2_500L) }
+                runCatching { threadToJoin.join(helperStopJoinTimeoutMs) }
             }
-            if (helperThread?.isAlive == true) {
+            if (watcherToJoin != null) {
+                runCatching { watcherToJoin.join(helperStopJoinTimeoutMs) }
+            }
+            val helperStillRunning = (threadToJoin?.isAlive == true) || (helperThread?.isAlive == true)
+            val watcherStillRunning = (watcherToJoin?.isAlive == true) || (listenWatcherThread?.isAlive == true)
+            if (helperStillRunning || watcherStillRunning) {
                 Log.w(loggerTag, "ProxyService helper thread still alive after stop timeout")
                 currentProfile?.let { profile ->
                     stateStore.write(
@@ -222,7 +234,7 @@ class ProxyService : Service() {
                 )
             }
             stopSelf()
-            terminateProxyProcess("helper stopped cleanly")
+            Log.i(loggerTag, "ProxyService helper stopped cleanly")
         }
     }
 
@@ -233,6 +245,15 @@ class ProxyService : Service() {
 
     override fun onDestroy() {
         Log.i(loggerTag, "ProxyService onDestroy")
+        if (!stopRequested && helperThread?.isAlive == true) {
+            Log.w(loggerTag, "ProxyService destroyed with live helper; signalling stop")
+            stopRequested = true
+            runCatching {
+                if (Python.isStarted()) {
+                    Python.getInstance().getModule("android_entry").callAttr("stop_helper")
+                }
+            }.onFailure { Log.w(loggerTag, "ProxyService onDestroy stop helper failed", it) }
+        }
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }

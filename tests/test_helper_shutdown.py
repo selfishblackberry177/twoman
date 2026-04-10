@@ -1,5 +1,7 @@
 import unittest
 from unittest import mock
+import asyncio
+import time
 
 from twoman_protocol import FRAME_RST, LANE_CTL
 import local_client.helper as helper
@@ -22,6 +24,88 @@ class _FakeTransport:
         self.sent_frames.append((lane, frame))
 
 
+class _FakeWriter:
+    def __init__(self):
+        self.closed = False
+        self.wait_closed_calls = 0
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        self.wait_closed_calls += 1
+        self.closed = True
+
+    def is_closing(self):
+        return self.closed
+
+    def write(self, _payload):
+        return None
+
+    def write_eof(self):
+        self.closed = True
+
+    async def drain(self):
+        return None
+
+
+class _SlowWriter(_FakeWriter):
+    async def wait_closed(self):
+        self.wait_closed_calls += 1
+        await asyncio.sleep(10)
+
+
+class _BlockingReader:
+    async def read(self, _size):
+        await asyncio.sleep(10)
+
+
+class _FakeRuntime:
+    def __init__(self):
+        self.released_stream_ids = []
+
+    async def release_stream(self, stream_id):
+        self.released_stream_ids.append(stream_id)
+
+
+class _FakeRelayStream:
+    def __init__(self, stream_id=7):
+        self.stream_id = stream_id
+        self.recv_queue = asyncio.Queue()
+        self.open_failed = ""
+        self.closed = False
+        self.local_write_bytes = 0
+        self.local_write_count = 0
+        self.recv_offset = 0
+        self.send_offset = 0
+        self.finish_calls = 0
+        self.reset_reasons = []
+
+    async def open(self):
+        return None
+
+    async def send_data(self, _payload):
+        return None
+
+    async def finish(self):
+        self.finish_calls += 1
+        self.closed = True
+
+    async def reset(self, reason):
+        self.reset_reasons.append(reason)
+        self.closed = True
+
+    async def grant_window(self, _amount):
+        return None
+
+
+async def _stubborn_task():
+    try:
+        await asyncio.sleep(10)
+    except asyncio.CancelledError:
+        await asyncio.sleep(10)
+
+
 class HelperShutdownTests(unittest.IsolatedAsyncioTestCase):
     async def test_stop_resets_open_streams_before_transport_stop(self):
         fake_transport = _FakeTransport()
@@ -39,6 +123,53 @@ class HelperShutdownTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lane, LANE_CTL)
         self.assertEqual(frame.type_id, FRAME_RST)
         self.assertEqual(frame.stream_id, first.stream_id)
+
+    async def test_stop_closes_active_connection_writers(self):
+        fake_transport = _FakeTransport()
+        with mock.patch.object(helper, "create_transport", return_value=fake_transport):
+            runtime = helper.HelperRuntime({"shutdown_stream_reset_grace_seconds": 0.0})
+        writer = _FakeWriter()
+        runtime.register_connection(None, writer)
+
+        await runtime.stop()
+
+        self.assertTrue(fake_transport.stopped)
+        self.assertTrue(writer.closed)
+        self.assertEqual(writer.wait_closed_calls, 1)
+
+    async def test_stop_waits_for_live_connections_concurrently(self):
+        fake_transport = _FakeTransport()
+        with mock.patch.object(helper, "create_transport", return_value=fake_transport):
+            runtime = helper.HelperRuntime({"shutdown_stream_reset_grace_seconds": 0.0})
+        stubborn_tasks = [asyncio.create_task(_stubborn_task()) for _ in range(3)]
+        for task in stubborn_tasks:
+            runtime.register_connection(task, None)
+        for _ in range(3):
+            runtime.register_connection(None, _SlowWriter())
+
+        started = time.monotonic()
+        await runtime.stop()
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(fake_transport.stopped)
+        self.assertLess(elapsed, 2.5)
+
+    async def test_cancelled_relay_resets_stream_instead_of_finishing(self):
+        runtime = _FakeRuntime()
+        stream = _FakeRelayStream()
+        reader = _BlockingReader()
+        writer = _FakeWriter()
+
+        relay_task = asyncio.create_task(helper.relay_stream(runtime, stream, reader, writer))
+        await asyncio.sleep(0.05)
+        relay_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await relay_task
+
+        self.assertEqual(stream.finish_calls, 0)
+        self.assertEqual(stream.reset_reasons, ["relay cancelled"])
+        self.assertEqual(runtime.released_stream_ids, [stream.stream_id])
+        self.assertTrue(writer.closed)
 
 
 if __name__ == "__main__":

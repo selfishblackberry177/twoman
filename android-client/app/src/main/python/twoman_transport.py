@@ -91,6 +91,8 @@ class LaneTransport(object):
         self.streaming_up_lanes = self._normalize_streaming_up_lanes(streaming_up_lanes)
         self.idle_repoll_delay_seconds = self._normalize_idle_repoll_delay_seconds(idle_repoll_delay_seconds)
         self.protocol_config = dict(protocol_config or {})
+        self.down_read_timeout_seconds = self._normalize_down_read_timeout_seconds()
+        self.down_stream_max_session_seconds = self._normalize_down_stream_max_session_seconds()
         self.route_provider = RouteProvider.from_config(self.base_url, self.protocol_config)
         self.random = random.Random()
         self.queues = dict((lane, asyncio.Queue()) for lane in LANES)
@@ -106,8 +108,8 @@ class LaneTransport(object):
         if self.clients:
             return
         for lane in self._external_lanes():
-            self.clients[(lane, "up")] = self._build_client(lane)
-            self.clients[(lane, "down")] = self._build_client(lane)
+            self.clients[(lane, "up")] = self._build_client(lane, "up")
+            self.clients[(lane, "down")] = self._build_client(lane, "down")
         for lane in self._external_lanes():
             if lane in self.streaming_up_lanes:
                 self.tasks.append(asyncio.create_task(self._streaming_up_loop(lane)))
@@ -242,20 +244,39 @@ class LaneTransport(object):
         while not self.stop_event.is_set():
             decoder = FrameDecoder()
             saw_non_ping = False
+            rotated = False
             try:
                 async with self.clients[(lane, "down")].stream("GET", self._lane_url(lane, "down"), headers=self._headers()) as response:
                     response.raise_for_status()
                     self._validate_binary_response(response)
                     self._mark_success("down", lane)
                     trace("%s/%s@%s down open lane=%s status=%s" % (self.role, self.peer_label, self.peer_session_id, lane, response.status_code))
-                    
+                    opened_at = asyncio.get_running_loop().time()
                     cipher = None
                     iv_buffer = b""
-                    
-                    async for chunk in response.aiter_bytes():
+                    iterator = response.aiter_bytes().__aiter__()
+                    while True:
+                        if self.down_stream_max_session_seconds > 0:
+                            age = asyncio.get_running_loop().time() - opened_at
+                            if age >= self.down_stream_max_session_seconds:
+                                rotated = True
+                                self._report_event(
+                                    "transport_down_rotate",
+                                    lane=lane,
+                                    age_seconds=age,
+                                )
+                                trace(
+                                    "%s/%s@%s down rotate lane=%s age=%0.3f"
+                                    % (self.role, self.peer_label, self.peer_session_id, lane, age)
+                                )
+                                break
+                        try:
+                            chunk = await self._next_response_chunk(iterator, lane)
+                        except StopAsyncIteration:
+                            break
                         if not chunk:
                             continue
-                            
+
                         # Extract the 16-byte IV from the front of the stream
                         if cipher is None:
                             needed_iv = 16 - len(iv_buffer)
@@ -267,14 +288,16 @@ class LaneTransport(object):
                                 continue
 
                         trace("%s/%s@%s down chunk lane=%s bytes=%s" % (self.role, self.peer_label, self.peer_session_id, lane, len(chunk)))
-                        
+
                         plaintext_chunk = cipher.process(chunk)
-                        
+
                         for frame in decoder.feed(plaintext_chunk):
                             if frame.type_id != FRAME_PING:
                                 saw_non_ping = True
                                 trace("%s/%s@%s down frame lane=%s type=%s stream=%s payload=%s" % (self.role, self.peer_label, self.peer_session_id, lane, frame.type_id, frame.stream_id, len(frame.payload)))
                             await self.on_frame(frame, lane)
+                if rotated:
+                    continue
                 if not saw_non_ping:
                     delay = self.idle_repoll_delay_seconds.get(lane, 0.0)
                     if delay > 0:
@@ -375,13 +398,35 @@ class LaneTransport(object):
                 delays[LANE_DATA] = max(0.0, float(values.get("pri", 0.0) or values.get("bulk", 0.0)))
             return delays
         if idle_repoll_delay_seconds is None:
-            try:
-                default_value = float(self.protocol_config.get("idle_repoll_delay_seconds", 10.0))
-            except (TypeError, ValueError):
-                default_value = 10.0
-        else:
-            default_value = max(0.0, float(idle_repoll_delay_seconds))
+            configured = self.protocol_config.get("idle_repoll_delay_seconds")
+            if isinstance(configured, dict):
+                return self._normalize_idle_repoll_delay_seconds(configured)
+            if configured is not None:
+                try:
+                    default_value = max(0.0, float(configured))
+                except (TypeError, ValueError):
+                    default_value = 0.05 if LANE_CTL in external_lanes else 0.1
+                return dict((lane, default_value) for lane in external_lanes)
+            defaults = {}
+            for lane in external_lanes:
+                defaults[lane] = 0.05 if lane == LANE_CTL else 0.1
+            return defaults
+        default_value = max(0.0, float(idle_repoll_delay_seconds))
         return dict((lane, default_value) for lane in external_lanes)
+
+    def _normalize_down_read_timeout_seconds(self):
+        configured = self.protocol_config.get("down_read_timeout_seconds", 10.0)
+        try:
+            return max(0.01, float(configured))
+        except (TypeError, ValueError):
+            return 10.0
+
+    def _normalize_down_stream_max_session_seconds(self):
+        configured = self.protocol_config.get("down_stream_max_session_seconds", 60.0)
+        try:
+            return max(0.0, float(configured))
+        except (TypeError, ValueError):
+            return 60.0
 
     def _default_data_upload_profile(self):
         if self.role == "agent":
@@ -439,10 +484,8 @@ class LaneTransport(object):
         return self.data_queue.get_nowait()
 
     async def _requeue_frame(self, lane, frame):
-        if lane != LANE_DATA:
-            await self.queues[lane].put(frame)
-            return
-        await self.data_queue.put(frame)
+        replay = self.replay_queues.setdefault(lane, collections.deque())
+        replay.appendleft(frame)
 
     async def _requeue_frames_front(self, lane, frames):
         if not frames:
@@ -457,7 +500,22 @@ class LaneTransport(object):
         if client is not None:
             with contextlib.suppress(Exception):
                 await client.aclose()
-        self.clients[key] = self._build_client(lane)
+        self.clients[key] = self._build_client(lane, direction)
+
+    async def _next_response_chunk(self, iterator, lane):
+        if self.down_read_timeout_seconds <= 0:
+            return await iterator.__anext__()
+        next_task = asyncio.create_task(iterator.__anext__())
+        done, _pending = await asyncio.wait({next_task}, timeout=self.down_read_timeout_seconds)
+        if done:
+            return await next_task
+        next_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration, Exception):
+            await next_task
+        raise TimeoutError(
+            "down stream chunk timeout lane=%s timeout=%s"
+            % (lane, self.down_read_timeout_seconds)
+        )
 
     async def _streaming_upload_chunks(self, lane):
         logical_lane = lane
@@ -508,12 +566,15 @@ class LaneTransport(object):
             else:
                 yield self._streaming_cipher.process(batch_payload)
 
-    def _build_client(self, lane):
+    def _build_client(self, lane, direction):
         limits = httpx.Limits(max_keepalive_connections=20, max_connections=50, keepalive_expiry=120)
+        read_timeout = None
+        if direction == "down" and self.down_read_timeout_seconds > 0:
+            read_timeout = self.down_read_timeout_seconds
         timeout = httpx.Timeout(
             None,
             connect=self.http_timeout_seconds,
-            read=None,
+            read=read_timeout,
             write=self.http_timeout_seconds,
             pool=self.http_timeout_seconds,
         )
@@ -871,8 +932,8 @@ def create_transport(config, role, peer_id, on_frame):
         "upload_profiles": config.get("upload_profiles", {}),
         "streaming_up_lanes": config.get("streaming_up_lanes", []),
         "idle_repoll_delay_seconds": config.get("idle_repoll_delay_seconds", {}),
-        "protocol_config": {
-            "auth_mode": config.get("auth_mode", "bearer"),
+            "protocol_config": {
+                "auth_mode": config.get("auth_mode", "bearer"),
             "legacy_custom_headers_enabled": config.get("legacy_custom_headers_enabled", True),
             "binary_media_type": config.get("binary_media_type", "image/webp"),
             "binary_media_types": config.get("binary_media_types", []),
@@ -886,12 +947,14 @@ def create_transport(config, role, peer_id, on_frame):
             "identity_cookie_names": config.get("identity_cookie_names", {}),
             "backoff_initial_delay_seconds": config.get("backoff_initial_delay_seconds", 0.1),
             "backoff_max_delay_seconds": config.get("backoff_max_delay_seconds", 5.0),
-            "backoff_multiplier": config.get("backoff_multiplier", 2.0),
-            "backoff_free_failures": config.get("backoff_free_failures", 1),
-            "heartbeat_interval_seconds": config.get("heartbeat_interval_seconds", 15.0),
-            "interval_jitter_ratio": config.get("interval_jitter_ratio", 0.2),
-            "ws_ping_interval_seconds": config.get("ws_ping_interval_seconds", 20.0),
-            "ws_ping_timeout_seconds": config.get("ws_ping_timeout_seconds", 20.0),
+                "backoff_multiplier": config.get("backoff_multiplier", 2.0),
+                "backoff_free_failures": config.get("backoff_free_failures", 1),
+                "heartbeat_interval_seconds": config.get("heartbeat_interval_seconds", 15.0),
+                "down_read_timeout_seconds": config.get("down_read_timeout_seconds", 10.0),
+                "down_stream_max_session_seconds": config.get("down_stream_max_session_seconds", 60.0),
+                "interval_jitter_ratio": config.get("interval_jitter_ratio", 0.2),
+                "ws_ping_interval_seconds": config.get("ws_ping_interval_seconds", 20.0),
+                "ws_ping_timeout_seconds": config.get("ws_ping_timeout_seconds", 20.0),
         },
     }
     if transport_kind == "ws":

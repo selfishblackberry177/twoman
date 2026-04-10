@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import random
 import sys
 import time
 import urllib.parse
@@ -184,10 +185,11 @@ class LaneQueue(object):
 
 
 class PeerState(object):
-    def __init__(self, role, peer_label, peer_session_id):
+    def __init__(self, role, peer_label, peer_session_id, auth_token=""):
         self.role = role
         self.peer_label = peer_label
         self.peer_session_id = peer_session_id
+        self.auth_token = str(auth_token or "")
         self.last_seen_ms = now_ms()
         self.queues = dict((lane, LaneQueue()) for lane in LANES)
         self.data_pri_streak = 0
@@ -245,8 +247,10 @@ def _normalize_lane_profiles(config):
 class BrokerState(object):
     def __init__(self, config):
         self.config = config
-        self.client_tokens = set(config.get("client_tokens", []))
-        self.agent_tokens = set(config.get("agent_tokens", []))
+        self.client_token_list = [str(token) for token in config.get("client_tokens", []) if str(token)]
+        self.agent_token_list = [str(token) for token in config.get("agent_tokens", []) if str(token)]
+        self.client_tokens = set(self.client_token_list)
+        self.agent_tokens = set(self.agent_token_list)
         self.peer_ttl_ms = int(config.get("peer_ttl_seconds", 90)) * 1000
         self.stream_ttl_ms = int(config.get("stream_ttl_seconds", 300)) * 1000
         self.max_lane_bytes = int(config.get("max_lane_bytes", 16 * 1024 * 1024))
@@ -263,7 +267,7 @@ class BrokerState(object):
         self.streams_by_agent = {}
         self.agent_session_id = ""
         self.agent_peer_label = ""
-        self.next_agent_stream_id = 1
+        self.next_agent_stream_id = random.randint(1, 0xFFFFFFFF)
         self.metrics = {
             "down_responses": dict((lane, 0) for lane in LANES),
             "down_frames": dict((lane, 0) for lane in LANES),
@@ -276,6 +280,18 @@ class BrokerState(object):
         }
         self.lock = asyncio.Lock()
 
+    def _allocate_agent_stream_id_locked(self):
+        stream_id = int(self.next_agent_stream_id) & 0xFFFFFFFF
+        if stream_id <= 0:
+            stream_id = 1
+        start = stream_id
+        while stream_id in self.streams_by_agent:
+            stream_id = 1 if stream_id >= 0xFFFFFFFF else stream_id + 1
+            if stream_id == start:
+                raise RuntimeError("no available agent stream ids")
+        self.next_agent_stream_id = 1 if stream_id >= 0xFFFFFFFF else stream_id + 1
+        return stream_id
+
     async def auth(self, role, token):
         if role == "helper":
             return token in self.client_tokens
@@ -283,17 +299,29 @@ class BrokerState(object):
             return token in self.agent_tokens
         return False
 
-    async def ensure_peer(self, role, peer_label, peer_session_id):
+    def default_token_for_role(self, role):
+        if role == "agent":
+            return self.agent_token_list[0] if self.agent_token_list else "twoman-default-key"
+        if role == "helper":
+            return self.client_token_list[0] if self.client_token_list else "twoman-default-key"
+        return "twoman-default-key"
+
+    def token_for_peer(self, peer):
+        token = str(getattr(peer, "auth_token", "") or "").strip()
+        return token or self.default_token_for_role(peer.role)
+
+    async def ensure_peer(self, role, peer_label, peer_session_id, auth_token=""):
         async with self.lock:
             key = (role, peer_session_id)
             peer = self.peers.get(key)
             if peer is None:
-                peer = PeerState(role, peer_label, peer_session_id)
+                peer = PeerState(role, peer_label, peer_session_id, auth_token=auth_token)
                 self.peers[key] = peer
                 trace("peer online role=%s label=%s session=%s" % (role, peer_label, peer_session_id))
                 record_event("peer_online", role=role, peer_label=peer_label, peer_session_id=peer_session_id)
             peer.touch()
             peer.peer_label = peer_label
+            peer.auth_token = str(auth_token or "")
             if role == "agent":
                 self.agent_session_id = peer_session_id
                 self.agent_peer_label = peer_label
@@ -441,8 +469,7 @@ class BrokerState(object):
             if not agent_session_id or ("agent", agent_session_id) not in self.peers:
                 agent_session_id = ""
             if agent_session_id and not open_error:
-                agent_stream_id = self.next_agent_stream_id
-                self.next_agent_stream_id += 1
+                agent_stream_id = self._allocate_agent_stream_id_locked()
                 stream = StreamState(helper_session_id, helper_peer_label, frame.stream_id, agent_session_id, agent_stream_id)
                 self.streams_by_helper[(helper_session_id, frame.stream_id)] = stream
                 self.streams_by_agent[agent_stream_id] = stream
@@ -495,7 +522,31 @@ class BrokerState(object):
                 Frame(FRAME_OPEN_FAIL, stream_id=frame.stream_id, payload=make_error_payload("hidden agent unavailable")),
             )
             return
-        await self.queue_frame("agent", agent_session_id, LANE_CTL, Frame(FRAME_OPEN, stream_id=agent_stream_id, offset=frame.offset, payload=frame.payload, flags=frame.flags))
+        queued = await self.queue_frame(
+            "agent",
+            agent_session_id,
+            LANE_CTL,
+            Frame(FRAME_OPEN, stream_id=agent_stream_id, offset=frame.offset, payload=frame.payload, flags=frame.flags),
+        )
+        if queued:
+            return
+        trace("open fail stream=%s helper=%s reason=agent-queue-failed" % (frame.stream_id, helper_session_id))
+        record_event(
+            "open_fail",
+            helper_session_id=helper_session_id,
+            helper_stream_id=frame.stream_id,
+            reason="agent-queue-failed",
+        )
+        async with self.lock:
+            stream = self.streams_by_helper.get((helper_session_id, frame.stream_id))
+            if stream is not None:
+                self._drop_stream_locked(stream)
+        await self.queue_frame(
+            "helper",
+            helper_session_id,
+            LANE_CTL,
+            Frame(FRAME_OPEN_FAIL, stream_id=frame.stream_id, payload=make_error_payload("hidden agent unavailable")),
+        )
 
     def _drop_stream_locked(self, stream):
         self.streams_by_helper.pop((stream.helper_session_id, stream.helper_stream_id), None)
@@ -700,7 +751,7 @@ class AsyncBrokerServer(object):
             if not role or not peer_label or not peer_session_id or not await self.state.auth(role, token):
                 await self._send_camouflage_html(writer, 403)
                 return
-            peer = await self.state.ensure_peer(role, peer_label, peer_session_id)
+            peer = await self.state.ensure_peer(role, peer_label, peer_session_id, token)
             if method == "GET" and direction == "down":
                 if lane == LANE_DATA:
                     if role == "helper" and self.streaming_data_down_helper:
@@ -722,7 +773,7 @@ class AsyncBrokerServer(object):
                     raise ValueError("payload too short for iv")
                 iv = body[:16]
                 ciphertext = body[16:]
-                cipher = TransportCipher(self.config.get("agent_tokens", ["twoman-default-key"])[0].encode('utf-8') if role == 'agent' else self.config.get("client_tokens", ["twoman-default-key"])[0].encode('utf-8'), iv)
+                cipher = TransportCipher(token.encode('utf-8'), iv)
                 plaintext_body = cipher.process(ciphertext)
 
                 await self._handle_up(writer, role, peer_session_id, lane, plaintext_body)
@@ -808,7 +859,7 @@ class AsyncBrokerServer(object):
         body = padded
         
         iv = os.urandom(16)
-        token_str = self.state.config.get("agent_tokens", ["twoman-default-key"])[0] if peer.role == 'agent' else self.state.config.get("client_tokens", ["twoman-default-key"])[0]
+        token_str = self.state.token_for_peer(peer)
         cipher = TransportCipher(token_str.encode('utf-8'), iv)
         encrypted_body = iv + cipher.process(body)
 
@@ -863,7 +914,7 @@ class AsyncBrokerServer(object):
                     heartbeat = padded_payload(encode_frame(Frame(FRAME_PING, offset=now_ms())), minimum_size=1024)
                     if stream_cipher is None:
                         iv = os.urandom(16)
-                        token_str = self.state.config.get("agent_tokens", ["twoman-default-key"])[0] if peer.role == 'agent' else self.state.config.get("client_tokens", ["twoman-default-key"])[0]
+                        token_str = self.state.token_for_peer(peer)
                         stream_cipher = TransportCipher(token_str.encode('utf-8'), iv)
                         await self._write_chunk(writer, iv + stream_cipher.process(heartbeat))
                     else:
@@ -887,7 +938,7 @@ class AsyncBrokerServer(object):
                 
                 if stream_cipher is None:
                     iv = os.urandom(16)
-                    token_str = self.state.config.get("agent_tokens", ["twoman-default-key"])[0] if peer.role == 'agent' else self.state.config.get("client_tokens", ["twoman-default-key"])[0]
+                    token_str = self.state.token_for_peer(peer)
                     stream_cipher = TransportCipher(token_str.encode('utf-8'), iv)
                     await self._write_chunk(writer, iv + stream_cipher.process(payload))
                 else:
@@ -934,7 +985,7 @@ class AsyncBrokerServer(object):
         ))
         
         iv = os.urandom(16)
-        token_str = self.state.config.get("agent_tokens", ["twoman-default-key"])[0] if peer.role == 'agent' else self.state.config.get("client_tokens", ["twoman-default-key"])[0]
+        token_str = self.state.token_for_peer(peer)
         cipher = TransportCipher(token_str.encode('utf-8'), iv)
         encrypted_payload = iv + cipher.process(payload)
         
@@ -955,7 +1006,7 @@ class AsyncBrokerServer(object):
         self.state.metrics["down_bytes"][LANE_CTL] += len(payload)
         
         iv = os.urandom(16)
-        token_str = self.state.config.get("agent_tokens", ["twoman-default-key"])[0] if peer.role == 'agent' else self.state.config.get("client_tokens", ["twoman-default-key"])[0]
+        token_str = self.state.token_for_peer(peer)
         cipher = TransportCipher(token_str.encode('utf-8'), iv)
         encrypted_payload = iv + cipher.process(payload)
         
@@ -996,7 +1047,7 @@ class AsyncBrokerServer(object):
                     
                     if stream_cipher is None:
                         iv = os.urandom(16)
-                        token_str = self.state.config.get("agent_tokens", ["twoman-default-key"])[0] if peer.role == 'agent' else self.state.config.get("client_tokens", ["twoman-default-key"])[0]
+                        token_str = self.state.token_for_peer(peer)
                         stream_cipher = TransportCipher(token_str.encode('utf-8'), iv)
                         await self._write_chunk(writer, iv + stream_cipher.process(payload))
                     else:
@@ -1006,7 +1057,7 @@ class AsyncBrokerServer(object):
                     heartbeat = padded_payload(encode_frame(Frame(FRAME_PING, offset=now_ms())), minimum_size=1024)
                     if stream_cipher is None:
                         iv = os.urandom(16)
-                        token_str = self.state.config.get("agent_tokens", ["twoman-default-key"])[0] if peer.role == 'agent' else self.state.config.get("client_tokens", ["twoman-default-key"])[0]
+                        token_str = self.state.token_for_peer(peer)
                         stream_cipher = TransportCipher(token_str.encode('utf-8'), iv)
                         await self._write_chunk(writer, iv + stream_cipher.process(heartbeat))
                     else:

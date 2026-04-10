@@ -64,6 +64,7 @@ SHUTDOWN_STREAM_RESET_GRACE_SECONDS = max(
 )
 DEFAULT_VPN_DNS_SERVERS = ["1.1.1.1", "8.8.8.8"]
 DNS_TYPE_AAAA = 28
+DNS_TYPE_HTTPS = 65
 
 TRACE_ENABLED = os.environ.get("TWOMAN_TRACE", "").strip().lower() in ("1", "true", "yes", "on", "debug", "verbose")
 LOGGER = logging.getLogger("twoman.helper")
@@ -487,7 +488,7 @@ def config_flag(config, key, default=False):
 def vpn_filter_aaaa(config):
     if "vpn_filter_aaaa" in config:
         return config_flag(config, "vpn_filter_aaaa", False)
-    return config_flag(config, "vpn_prefer_ipv4", True)
+    return config_flag(config, "vpn_prefer_ipv4", False)
 
 
 def dns_question_type(payload):
@@ -558,6 +559,15 @@ def with_dns_transaction_id(payload, transaction_id):
     return bytes(transaction_id) + data[2:]
 
 
+def format_error_summary(error):
+    if error is None:
+        return ""
+    text = str(error).strip()
+    if text:
+        return text
+    return error.__class__.__name__
+
+
 def expire_dns_cache(cache, now_monotonic, max_entries):
     expired_keys = [key for key, entry in cache.items() if entry["expires_at"] <= now_monotonic]
     for key in expired_keys:
@@ -601,9 +611,11 @@ async def tcp_dns_query(runtime, host, port, payload):
 async def resolve_dns_query(runtime, target_host, payload):
     cache_key = dns_query_cache_key(payload)
     transaction_id = dns_transaction_id(payload)
-    if vpn_filter_aaaa(runtime.config) and dns_question_type(payload) == DNS_TYPE_AAAA:
-        trace("dns synthetic nodata type=AAAA bytes=%s" % len(payload))
-        record_event("dns_query_synthesized", query_type="AAAA", reason="ipv4-preferred")
+    question_type = dns_question_type(payload)
+    if vpn_filter_aaaa(runtime.config) and question_type in {DNS_TYPE_AAAA, DNS_TYPE_HTTPS}:
+        query_type = "AAAA" if question_type == DNS_TYPE_AAAA else "HTTPS"
+        trace("dns synthetic nodata type=%s bytes=%s" % (query_type, len(payload)))
+        record_event("dns_query_synthesized", query_type=query_type, reason="ipv4-preferred")
         return with_dns_transaction_id(synthesize_empty_dns_response(payload), transaction_id)
     owner = False
     query_task = None
@@ -638,20 +650,48 @@ async def _resolve_dns_query_uncached(runtime, target_host, payload):
         if fallback_host not in upstream_hosts:
             upstream_hosts.append(fallback_host)
     last_error = None
-    async with runtime.dns_semaphore:
-        for upstream_host in upstream_hosts:
-            try:
+    tasks = []
+    try:
+        async with runtime.dns_semaphore:
+            async def query_upstream(upstream_host):
                 response = await tcp_dns_query(runtime, upstream_host, 53, payload)
-                async with runtime.dns_cache_lock:
-                    expire_dns_cache(runtime.dns_cache, time.monotonic(), runtime.dns_cache_max_entries)
-                    runtime.dns_cache[dns_query_cache_key(payload)] = {
-                        "expires_at": time.monotonic() + runtime.dns_cache_ttl_seconds,
-                        "response": response,
-                    }
-                trace("dns udp relay target=%s upstream=%s bytes=%s" % (target_host, upstream_host, len(response)))
-                return response
-            except Exception as error:
-                last_error = error
+                return upstream_host, response
+
+            tasks = [asyncio.create_task(query_upstream(upstream_host)) for upstream_host in upstream_hosts]
+            while tasks:
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                tasks = list(pending)
+                for completed in done:
+                    try:
+                        upstream_host, response = completed.result()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        last_error = error
+                        trace(
+                            "dns udp relay upstream error target=%s error=%s"
+                            % (target_host, format_error_summary(error))
+                        )
+                        continue
+                    for pending_task in tasks:
+                        pending_task.cancel()
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                        tasks = []
+                    async with runtime.dns_cache_lock:
+                        expire_dns_cache(runtime.dns_cache, time.monotonic(), runtime.dns_cache_max_entries)
+                        runtime.dns_cache[dns_query_cache_key(payload)] = {
+                            "expires_at": time.monotonic() + runtime.dns_cache_ttl_seconds,
+                            "response": response,
+                        }
+                    trace("dns udp relay target=%s upstream=%s bytes=%s" % (target_host, upstream_host, len(response)))
+                    return response
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
     raise last_error or RuntimeError("dns query failed")
 
 
@@ -720,7 +760,7 @@ class SocksUdpAssociation(asyncio.DatagramProtocol):
             target_host,
             dns_question_type(payload),
             len(payload),
-            last_error,
+            format_error_summary(last_error),
         )
 
 
@@ -1073,11 +1113,14 @@ class HelperRuntime(object):
         self.dns_cache = {}
         self.dns_inflight = {}
         self.dns_cache_lock = asyncio.Lock()
+        self.active_connection_tasks = set()
+        self.active_connection_writers = set()
 
     async def start(self):
         await self.transport.start()
 
     async def stop(self):
+        await self.shutdown_active_connections()
         await self._reset_active_streams_for_shutdown()
         await self.transport.stop()
 
@@ -1098,8 +1141,50 @@ class HelperRuntime(object):
         self.streams.pop(stream_id, None)
         record_event("stream_released", stream_id=stream_id)
 
+    def register_connection(self, task, writer):
+        if task is not None:
+            self.active_connection_tasks.add(task)
+        if writer is not None:
+            self.active_connection_writers.add(writer)
+
+    def unregister_connection(self, task, writer):
+        if task is not None:
+            self.active_connection_tasks.discard(task)
+        if writer is not None:
+            self.active_connection_writers.discard(writer)
+
     def _record_transport_event(self, event):
         record_event(**event)
+
+    async def shutdown_active_connections(self):
+        active_writers = list(self.active_connection_writers)
+        active_tasks = [task for task in self.active_connection_tasks if task is not asyncio.current_task()]
+        if not active_writers and not active_tasks:
+            return
+        record_event(
+            "helper_shutdown_connections",
+            writer_count=len(active_writers),
+            task_count=len(active_tasks),
+        )
+        for writer in active_writers:
+            with contextlib.suppress(Exception):
+                writer.close()
+        for task in active_tasks:
+            task.cancel()
+
+        async def _wait_writer_closed(writer):
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+
+        async def _wait_task_cancelled(task):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.wait_for(task, timeout=1.0)
+
+        await asyncio.gather(
+            *[_wait_writer_closed(writer) for writer in active_writers],
+            *[_wait_task_cancelled(task) for task in active_tasks],
+            return_exceptions=True,
+        )
 
     async def _reset_active_streams_for_shutdown(self):
         active_streams = [stream for stream in self.streams.values() if not stream.closed]
@@ -1128,6 +1213,31 @@ class HelperRuntime(object):
 
 async def relay_stream(runtime, stream, reader, writer, initial_payload=b"", connected_response=None, open_stream=True):
     failure = None
+    child_tasks = []
+
+    async def wait_for_drain(write_start, write_end):
+        drain_task = asyncio.create_task(writer.drain())
+        try:
+            while True:
+                try:
+                    await asyncio.wait_for(asyncio.shield(drain_task), timeout=5.0)
+                    return
+                except asyncio.TimeoutError:
+                    trace(
+                        "remote drain waiting stream=%s local_range=%s-%s recv_offset=%s queue=%s" % (
+                            stream.stream_id,
+                            write_start,
+                            write_end,
+                            stream.recv_offset,
+                            stream.recv_queue.qsize(),
+                        )
+                    )
+        finally:
+            if not drain_task.done():
+                drain_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await drain_task
+
     try:
         if open_stream:
             await stream.open()
@@ -1186,21 +1296,7 @@ async def relay_stream(runtime, stream, reader, writer, initial_payload=b"", con
                     )
                 )
                 writer.write(payload)
-                drain_task = asyncio.create_task(writer.drain())
-                while True:
-                    try:
-                        await asyncio.wait_for(asyncio.shield(drain_task), timeout=5.0)
-                        break
-                    except asyncio.TimeoutError:
-                        trace(
-                            "remote drain waiting stream=%s local_range=%s-%s recv_offset=%s queue=%s" % (
-                                stream.stream_id,
-                                write_start,
-                                write_end,
-                                stream.recv_offset,
-                                stream.recv_queue.qsize(),
-                            )
-                        )
+                await wait_for_drain(write_start, write_end)
                 stream.local_write_bytes = write_end
                 stream.local_write_count += 1
                 trace(
@@ -1214,8 +1310,8 @@ async def relay_stream(runtime, stream, reader, writer, initial_payload=b"", con
                 )
                 await stream.grant_window(len(payload))
 
-        tasks = [asyncio.create_task(local_to_remote()), asyncio.create_task(remote_to_local())]
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        child_tasks = [asyncio.create_task(local_to_remote()), asyncio.create_task(remote_to_local())]
+        done, pending = await asyncio.wait(child_tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
         for task in done:
@@ -1223,13 +1319,22 @@ async def relay_stream(runtime, stream, reader, writer, initial_payload=b"", con
                 error = task.exception()
                 if error:
                     raise error
+    except asyncio.CancelledError as error:
+        failure = error
+        raise
     except Exception as error:
         failure = error
         raise
     finally:
+        if child_tasks:
+            for task in child_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*child_tasks, return_exceptions=True)
         if failure is not None:
             with contextlib.suppress(Exception):
-                await stream.reset(str(failure))
+                reason = "relay cancelled" if isinstance(failure, asyncio.CancelledError) else str(failure)
+                await stream.reset(reason)
         elif not stream.closed:
             with contextlib.suppress(Exception):
                 await stream.finish()
@@ -1300,6 +1405,7 @@ async def handle_socks(runtime, reader, writer):
             version, method_count = (await reader.readexactly(2))
         except asyncio.IncompleteReadError as error:
             if not error.partial:
+                await close_writer_quietly(writer)
                 return
             raise
         if version != 5:
@@ -1308,6 +1414,7 @@ async def handle_socks(runtime, reader, writer):
         if b"\x00" not in methods:
             writer.write(b"\x05\xff")
             await writer.drain()
+            await close_writer_quietly(writer)
             return
         writer.write(b"\x05\x00")
         await writer.drain()
@@ -1333,6 +1440,7 @@ async def handle_socks(runtime, reader, writer):
             await writer.drain()
             trace("socks udp association bind=%s:%s target=%s:%s" % (bind_host, bind_port, host, port))
             await reader.read()
+            await close_writer_quietly(writer)
             return
         if command != 1:
             raise RuntimeError("unsupported socks command")
@@ -1350,8 +1458,18 @@ async def handle_socks(runtime, reader, writer):
                 await stream.reset("socks failure")
             await runtime.release_stream(stream.stream_id)
         await close_writer_quietly(writer)
+    finally:
         if udp_association is not None:
             udp_association.close()
+
+
+async def handle_client_connection(runtime, handler, reader, writer):
+    task = asyncio.current_task()
+    runtime.register_connection(task, writer)
+    try:
+        await handler(runtime, reader, writer)
+    finally:
+        runtime.unregister_connection(task, writer)
 
 
 async def main_async(config):
@@ -1407,12 +1525,12 @@ async def main_async(config):
         http_servers, active_http_port = await start_bound_servers(
             http_listen_hosts,
             http_port,
-            lambda r, w: handle_http(runtime, r, w),
+            lambda r, w: handle_client_connection(runtime, handle_http, r, w),
         )
         socks_servers, active_socks_port = await start_bound_servers(
             socks_listen_hosts,
             socks_port,
-            lambda r, w: handle_socks(runtime, r, w),
+            lambda r, w: handle_client_connection(runtime, handle_socks, r, w),
         )
         write_listen_state(
             {

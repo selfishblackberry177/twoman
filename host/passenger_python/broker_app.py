@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import queue
+import random
 import sys
 import threading
 import time
@@ -237,7 +238,7 @@ class BrokerState(object):
         self.streams_by_agent = {}
         self.agent_session_id = ""
         self.agent_peer_label = ""
-        self.next_agent_stream_id = 1
+        self.next_agent_stream_id = random.randint(1, 0xFFFFFFFF)
         self.lock = threading.Lock()
         self.metrics = {
             "down_responses": dict((lane, 0) for lane in LANES),
@@ -249,6 +250,18 @@ class BrokerState(object):
             "up_frames": dict((lane, 0) for lane in LANES),
             "up_bytes": dict((lane, 0) for lane in LANES),
         }
+
+    def _allocate_agent_stream_id_locked(self):
+        stream_id = int(self.next_agent_stream_id) & 0xFFFFFFFF
+        if stream_id <= 0:
+            stream_id = 1
+        start = stream_id
+        while stream_id in self.streams_by_agent:
+            stream_id = 1 if stream_id >= 0xFFFFFFFF else stream_id + 1
+            if stream_id == start:
+                raise RuntimeError("no available agent stream ids")
+        self.next_agent_stream_id = 1 if stream_id >= 0xFFFFFFFF else stream_id + 1
+        return stream_id
 
     def auth(self, role, token):
         if role == "helper":
@@ -413,8 +426,7 @@ class BrokerState(object):
             if not agent_session_id or ("agent", agent_session_id) not in self.peers:
                 agent_session_id = ""
             if agent_session_id and not open_error:
-                agent_stream_id = self.next_agent_stream_id
-                self.next_agent_stream_id += 1
+                agent_stream_id = self._allocate_agent_stream_id_locked()
                 stream = StreamState(helper_session_id, helper_peer_label, frame.stream_id, agent_session_id, agent_stream_id)
                 self.streams_by_helper[(helper_session_id, frame.stream_id)] = stream
                 self.streams_by_agent[agent_stream_id] = stream

@@ -70,7 +70,12 @@ fn live_profile() -> Option<ClientProfile> {
 }
 
 fn curl_via_proxy(proxy: &str) -> String {
-    for url in ["https://api.ipify.org", "http://api.ipify.org"] {
+    for url in [
+        "https://api.ipify.org",
+        "http://api.ipify.org",
+        "https://example.com",
+        "http://example.com",
+    ] {
         let output = Command::new("curl")
             .args(["--max-time", "45", "--proxy", proxy, url])
             .output()
@@ -86,7 +91,12 @@ fn curl_via_proxy(proxy: &str) -> String {
 }
 
 fn curl_direct() -> String {
-    for url in ["https://api.ipify.org", "http://api.ipify.org"] {
+    for url in [
+        "https://api.ipify.org",
+        "http://api.ipify.org",
+        "https://example.com",
+        "http://example.com",
+    ] {
         let output = Command::new("curl")
             .args(["--max-time", "45", url])
             .output()

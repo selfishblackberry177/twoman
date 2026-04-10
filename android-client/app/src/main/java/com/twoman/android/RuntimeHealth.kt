@@ -12,9 +12,10 @@ object RuntimeHealth {
         val proxyServiceRunning = isServiceRunning(context, ProxyService::class.java.name)
         val vpnServiceRunning = isServiceRunning(context, TunnelVpnService::class.java.name)
         val proxyProcessRunning = isProcessRunning(context, "${context.packageName}:proxy")
-        val anyServiceRunning = proxyServiceRunning || vpnServiceRunning || proxyProcessRunning
+        val anyServiceRunning = proxyServiceRunning || vpnServiceRunning
         val anyPortListening = isListening(status.socksPort) || isListening(status.httpPort)
         val anyRuntimeRunning = anyServiceRunning || anyPortListening
+        val proxyProcessResidual = proxyProcessRunning && !anyRuntimeRunning
         val statusAgeMs = System.currentTimeMillis() - status.updatedAtEpochMs
         val withinStartupGrace = status.updatedAtEpochMs != 0L && statusAgeMs <= STARTUP_GRACE_MS
         val stoppingMessage = context.getString(R.string.status_stopping_message)
@@ -23,6 +24,12 @@ object RuntimeHealth {
         if (status.message == stoppingMessage) {
             return if (anyRuntimeRunning) {
                 status.copy(running = true)
+            } else if (proxyProcessResidual) {
+                status.copy(
+                    running = false,
+                    mode = "stopped",
+                    message = "",
+                )
             } else {
                 status.copy(
                     running = false,
@@ -35,6 +42,12 @@ object RuntimeHealth {
         if (!status.running) {
             return if (!anyRuntimeRunning) {
                 status
+            } else if (proxyProcessResidual) {
+                status.copy(
+                    running = false,
+                    mode = "stopped",
+                    message = "",
+                )
             } else if (status.message == startingMessage && withinStartupGrace) {
                 status
             } else {
