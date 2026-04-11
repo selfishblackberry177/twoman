@@ -1494,6 +1494,13 @@ async def main_async(config):
         socks_listen_hosts = ["127.0.0.1"]
     http_port = int(config.get("http_listen_port", 8080))
     socks_port = int(config.get("socks_listen_port", 1080))
+    http2_config = config.get("http2_enabled", {})
+    if isinstance(http2_config, dict):
+        http2_ctl_enabled = bool(http2_config.get("ctl", False))
+        http2_data_enabled = bool(http2_config.get("data", False))
+    else:
+        http2_ctl_enabled = bool(http2_config)
+        http2_data_enabled = bool(http2_config)
     LOGGER.info(
         "helper starting transport=%s http_hosts=%s socks_hosts=%s http_port=%s socks_port=%s trace=%s http2_ctl=%s http2_data=%s peer_id=%s transport_session=%s",
         config.get("transport", "http"),
@@ -1502,8 +1509,8 @@ async def main_async(config):
         http_port,
         socks_port,
         TRACE_ENABLED,
-        bool(config.get("http2_enabled", {}).get("ctl", False)),
-        bool(config.get("http2_enabled", {}).get("data", False)),
+        http2_ctl_enabled,
+        http2_data_enabled,
         runtime.peer_id,
         runtime.transport.peer_session_id,
     )
