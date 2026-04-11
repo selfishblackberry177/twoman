@@ -1,12 +1,27 @@
 # Release Checklist
 
-- Verify the repo deploy commands still work:
+- Verify the fast installer path still works:
+  - `scripts/install_twoman.sh`
+  - `sudo twoman verify`
+  - `sudo twoman show-config`
+- Verify the repo deploy commands still work when used manually:
   - `scripts/deploy_host.sh`
   - `scripts/deploy_hidden_server.sh`
+  - `scripts/install_hidden_server_local.sh`
   - `scripts/start_client.sh`
+- Verify the focused CI checks pass locally:
+  - `python3 -m unittest tests.test_transport_proxy tests.test_twoman_control_cpanel tests.test_twoman_control_installer tests.test_twoman_control_manager tests.test_desktop_client_tui`
+  - `bash tests/run_e2e.sh`
+  - `bash tests/run_e2e_node_http.sh`
+  - `bash tests/run_desktop_client_e2e.sh`
+- Rebuild release artifacts when shared runtime files changed:
+  - Android APK/AAB
+  - Linux desktop bundles
+  - Windows desktop bundles
 - Verify no real tokens are present in tracked files
 - Verify `host/storage/` is empty or absent
 - Verify `TWOMAN_TRACE` is not enabled in production
 - Verify broker health responds on the configured public base URI, for example `https://host.example.com/<public-base-uri>/health`
 - Verify SOCKS egress through the helper
 - Verify HTTP egress through the helper
+- Update `README.md`, `docs/EASY_DEPLOY.md`, and the release note under `docs/releases/`

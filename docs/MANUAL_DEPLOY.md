@@ -2,6 +2,8 @@
 
 Use this guide when the scripted install path fails or when you want to inspect each step manually.
 
+If you do not need that level of control, start with [docs/EASY_DEPLOY.md](docs/EASY_DEPLOY.md).
+
 ## 1. cPanel host
 
 Target layout under your public base path, for example `/home/<user>/public_html/rahkar`:
@@ -109,6 +111,7 @@ Example:
 ```json
 {
   "broker_base_url": "https://your-host.example/api/v1/telemetry",
+  "upstream_proxy_url": "socks5://127.0.0.1:1280",
   "agent_token": "replace-with-agent-token",
   "http_timeout_seconds": 30,
   "flush_delay_seconds": 0.01,
@@ -133,6 +136,9 @@ Example:
   }
 }
 ```
+
+`upstream_proxy_url` is optional. Set it only when the hidden server must reach
+the public host through a local upstream proxy such as `wireproxy`.
 
 Use HTTP/1.1 for the hidden-agent control lane by default on the current public
 Passenger path. In live validation, `ctl=true` on the hidden agent caused
@@ -213,6 +219,7 @@ Example:
 ```json
 {
   "broker_base_url": "https://your-host.example/api/v1/telemetry",
+  "upstream_proxy_url": "",
   "client_token": "replace-with-client-token",
   "listen_host": "127.0.0.1",
   "http_listen_port": 18092,

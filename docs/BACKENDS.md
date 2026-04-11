@@ -16,6 +16,13 @@ These backend families still target the same product shape:
 - final path:
   `client -> public host -> hidden server -> internet`
 
+Optional reachability note:
+
+- the hidden server may use a local upstream proxy such as WireProxy/WARP when
+  it cannot reach the public host directly
+- that changes only the hidden-to-host route; it does not change desktop or
+  Android client requirements
+
 ## Backend Families
 
 ### `cpanel_runtime_bridge`

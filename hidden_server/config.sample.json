@@ -1,5 +1,6 @@
 {
   "broker_base_url": "https://host.example.com/api/v1/telemetry",
+  "upstream_proxy_url": "",
   "agent_token": "replace-with-agent-token",
   "auth_mode": "bearer",
   "legacy_custom_headers_enabled": false,

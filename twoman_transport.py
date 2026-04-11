@@ -67,6 +67,7 @@ class LaneTransport(object):
         streaming_up_lanes=None,
         idle_repoll_delay_seconds=None,
         protocol_config=None,
+        upstream_proxy_url=None,
     ):
         self.base_url = base_url.rstrip("/")
         self.token = token
@@ -91,6 +92,7 @@ class LaneTransport(object):
         self.streaming_up_lanes = self._normalize_streaming_up_lanes(streaming_up_lanes)
         self.idle_repoll_delay_seconds = self._normalize_idle_repoll_delay_seconds(idle_repoll_delay_seconds)
         self.protocol_config = dict(protocol_config or {})
+        self.upstream_proxy_url = str(upstream_proxy_url or "").strip() or None
         self.down_read_timeout_seconds = self._normalize_down_read_timeout_seconds()
         self.down_stream_max_session_seconds = self._normalize_down_stream_max_session_seconds()
         self.route_provider = RouteProvider.from_config(self.base_url, self.protocol_config)
@@ -584,6 +586,7 @@ class LaneTransport(object):
             timeout=timeout,
             limits=limits,
             verify=self.verify_tls,
+            proxy=self.upstream_proxy_url,
         )
 
     def _validate_ack_response(self, response):
@@ -664,6 +667,7 @@ class WebSocketLaneTransport(object):
         streaming_up_lanes=None,
         idle_repoll_delay_seconds=None,
         protocol_config=None,
+        upstream_proxy_url=None,
     ):
         del http2_enabled
         del upload_profiles
@@ -681,6 +685,7 @@ class WebSocketLaneTransport(object):
         self.verify_tls = bool(verify_tls)
         self.collapse_data_lanes = bool(collapse_data_lanes)
         self.protocol_config = dict(protocol_config or {})
+        self.upstream_proxy_url = str(upstream_proxy_url or "").strip() or None
         self.route_provider = RouteProvider.from_config(self.base_url, self.protocol_config)
         self.random = random.Random()
         self.queues = dict((lane, AsyncFrameQueue()) for lane in LANES)
@@ -933,8 +938,9 @@ def create_transport(config, role, peer_id, on_frame):
         "upload_profiles": config.get("upload_profiles", {}),
         "streaming_up_lanes": config.get("streaming_up_lanes", []),
         "idle_repoll_delay_seconds": config.get("idle_repoll_delay_seconds", {}),
-            "protocol_config": {
-                "auth_mode": config.get("auth_mode", "bearer"),
+        "upstream_proxy_url": str(config.get("upstream_proxy_url", "")).strip() or None,
+        "protocol_config": {
+            "auth_mode": config.get("auth_mode", "bearer"),
             "legacy_custom_headers_enabled": config.get("legacy_custom_headers_enabled", True),
             "binary_media_type": config.get("binary_media_type", "image/webp"),
             "binary_media_types": config.get("binary_media_types", []),
@@ -948,14 +954,14 @@ def create_transport(config, role, peer_id, on_frame):
             "identity_cookie_names": config.get("identity_cookie_names", {}),
             "backoff_initial_delay_seconds": config.get("backoff_initial_delay_seconds", 0.1),
             "backoff_max_delay_seconds": config.get("backoff_max_delay_seconds", 5.0),
-                "backoff_multiplier": config.get("backoff_multiplier", 2.0),
-                "backoff_free_failures": config.get("backoff_free_failures", 1),
-                "heartbeat_interval_seconds": config.get("heartbeat_interval_seconds", 15.0),
-                "down_read_timeout_seconds": config.get("down_read_timeout_seconds", 10.0),
-                "down_stream_max_session_seconds": config.get("down_stream_max_session_seconds", 60.0),
-                "interval_jitter_ratio": config.get("interval_jitter_ratio", 0.2),
-                "ws_ping_interval_seconds": config.get("ws_ping_interval_seconds", 20.0),
-                "ws_ping_timeout_seconds": config.get("ws_ping_timeout_seconds", 20.0),
+            "backoff_multiplier": config.get("backoff_multiplier", 2.0),
+            "backoff_free_failures": config.get("backoff_free_failures", 1),
+            "heartbeat_interval_seconds": config.get("heartbeat_interval_seconds", 15.0),
+            "down_read_timeout_seconds": config.get("down_read_timeout_seconds", 10.0),
+            "down_stream_max_session_seconds": config.get("down_stream_max_session_seconds", 60.0),
+            "interval_jitter_ratio": config.get("interval_jitter_ratio", 0.2),
+            "ws_ping_interval_seconds": config.get("ws_ping_interval_seconds", 20.0),
+            "ws_ping_timeout_seconds": config.get("ws_ping_timeout_seconds", 20.0),
         },
     }
     if transport_kind == "ws":

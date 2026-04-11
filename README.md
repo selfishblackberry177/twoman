@@ -4,6 +4,12 @@
   <img src="docs/assets/logo-homepage.png" alt="Twoman logo" width="160" />
 </p>
 
+<p align="center">
+  <a href="https://github.com/ShahabSL/twoman/actions/workflows/ci.yml"><img src="https://github.com/ShahabSL/twoman/actions/workflows/ci.yml/badge.svg" alt="CI status" /></a>
+  <a href="https://github.com/ShahabSL/twoman/releases"><img src="https://img.shields.io/github/v/release/ShahabSL/twoman" alt="Latest release" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license" /></a>
+</p>
+
 Twoman is a host-preserving relay for shared cPanel hosting and managed
 CloudLinux app runtimes.
 
@@ -19,6 +25,51 @@ Compatibility note:
 - the public broker base URI is configurable end-to-end; deployments can mount the service under paths such as `/api/v1/telemetry` or `/wp-content/sync`
 - route templates are now relative to that configured base URI by default
 
+## Easy Deploy
+
+The main path is the Linux installer. Run it on the Linux machine that
+should become the hidden Twoman server. The installer:
+
+- asks only for the public host domain and cPanel credentials
+- checks that the Linux machine can actually reach the host
+- detects which public-host backends your cPanel account supports
+- recommends the best backend automatically
+- generates Persian-style default names and paths, while still letting you override them
+- can route the hidden server through local WARP WireProxy when the Linux machine cannot reach the host directly
+- deploys the public broker and installs the hidden agent on the same machine
+- prints the final Twoman import text and installs a `twoman` management command
+
+From a cloned repo:
+
+```bash
+sudo bash scripts/install_twoman.sh
+```
+
+From GitHub directly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ShahabSL/twoman/main/scripts/install_twoman.sh | sudo bash
+```
+
+Fully unattended installs are also supported through `twoman install` flags
+after bootstrap. See [docs/EASY_DEPLOY.md](docs/EASY_DEPLOY.md) for the
+non-interactive example.
+
+After deployment:
+
+- `sudo twoman` opens the management TUI
+- `sudo twoman verify` runs a non-interactive health check
+- `sudo twoman logs` prints the hidden-agent journal tail
+- `sudo twoman show-config` prints the client import text again
+- `sudo twoman restart-upstream-proxy` restarts managed WireProxy when that route is enabled
+
+Easy-deploy guide:
+- [docs/EASY_DEPLOY.md](docs/EASY_DEPLOY.md)
+
+If this Linux machine can only reach the public host through WARP, answer `yes`
+when the installer asks about a local WARP / upstream proxy and keep the default
+`socks5://127.0.0.1:1280` when you already run `wireproxy.service`.
+
 ## Status
 
 This repository contains the current public implementation.
@@ -32,6 +83,19 @@ What it is good at:
 What it is not:
 - a full-speed VPN replacement
 - a general-purpose high-throughput tunnel on hostile shared hosting
+
+## Documentation
+
+Start here:
+
+- [docs/EASY_DEPLOY.md](docs/EASY_DEPLOY.md): one-command Linux install, optional WARP route, `twoman` management command
+- [docs/MANUAL_DEPLOY.md](docs/MANUAL_DEPLOY.md): repo-level host, hidden-server, and helper deployment
+- [docs/BACKENDS.md](docs/BACKENDS.md): backend families and when each one fits
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): runtime layout, lanes, and broker behavior
+- [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md): release validation and packaging checklist
+- [docs/releases/](docs/releases): versioned release notes
+- [CONTRIBUTING.md](CONTRIBUTING.md): contribution and validation guidance
+- [SECURITY.md](SECURITY.md): vulnerability reporting guidance
 
 ## Repository Layout
 
@@ -93,11 +157,9 @@ Today:
 This is intentional. Different host classes expose different runtime models,
 and Twoman does not force them into one fragile host implementation.
 
-## Quick Start
+## Manual Deployment
 
-### One-command deployment
-
-Twoman now ships with repo-level scripts for each side:
+Twoman still ships with repo-level scripts for each side:
 
 - `scripts/deploy_host.sh`: uploads the cPanel host files, writes `host/app/config.php`, restarts the broker, and verifies health
 - `scripts/deploy_hidden_server.sh`: uploads the hidden agent files, writes `config.json`, installs `systemd` units, enables the watchdog, and restarts the agent
@@ -150,6 +212,9 @@ Override that location with `TWOMAN_LOG_PATH=/path/to/helper.log`.
 Default helper ports:
 - HTTP proxy: `127.0.0.1:18092`
 - SOCKS5 proxy: `127.0.0.1:11092`
+
+Use this path when you need to inspect or override each stage manually:
+- [docs/MANUAL_DEPLOY.md](docs/MANUAL_DEPLOY.md)
 
 ## Requirements
 
@@ -219,5 +284,9 @@ Client crash and runtime logs:
 
 - Do not commit real `client_token` or `agent_token` values.
 - Do not commit `host/app/config.php`.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
 - Do not commit runtime data under `host/storage/`.
 - Rotate tokens if they have ever been shared.

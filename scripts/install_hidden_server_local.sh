@@ -9,17 +9,34 @@ require_env() {
   fi
 }
 
-require_env TWOMAN_SERVER_HOST
-require_env TWOMAN_SERVER_USER
+require_env TWOMAN_REPO_ROOT
 require_env TWOMAN_BROKER_BASE_URL
 require_env TWOMAN_AGENT_TOKEN
 
-TWOMAN_SERVER_PORT="${TWOMAN_SERVER_PORT:-22}"
-TWOMAN_SERVER_DIR="${TWOMAN_SERVER_DIR:-/opt/twoman}"
+ensure_python_venv_support() {
+  local probe_dir
+  probe_dir="$(mktemp -d)"
+  if python3 -m venv "${probe_dir}/venv" >/dev/null 2>&1; then
+    rm -rf "${probe_dir}"
+    return 0
+  fi
+  rm -rf "${probe_dir}"
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv
+    return 0
+  fi
+  echo 'unable to bootstrap python virtual environments automatically' >&2
+  exit 1
+}
+
+TWOMAN_INSTALL_ROOT="${TWOMAN_INSTALL_ROOT:-/opt/twoman}"
 TWOMAN_AGENT_PEER_ID="${TWOMAN_AGENT_PEER_ID:-agent-main}"
-TWOMAN_SERVER_PASSWORD="${TWOMAN_SERVER_PASSWORD:-}"
-TWOMAN_SERVER_SSH_KEY="${TWOMAN_SERVER_SSH_KEY:-}"
 TWOMAN_AGENT_SERVICE_NAME="${TWOMAN_AGENT_SERVICE_NAME:-twoman-agent.service}"
+TWOMAN_AGENT_SERVICE_USER="${TWOMAN_AGENT_SERVICE_USER:-twoman}"
+TWOMAN_AGENT_SERVICE_GROUP="${TWOMAN_AGENT_SERVICE_GROUP:-twoman}"
+TWOMAN_WATCHDOG_SERVICE_NAME="${TWOMAN_WATCHDOG_SERVICE_NAME:-twoman-agent-watchdog.service}"
+TWOMAN_WATCHDOG_TIMER_NAME="${TWOMAN_WATCHDOG_TIMER_NAME:-twoman-agent-watchdog.timer}"
 TWOMAN_VERIFY_TLS="${TWOMAN_VERIFY_TLS:-true}"
 TWOMAN_HTTP2_CTL="${TWOMAN_HTTP2_CTL:-false}"
 TWOMAN_HTTP2_DATA="${TWOMAN_HTTP2_DATA:-false}"
@@ -34,7 +51,7 @@ TWOMAN_DATA_UP_MAX_BATCH_BYTES="${TWOMAN_DATA_UP_MAX_BATCH_BYTES:-131072}"
 TWOMAN_DATA_UP_FLUSH_DELAY_SECONDS="${TWOMAN_DATA_UP_FLUSH_DELAY_SECONDS:-0.006}"
 TWOMAN_OPEN_CONNECT_TIMEOUT_SECONDS="${TWOMAN_OPEN_CONNECT_TIMEOUT_SECONDS:-12}"
 TWOMAN_PREFER_IPV4="${TWOMAN_PREFER_IPV4:-true}"
-TWOMAN_DISABLE_IPV6_ORIGIN="${TWOMAN_DISABLE_IPV6_ORIGIN:-false}"
+TWOMAN_DISABLE_IPV6_ORIGIN="${TWOMAN_DISABLE_IPV6_ORIGIN:-true}"
 TWOMAN_HAPPY_EYEBALLS_DELAY_SECONDS="${TWOMAN_HAPPY_EYEBALLS_DELAY_SECONDS:-0.25}"
 TWOMAN_UPSTREAM_PROXY_URL="${TWOMAN_UPSTREAM_PROXY_URL:-}"
 TWOMAN_UPSTREAM_PROXY_LABEL="${TWOMAN_UPSTREAM_PROXY_LABEL:-}"
@@ -45,8 +62,6 @@ if [ -z "${TWOMAN_ROUTE_TEMPLATE:-}" ]; then
   TWOMAN_ROUTE_TEMPLATE='/{lane}/{direction}'
 fi
 TWOMAN_HEALTH_TEMPLATE="${TWOMAN_HEALTH_TEMPLATE:-/health}"
-TWOMAN_AGENT_SERVICE_USER="${TWOMAN_AGENT_SERVICE_USER:-twoman}"
-TWOMAN_AGENT_SERVICE_GROUP="${TWOMAN_AGENT_SERVICE_GROUP:-twoman}"
 
 STREAMING_UP_JSON="[]"
 if [ -n "${TWOMAN_STREAMING_UP_LANES}" ]; then
@@ -74,26 +89,15 @@ if [ "${TWOMAN_UPSTREAM_PROXY_LABEL}" = "wireproxy" ]; then
   SYSTEMD_WANTS="Wants=network-online.target wireproxy.service"
 fi
 
-SSH_OPTS=(-p "${TWOMAN_SERVER_PORT}" -o StrictHostKeyChecking=no)
-SCP_OPTS=(-P "${TWOMAN_SERVER_PORT}" -o StrictHostKeyChecking=no)
-if [ -n "${TWOMAN_SERVER_SSH_KEY}" ]; then
-  SSH_OPTS+=(-i "${TWOMAN_SERVER_SSH_KEY}")
-  SCP_OPTS+=(-i "${TWOMAN_SERVER_SSH_KEY}")
-fi
-SCP_CMD=(scp "${SCP_OPTS[@]}")
-SSH_CMD=(ssh "${SSH_OPTS[@]}")
-if [ -n "${TWOMAN_SERVER_PASSWORD}" ]; then
-  SCP_CMD=(sshpass -p "${TWOMAN_SERVER_PASSWORD}" "${SCP_CMD[@]}")
-  SSH_CMD=(sshpass -p "${TWOMAN_SERVER_PASSWORD}" "${SSH_CMD[@]}")
-fi
+mkdir -p "${TWOMAN_INSTALL_ROOT}"
+install -m 0755 -d "${TWOMAN_INSTALL_ROOT}/logs"
 
-echo "Creating remote directory..."
-"${SSH_CMD[@]}" "${TWOMAN_SERVER_USER}@${TWOMAN_SERVER_HOST}" "mkdir -p '${TWOMAN_SERVER_DIR}/systemd'"
+echo "Preparing Twoman hidden-server files in ${TWOMAN_INSTALL_ROOT}..."
 
-echo "Uploading agent files..."
-"${SCP_CMD[@]}" \
+for source in \
   requirements.txt \
   runtime_diagnostics.py \
+  twoman_crypto.py \
   twoman_http.py \
   twoman_protocol.py \
   twoman_transport.py \
@@ -101,8 +105,11 @@ echo "Uploading agent files..."
   hidden_server/agent_watchdog.py \
   hidden_server/install_watchdog.sh \
   hidden_server/systemd/twoman-agent-watchdog.service \
-  hidden_server/systemd/twoman-agent-watchdog.timer \
-  "${TWOMAN_SERVER_USER}@${TWOMAN_SERVER_HOST}:${TWOMAN_SERVER_DIR}/"
+  hidden_server/systemd/twoman-agent-watchdog.timer
+do
+  install -m 0644 "${TWOMAN_REPO_ROOT}/${source}" "${TWOMAN_INSTALL_ROOT}/$(basename "${source}")"
+done
+chmod 0755 "${TWOMAN_INSTALL_ROOT}/install_watchdog.sh" "${TWOMAN_INSTALL_ROOT}/agent_watchdog.py"
 
 CONFIG_JSON="$(cat <<EOF
 {
@@ -117,9 +124,9 @@ CONFIG_JSON="$(cat <<EOF
   "health_template": "${TWOMAN_HEALTH_TEMPLATE}",
   "http_timeout_seconds": 30,
   "heartbeat_interval_seconds": 15,
-  "interval_jitter_ratio": 0.2,
   "down_read_timeout_seconds": ${TWOMAN_DOWN_READ_TIMEOUT_SECONDS},
   "down_stream_max_session_seconds": ${TWOMAN_DOWN_STREAM_MAX_SESSION_SECONDS},
+  "interval_jitter_ratio": 0.2,
   "backoff_initial_delay_seconds": 0.1,
   "backoff_max_delay_seconds": 5,
   "flush_delay_seconds": 0.01,
@@ -144,10 +151,32 @@ CONFIG_JSON="$(cat <<EOF
   "http2_enabled": {
     "ctl": ${TWOMAN_HTTP2_CTL},
     "data": ${TWOMAN_HTTP2_DATA}
-  }
+  },
+  "log_path": "${TWOMAN_INSTALL_ROOT}/logs/agent.log",
+  "event_log_path": "${TWOMAN_INSTALL_ROOT}/logs/agent-events.ndjson"
 }
 EOF
 )"
+
+cat > "${TWOMAN_INSTALL_ROOT}/config.json" <<EOF
+${CONFIG_JSON}
+EOF
+chmod 0600 "${TWOMAN_INSTALL_ROOT}/config.json"
+
+getent group "${TWOMAN_AGENT_SERVICE_GROUP}" >/dev/null 2>&1 || groupadd --system "${TWOMAN_AGENT_SERVICE_GROUP}"
+id -u "${TWOMAN_AGENT_SERVICE_USER}" >/dev/null 2>&1 || useradd --system --gid "${TWOMAN_AGENT_SERVICE_GROUP}" --home-dir "${TWOMAN_INSTALL_ROOT}" --shell /usr/sbin/nologin "${TWOMAN_AGENT_SERVICE_USER}"
+
+ensure_python_venv_support
+
+if [ ! -d "${TWOMAN_INSTALL_ROOT}/.venv" ]; then
+  echo "Creating the hidden-agent virtual environment..."
+  python3 -m venv "${TWOMAN_INSTALL_ROOT}/.venv"
+fi
+PYTHON_BIN="${TWOMAN_INSTALL_ROOT}/.venv/bin/python"
+echo "Installing hidden-agent Python dependencies..."
+PIP_DISABLE_PIP_VERSION_CHECK=1 "${PYTHON_BIN}" -m pip install --no-input -r "${TWOMAN_INSTALL_ROOT}/requirements.txt"
+
+chown -R "${TWOMAN_AGENT_SERVICE_USER}:${TWOMAN_AGENT_SERVICE_GROUP}" "${TWOMAN_INSTALL_ROOT}"
 
 SERVICE_CONTENT="$(cat <<EOF
 [Unit]
@@ -157,12 +186,12 @@ ${SYSTEMD_WANTS}
 
 [Service]
 Type=simple
-WorkingDirectory=${TWOMAN_SERVER_DIR}
+WorkingDirectory=${TWOMAN_INSTALL_ROOT}
 User=${TWOMAN_AGENT_SERVICE_USER}
 Group=${TWOMAN_AGENT_SERVICE_GROUP}
 Environment=PYTHONUNBUFFERED=1
 Environment=TWOMAN_TRACE=${TWOMAN_TRACE}
-ExecStart=/usr/bin/python3 ${TWOMAN_SERVER_DIR}/agent.py --config ${TWOMAN_SERVER_DIR}/config.json
+ExecStart=${TWOMAN_INSTALL_ROOT}/.venv/bin/python ${TWOMAN_INSTALL_ROOT}/agent.py --config ${TWOMAN_INSTALL_ROOT}/config.json
 Restart=always
 RestartSec=2
 LimitNOFILE=65536
@@ -170,7 +199,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=${TWOMAN_SERVER_DIR}
+ReadWritePaths=${TWOMAN_INSTALL_ROOT}
 UMask=0077
 StandardOutput=journal
 StandardError=journal
@@ -187,44 +216,25 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 ${TWOMAN_SERVER_DIR}/agent_watchdog.py --service ${TWOMAN_AGENT_SERVICE_NAME} --fd-threshold 16384 --close-wait-threshold 2048
+ExecStart=${TWOMAN_INSTALL_ROOT}/.venv/bin/python ${TWOMAN_INSTALL_ROOT}/agent_watchdog.py --service ${TWOMAN_AGENT_SERVICE_NAME} --fd-threshold 16384 --close-wait-threshold 2048
 EOF
 )"
 
-echo "Installing remote config and services..."
-"${SSH_CMD[@]}" "${TWOMAN_SERVER_USER}@${TWOMAN_SERVER_HOST}" "cat > '${TWOMAN_SERVER_DIR}/config.json' <<'EOF'
-${CONFIG_JSON}
-EOF
-getent group '${TWOMAN_AGENT_SERVICE_GROUP}' >/dev/null 2>&1 || groupadd --system '${TWOMAN_AGENT_SERVICE_GROUP}'
-id -u '${TWOMAN_AGENT_SERVICE_USER}' >/dev/null 2>&1 || useradd --system --gid '${TWOMAN_AGENT_SERVICE_GROUP}' --home-dir '${TWOMAN_SERVER_DIR}' --shell /usr/sbin/nologin '${TWOMAN_AGENT_SERVICE_USER}'
-chown -R '${TWOMAN_AGENT_SERVICE_USER}:${TWOMAN_AGENT_SERVICE_GROUP}' '${TWOMAN_SERVER_DIR}'
-cat > '/etc/systemd/system/${TWOMAN_AGENT_SERVICE_NAME}' <<'EOF'
+cat > "/etc/systemd/system/${TWOMAN_AGENT_SERVICE_NAME}" <<EOF
 ${SERVICE_CONTENT}
 EOF
-cat > '/etc/systemd/system/twoman-agent-watchdog.service' <<'EOF'
+cat > "/etc/systemd/system/${TWOMAN_WATCHDOG_SERVICE_NAME}" <<EOF
 ${WATCHDOG_SERVICE_CONTENT}
 EOF
-install -m 0644 '${TWOMAN_SERVER_DIR}/twoman-agent-watchdog.timer' /etc/systemd/system/twoman-agent-watchdog.timer
-chmod 755 '${TWOMAN_SERVER_DIR}/install_watchdog.sh' '${TWOMAN_SERVER_DIR}/agent_watchdog.py'
-if ! python3 -c 'import httpx, websockets' >/dev/null 2>&1; then
-  if python3 -m pip --version >/dev/null 2>&1; then
-    python3 -m pip install -r '${TWOMAN_SERVER_DIR}/requirements.txt'
-  elif command -v apt-get >/dev/null 2>&1; then
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y python3-httpx python3-websockets
-  else
-    echo 'unable to install httpx/websockets automatically: pip and apt-get are unavailable' >&2
-    exit 1
-  fi
-fi
-python3 -m py_compile '${TWOMAN_SERVER_DIR}/agent.py' '${TWOMAN_SERVER_DIR}/agent_watchdog.py'
-systemctl daemon-reload
-systemctl enable --now '${TWOMAN_AGENT_SERVICE_NAME}'
-systemctl enable --now twoman-agent-watchdog.timer
-systemctl restart '${TWOMAN_AGENT_SERVICE_NAME}'
-systemctl start twoman-agent-watchdog.service
-systemctl is-active '${TWOMAN_AGENT_SERVICE_NAME}'
-systemctl is-active twoman-agent-watchdog.timer
-"
+install -m 0644 "${TWOMAN_INSTALL_ROOT}/twoman-agent-watchdog.timer" "/etc/systemd/system/${TWOMAN_WATCHDOG_TIMER_NAME}"
 
-echo "Hidden server deployment complete."
+echo "Compiling the hidden-agent runtime..."
+"${PYTHON_BIN}" -m py_compile "${TWOMAN_INSTALL_ROOT}/agent.py" "${TWOMAN_INSTALL_ROOT}/agent_watchdog.py"
+echo "Enabling and starting Twoman systemd services..."
+systemctl daemon-reload
+systemctl enable --now "${TWOMAN_AGENT_SERVICE_NAME}"
+systemctl enable --now "${TWOMAN_WATCHDOG_TIMER_NAME}"
+systemctl restart "${TWOMAN_AGENT_SERVICE_NAME}"
+systemctl start "${TWOMAN_WATCHDOG_SERVICE_NAME}"
+systemctl is-active "${TWOMAN_AGENT_SERVICE_NAME}"
+systemctl is-active "${TWOMAN_WATCHDOG_TIMER_NAME}"

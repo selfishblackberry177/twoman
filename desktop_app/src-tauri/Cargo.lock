@@ -704,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "desktop_app"
-version = "0.6.2"
+version = "0.6.7"
 dependencies = [
  "serde",
  "serde_json",

@@ -4,8 +4,10 @@ from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.reactive import reactive
 from textual.screen import ModalScreen
+from textual.timer import Timer
 from textual.widgets import Button, Checkbox, Footer, Header, Input, Select, Static
 
 from desktop_client.controller import DesktopController
@@ -270,6 +272,7 @@ class DesktopClientApp(App):
     def __init__(self, controller: DesktopController | None = None) -> None:
         super().__init__()
         self.controller = controller or DesktopController()
+        self._refresh_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -305,7 +308,13 @@ class DesktopClientApp(App):
 
     def on_mount(self) -> None:
         self.refresh_all()
-        self.set_interval(1.0, self.refresh_all)
+        self._refresh_timer = self.set_interval(1.0, self.refresh_all)
+
+    def on_unmount(self) -> None:
+        # Stop the periodic refresh before Textual tears down Select internals.
+        if self._refresh_timer is not None:
+            self._refresh_timer.stop()
+            self._refresh_timer = None
 
     def action_refresh(self) -> None:
         self.refresh_all()
@@ -319,21 +328,26 @@ class DesktopClientApp(App):
         if self.selected_share_id is None and shares:
             self.selected_share_id = shares[0].id
 
-        profile_select = self.query_one("#profiles-select", Select)
-        profile_select.set_options([(profile.name, profile.id) for profile in profiles])
-        if self.selected_profile_id and any(profile.id == self.selected_profile_id for profile in profiles):
-            profile_select.value = self.selected_profile_id
-        else:
-            profile_select.clear()
-            self.selected_profile_id = None
+        try:
+            profile_select = self.query_one("#profiles-select", Select)
+            share_select = self.query_one("#shares-select", Select)
 
-        share_select = self.query_one("#shares-select", Select)
-        share_select.set_options([(share.name, share.id) for share in shares])
-        if self.selected_share_id and any(share.id == self.selected_share_id for share in shares):
-            share_select.value = self.selected_share_id
-        else:
-            share_select.clear()
-            self.selected_share_id = None
+            profile_select.set_options([(profile.name, profile.id) for profile in profiles])
+            if self.selected_profile_id and any(profile.id == self.selected_profile_id for profile in profiles):
+                profile_select.value = self.selected_profile_id
+            else:
+                profile_select.clear()
+                self.selected_profile_id = None
+
+            share_select.set_options([(share.name, share.id) for share in shares])
+            if self.selected_share_id and any(share.id == self.selected_share_id for share in shares):
+                share_select.value = self.selected_share_id
+            else:
+                share_select.clear()
+                self.selected_share_id = None
+        except NoMatches:
+            # The refresh timer can overlap shutdown while Select internals unmount.
+            return
 
         self._render_status()
         self._render_profile_details()

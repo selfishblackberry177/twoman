@@ -12,7 +12,7 @@ require_env() {
 api_get() {
   local endpoint="$1"
   shift
-  curl -sk --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl -sk "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     --get \
     "$@" \
     "${TWOMAN_CPANEL_BASE_URL}/execute/${endpoint}"
@@ -21,7 +21,7 @@ api_get() {
 api_post() {
   local endpoint="$1"
   shift
-  curl -sk --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl -sk "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     "$@" \
     "${TWOMAN_CPANEL_BASE_URL}/execute/${endpoint}"
 }
@@ -30,7 +30,7 @@ upload_file() {
   local source_path="$1"
   local remote_dir="$2"
   local remote_name="$3"
-  curl -sk --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl -sk "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     -F "dir=${remote_dir}" \
     -F "overwrite=1" \
     -F "file-1=@${source_path};filename=${remote_name}" \
@@ -41,7 +41,7 @@ upload_content() {
   local remote_dir="$1"
   local remote_name="$2"
   local content="$3"
-  curl -sk --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl -sk "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     --data-urlencode "dir=${remote_dir}" \
     --data-urlencode "file=${remote_name}" \
     --data-urlencode "content=${content}" \
@@ -54,7 +54,7 @@ upload_content() {
 mkdir_api() {
   local parent_path="$1"
   local dir_name="$2"
-  curl -sk --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl -sk "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     --get \
     --data-urlencode "cpanel_jsonapi_user=${TWOMAN_CPANEL_USERNAME}" \
     --data-urlencode "cpanel_jsonapi_apiversion=2" \
@@ -88,6 +88,12 @@ require_env TWOMAN_CPANEL_HOME
 require_env TWOMAN_PUBLIC_ORIGIN
 require_env TWOMAN_CLIENT_TOKEN
 require_env TWOMAN_AGENT_TOKEN
+TWOMAN_UPSTREAM_PROXY_URL="${TWOMAN_UPSTREAM_PROXY_URL:-}"
+
+CURL_PROXY_ARGS=()
+if [ -n "${TWOMAN_UPSTREAM_PROXY_URL}" ]; then
+  CURL_PROXY_ARGS+=(--proxy "${TWOMAN_UPSTREAM_PROXY_URL}")
+fi
 
 TWOMAN_CAMOUFLAGE_SITE_ENABLED="${TWOMAN_CAMOUFLAGE_SITE_ENABLED:-false}"
 TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID="${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID:-}"
@@ -265,22 +271,44 @@ echo "Checking Passenger broker health..."
 sleep 3
 health_url="${TWOMAN_PUBLIC_ORIGIN}${TWOMAN_PUBLIC_BASE_PATH}${TWOMAN_HEALTH_TEMPLATE}"
 health_result=""
-for _ in $(seq 1 20); do
-  health_result="$(curl -sk -H "Authorization: Bearer ${TWOMAN_CLIENT_TOKEN}" "${health_url}" || true)"
-  if printf "%s" "${health_result}" | python3 - <<'PY' >/dev/null 2>&1
+health_code=""
+health_ok="false"
+health_body_path="$(mktemp)"
+trap 'rm -f "${health_body_path}"; cleanup' EXIT
+for _ in $(seq 1 45); do
+  health_code="$(curl -sk "${CURL_PROXY_ARGS[@]}" \
+    --connect-timeout 10 \
+    --max-time 20 \
+    -H "Authorization: Bearer ${TWOMAN_CLIENT_TOKEN}" \
+    -o "${health_body_path}" \
+    -w "%{http_code}" \
+    "${health_url}" || true)"
+  health_result="$(cat "${health_body_path}" 2>/dev/null || true)"
+  if [ "${health_code}" = "200" ] && python3 - <<'PY' "${health_body_path}" >/dev/null 2>&1
 import json
 import sys
-payload = json.loads(sys.stdin.read())
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
 assert payload.get("ok")
 PY
   then
+    health_ok="true"
     break
   fi
-  sleep 1
+  sleep 2
 done
-echo "${health_result}" | python3 - <<'PY'
+if [ "${health_ok}" != "true" ]; then
+  echo "Passenger health probe did not become ready." >&2
+  echo "  URL: ${health_url}" >&2
+  echo "  last HTTP code: ${health_code:-unknown}" >&2
+  echo "  last body preview:" >&2
+  printf "%s\n" "${health_result}" | sed -n '1,20p' >&2
+  exit 1
+fi
+python3 - <<'PY' "${health_body_path}"
 import json,sys
-data=json.load(sys.stdin)
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    data=json.load(handle)
 if not data.get("ok"):
     raise SystemExit("Passenger health failed: %s" % (data,))
 stats = data.get("stats") if isinstance(data.get("stats"), dict) else data

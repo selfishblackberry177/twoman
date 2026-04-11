@@ -13,7 +13,7 @@ upload_file() {
   local source_path="$1"
   local remote_dir="$2"
   local remote_name="$3"
-  curl -sk --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl -sk "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     -F "dir=${remote_dir}" \
     -F "overwrite=1" \
     -F "file-1=@${source_path};filename=${remote_name}" \
@@ -24,7 +24,7 @@ upload_content() {
   local remote_dir="$1"
   local remote_name="$2"
   local content="$3"
-  curl -sk --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl -sk "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     --data-urlencode "dir=${remote_dir}" \
     --data-urlencode "file=${remote_name}" \
     --data-urlencode "content=${content}" \
@@ -37,7 +37,7 @@ upload_content() {
 mkdir_api() {
   local parent_path="$1"
   local dir_name="$2"
-  curl -sk --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl -sk "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     --get \
     --data-urlencode "cpanel_jsonapi_user=${TWOMAN_CPANEL_USERNAME}" \
     --data-urlencode "cpanel_jsonapi_apiversion=2" \
@@ -71,6 +71,12 @@ require_env TWOMAN_CPANEL_HOME
 require_env TWOMAN_PUBLIC_ORIGIN
 require_env TWOMAN_CLIENT_TOKEN
 require_env TWOMAN_AGENT_TOKEN
+TWOMAN_UPSTREAM_PROXY_URL="${TWOMAN_UPSTREAM_PROXY_URL:-}"
+
+CURL_PROXY_ARGS=()
+if [ -n "${TWOMAN_UPSTREAM_PROXY_URL}" ]; then
+  CURL_PROXY_ARGS+=(--proxy "${TWOMAN_UPSTREAM_PROXY_URL}")
+fi
 
 TWOMAN_PUBLIC_BASE_PATH="${TWOMAN_PUBLIC_BASE_PATH:-/rahkar}"
 TWOMAN_BRIDGE_LOCAL_PORT="${TWOMAN_BRIDGE_LOCAL_PORT:-18093}"
@@ -166,7 +172,7 @@ upload_content "${REMOTE_APP_DIR}" "config.php" "${HOST_CONFIG_CONTENT}"
 
 echo "Restarting broker..."
 upload_content "${REMOTE_BASE}" "ops.php" "${OPS_RESTART_CONTENT}"
-restart_result="$(curl -sk "${TWOMAN_PUBLIC_ORIGIN}/${PUBLIC_BASE_TRIMMED}/ops.php" || true)"
+restart_result="$(curl -sk "${CURL_PROXY_ARGS[@]}" --connect-timeout 10 --max-time 20 "${TWOMAN_PUBLIC_ORIGIN}/${PUBLIC_BASE_TRIMMED}/ops.php" || true)"
 upload_content "${REMOTE_BASE}" "ops.php" "${OPS_STUB_CONTENT}"
 if [ "${restart_result}" != "ok" ]; then
   echo "broker restart failed: ${restart_result}" >&2
@@ -174,7 +180,7 @@ if [ "${restart_result}" != "ok" ]; then
 fi
 
 echo "Checking health..."
-curl -sk -H "Authorization: Bearer ${TWOMAN_CLIENT_TOKEN}" \
+curl -sk "${CURL_PROXY_ARGS[@]}" --connect-timeout 10 --max-time 20 -H "Authorization: Bearer ${TWOMAN_CLIENT_TOKEN}" \
   "${TWOMAN_PUBLIC_ORIGIN}/${PUBLIC_BASE_TRIMMED}/api.php?action=health"
 echo
 echo "Host deployment complete."
