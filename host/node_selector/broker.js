@@ -377,6 +377,8 @@ class StreamState {
     this.agentAckOffset = 0;
     this.helperFinSeen = false;
     this.agentFinSeen = false;
+    this.helperFinOffset = null;
+    this.agentFinOffset = null;
   }
 
   touch() {
@@ -851,8 +853,10 @@ class BrokerState {
     if (frame.typeId === FRAME_FIN) {
       if (senderRole === "helper") {
         stream.helperFinSeen = true;
+        stream.helperFinOffset = Number(frame.offset || 0);
       } else {
         stream.agentFinSeen = true;
+        stream.agentFinOffset = Number(frame.offset || 0);
       }
     }
     let targetRole;
@@ -899,7 +903,7 @@ class BrokerState {
       this.dropStream(stream);
       return;
     }
-    if (frame.typeId === FRAME_FIN && stream.helperFinSeen && stream.agentFinSeen) {
+    if ((frame.typeId === FRAME_FIN || frame.typeId === FRAME_WINDOW) && this.streamDeliveryComplete(stream)) {
       this.dropStream(stream);
     }
   }
@@ -997,7 +1001,11 @@ class BrokerState {
       agent_session_id: stream.agentSessionId,
       agent_stream_id: stream.agentStreamId,
       helper_fin_seen: stream.helperFinSeen,
-      agent_fin_seen: stream.agentFinSeen
+      agent_fin_seen: stream.agentFinSeen,
+      helper_fin_offset: stream.helperFinOffset,
+      agent_fin_offset: stream.agentFinOffset,
+      helper_ack_offset: stream.helperAckOffset,
+      agent_ack_offset: stream.agentAckOffset
     });
     const helperPeer = this.peers.get(this.peerKey("helper", stream.helperSessionId));
     if (helperPeer && helperPeer.activeStreams > 0) {
@@ -1007,6 +1015,15 @@ class BrokerState {
     if (agentPeer && agentPeer.activeStreams > 0) {
       agentPeer.activeStreams -= 1;
     }
+  }
+
+  streamDeliveryComplete(stream) {
+    if (!(stream.helperFinSeen && stream.agentFinSeen)) {
+      return false;
+    }
+    const helperDone = stream.agentFinOffset !== null && stream.helperAckOffset >= Number(stream.agentFinOffset);
+    const agentDone = stream.helperFinOffset !== null && stream.agentAckOffset >= Number(stream.helperFinOffset);
+    return helperDone && agentDone;
   }
 
   cleanup() {

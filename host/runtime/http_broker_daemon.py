@@ -34,6 +34,7 @@ from twoman_protocol import (
     FRAME_OPEN_FAIL,
     FRAME_PING,
     FRAME_RST,
+    FRAME_WINDOW,
     FLAG_DATA_BULK,
     LANES,
     LANE_CTL,
@@ -214,8 +215,12 @@ class StreamState(object):
         self.agent_stream_id = int(agent_stream_id)
         self.created_at_ms = now_ms()
         self.last_seen_ms = self.created_at_ms
+        self.helper_ack_offset = 0
+        self.agent_ack_offset = 0
         self.helper_fin_seen = False
         self.agent_fin_seen = False
+        self.helper_fin_offset = None
+        self.agent_fin_offset = None
 
     def touch(self):
         self.last_seen_ms = now_ms()
@@ -414,11 +419,18 @@ class BrokerState(object):
                 )
                 return
             stream.touch()
+            if frame.type_id == FRAME_WINDOW:
+                if sender_role == "helper":
+                    stream.helper_ack_offset += int(frame.offset or 0)
+                else:
+                    stream.agent_ack_offset += int(frame.offset or 0)
             if frame.type_id == FRAME_FIN:
                 if sender_role == "helper":
                     stream.helper_fin_seen = True
+                    stream.helper_fin_offset = int(frame.offset or 0)
                 else:
                     stream.agent_fin_seen = True
+                    stream.agent_fin_offset = int(frame.offset or 0)
             if sender_role == "helper":
                 target_role = "agent"
                 target_peer_session_id = stream.agent_session_id
@@ -463,9 +475,10 @@ class BrokerState(object):
         if frame.type_id == FRAME_RST:
             async with self.lock:
                 self._drop_stream_locked(stream)
-        elif frame.type_id == FRAME_FIN and stream.helper_fin_seen and stream.agent_fin_seen:
+        elif frame.type_id in (FRAME_FIN, FRAME_WINDOW):
             async with self.lock:
-                self._drop_stream_locked(stream)
+                if self._stream_delivery_complete_locked(stream):
+                    self._drop_stream_locked(stream)
 
     async def _handle_open(self, helper_session_id, frame):
         open_error = ""
@@ -569,6 +582,12 @@ class BrokerState(object):
             helper_stream_id=stream.helper_stream_id,
             agent_session_id=stream.agent_session_id,
             agent_stream_id=stream.agent_stream_id,
+            helper_fin_seen=stream.helper_fin_seen,
+            agent_fin_seen=stream.agent_fin_seen,
+            helper_fin_offset=stream.helper_fin_offset,
+            agent_fin_offset=stream.agent_fin_offset,
+            helper_ack_offset=stream.helper_ack_offset,
+            agent_ack_offset=stream.agent_ack_offset,
         )
         helper_peer = self.peers.get(("helper", stream.helper_session_id))
         if helper_peer is not None and helper_peer.active_streams > 0:
@@ -576,6 +595,19 @@ class BrokerState(object):
         agent_peer = self.peers.get(("agent", stream.agent_session_id))
         if agent_peer is not None and agent_peer.active_streams > 0:
             agent_peer.active_streams -= 1
+
+    def _stream_delivery_complete_locked(self, stream):
+        if not (stream.helper_fin_seen and stream.agent_fin_seen):
+            return False
+        helper_done = (
+            stream.agent_fin_offset is not None
+            and stream.helper_ack_offset >= int(stream.agent_fin_offset)
+        )
+        agent_done = (
+            stream.helper_fin_offset is not None
+            and stream.agent_ack_offset >= int(stream.helper_fin_offset)
+        )
+        return helper_done and agent_done
 
     def _reserve_helper_open_locked(self, helper_peer):
         current_ms = now_ms()

@@ -4,7 +4,7 @@ from unittest import mock
 from host.runtime.http_broker_daemon import AsyncBrokerServer, BrokerState
 from twoman_crypto import TransportCipher
 from twoman_http import build_connection_headers, expected_binary_media_type
-from twoman_protocol import FRAME_FIN, FRAME_OPEN, FRAME_OPEN_FAIL, Frame, LANE_CTL
+from twoman_protocol import FRAME_FIN, FRAME_OPEN, FRAME_OPEN_FAIL, FRAME_WINDOW, Frame, LANE_CTL
 
 
 class _FakeWriter:
@@ -88,7 +88,7 @@ class BrokerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(queued_frames[1][2], LANE_CTL)
         self.assertEqual(queued_frames[1][3].type_id, FRAME_OPEN_FAIL)
 
-    async def test_handle_frame_drops_stream_after_both_fin_frames(self):
+    async def test_handle_frame_waits_for_window_ack_before_dropping_finished_stream(self):
         state = BrokerState({"client_tokens": ["client-token"], "agent_tokens": ["agent-token"]})
         await state.ensure_peer("helper", "desktop", "helper-session", "client-token")
         await state.ensure_peer("agent", "hidden", "agent-session", "agent-token")
@@ -110,10 +110,21 @@ class BrokerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(stream.agent_fin_seen)
 
         await state.handle_frame("agent", "agent-session", LANE_CTL, Frame(FRAME_FIN, stream_id=agent_stream_id, offset=7))
+        self.assertIn(("helper-session", 17), state.streams_by_helper)
+        self.assertEqual(stream.helper_fin_offset, 5)
+        self.assertEqual(stream.agent_fin_offset, 7)
+
+        await state.handle_frame("helper", "helper-session", LANE_CTL, Frame(FRAME_WINDOW, stream_id=17, offset=7))
+        self.assertIn(("helper-session", 17), state.streams_by_helper)
+
+        await state.handle_frame("agent", "agent-session", LANE_CTL, Frame(FRAME_WINDOW, stream_id=agent_stream_id, offset=5))
         self.assertEqual(state.streams_by_helper, {})
         self.assertEqual(state.streams_by_agent, {})
 
-        self.assertEqual([entry[3].type_id for entry in queued_frames], [FRAME_OPEN, FRAME_FIN, FRAME_FIN])
+        self.assertEqual(
+            [entry[3].type_id for entry in queued_frames],
+            [FRAME_OPEN, FRAME_FIN, FRAME_FIN, FRAME_WINDOW, FRAME_WINDOW],
+        )
 
 
 if __name__ == "__main__":
