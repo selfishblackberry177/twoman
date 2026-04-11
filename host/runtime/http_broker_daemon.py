@@ -29,6 +29,7 @@ from twoman_protocol import (
     Frame,
     FrameDecoder,
     FRAME_DATA,
+    FRAME_FIN,
     FRAME_OPEN,
     FRAME_OPEN_FAIL,
     FRAME_PING,
@@ -213,6 +214,8 @@ class StreamState(object):
         self.agent_stream_id = int(agent_stream_id)
         self.created_at_ms = now_ms()
         self.last_seen_ms = self.created_at_ms
+        self.helper_fin_seen = False
+        self.agent_fin_seen = False
 
     def touch(self):
         self.last_seen_ms = now_ms()
@@ -411,6 +414,11 @@ class BrokerState(object):
                 )
                 return
             stream.touch()
+            if frame.type_id == FRAME_FIN:
+                if sender_role == "helper":
+                    stream.helper_fin_seen = True
+                else:
+                    stream.agent_fin_seen = True
             if sender_role == "helper":
                 target_role = "agent"
                 target_peer_session_id = stream.agent_session_id
@@ -453,6 +461,9 @@ class BrokerState(object):
             )
 
         if frame.type_id == FRAME_RST:
+            async with self.lock:
+                self._drop_stream_locked(stream)
+        elif frame.type_id == FRAME_FIN and stream.helper_fin_seen and stream.agent_fin_seen:
             async with self.lock:
                 self._drop_stream_locked(stream)
 

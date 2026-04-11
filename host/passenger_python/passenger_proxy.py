@@ -478,6 +478,26 @@ def _camouflage_html(status_code):
     return html.encode("utf-8")
 
 
+def _candidate_broker_log_paths():
+    config_root = os.path.dirname(os.path.abspath(CONFIG_PATH))
+    candidates = [
+        os.path.join(config_root, "logs", "http-broker.log"),
+        os.path.join(config_root, "logs", "passenger-broker.log"),
+        os.path.join(os.path.dirname(CURRENT_DIR), "logs", "http-broker.log"),
+        os.path.join(os.path.dirname(CURRENT_DIR), "logs", "passenger-broker.log"),
+        os.path.join(CURRENT_DIR, "runtime", "broker_stderr.log"),
+    ]
+    seen = set()
+    ordered = []
+    for candidate in candidates:
+        normalized = os.path.abspath(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
 def application(environ, start_response):
     try:
         path = str(environ.get("PATH_INFO", "") or "/")
@@ -496,12 +516,13 @@ def application(environ, start_response):
                 return [body]
 
         if path == "/dump-log":
-            log_path = os.path.join(os.path.dirname(CURRENT_DIR), "logs", "http-broker.log")
-            if os.path.exists(log_path):
+            body = b"Log not found"
+            for log_path in _candidate_broker_log_paths():
+                if not os.path.exists(log_path):
+                    continue
                 with open(log_path, "r", encoding="utf-8") as f:
                     body = f.read().encode("utf-8")
-            else:
-                body = b"Log not found"
+                break
             start_response("200 OK", [("Content-Type", "text/plain"), ("Content-Length", str(len(body)))])
             return [body]
 
