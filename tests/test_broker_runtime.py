@@ -4,7 +4,16 @@ from unittest import mock
 from host.runtime.http_broker_daemon import AsyncBrokerServer, BrokerState
 from twoman_crypto import TransportCipher
 from twoman_http import build_connection_headers, expected_binary_media_type
-from twoman_protocol import FRAME_FIN, FRAME_OPEN, FRAME_OPEN_FAIL, FRAME_WINDOW, Frame, LANE_CTL
+from twoman_protocol import (
+    FRAME_DNS_QUERY,
+    FRAME_DNS_RESPONSE,
+    FRAME_FIN,
+    FRAME_OPEN,
+    FRAME_OPEN_FAIL,
+    FRAME_WINDOW,
+    Frame,
+    LANE_CTL,
+)
 
 
 class _FakeWriter:
@@ -125,6 +134,41 @@ class BrokerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             [entry[3].type_id for entry in queued_frames],
             [FRAME_OPEN, FRAME_FIN, FRAME_FIN, FRAME_WINDOW, FRAME_WINDOW],
         )
+
+    async def test_handle_frame_maps_dns_queries_without_creating_stream_state(self):
+        state = BrokerState({"client_tokens": ["client-token"], "agent_tokens": ["agent-token"]})
+        await state.ensure_peer("helper", "desktop", "helper-session", "client-token")
+        await state.ensure_peer("agent", "hidden", "agent-session", "agent-token")
+        queued_frames = []
+
+        async def fake_queue(role, peer_session_id, lane, frame):
+            queued_frames.append((role, peer_session_id, lane, frame))
+            return True
+
+        state.queue_frame = fake_queue
+        await state.handle_frame("helper", "helper-session", "pri", Frame(FRAME_DNS_QUERY, stream_id=41, payload=b"query"))
+
+        self.assertEqual(state.streams_by_helper, {})
+        self.assertEqual(len(state.dns_queries_by_helper), 1)
+        query = state.dns_queries_by_helper[("helper-session", 41)]
+        self.assertEqual(queued_frames[0][0], "agent")
+        self.assertEqual(queued_frames[0][2], "pri")
+        self.assertEqual(queued_frames[0][3].type_id, FRAME_DNS_QUERY)
+        self.assertEqual(queued_frames[0][3].stream_id, query.agent_request_id)
+
+        await state.handle_frame(
+            "agent",
+            "agent-session",
+            "pri",
+            Frame(FRAME_DNS_RESPONSE, stream_id=query.agent_request_id, payload=b"response"),
+        )
+
+        self.assertEqual(len(state.dns_queries_by_helper), 0)
+        self.assertEqual(len(state.dns_queries_by_agent), 0)
+        self.assertEqual(queued_frames[1][0], "helper")
+        self.assertEqual(queued_frames[1][2], "pri")
+        self.assertEqual(queued_frames[1][3].type_id, FRAME_DNS_RESPONSE)
+        self.assertEqual(queued_frames[1][3].stream_id, 41)
 
 
 if __name__ == "__main__":

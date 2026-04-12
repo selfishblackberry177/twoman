@@ -74,10 +74,14 @@ const FRAME_PING = 10;
 const FRAME_OPEN = 3;
 const FRAME_OPEN_FAIL = 5;
 const FRAME_RST = 9;
+const FRAME_DNS_QUERY = 12;
+const FRAME_DNS_RESPONSE = 13;
+const FRAME_DNS_FAIL = 14;
 const FLAG_DATA_BULK = 1;
 const LANE_CTL = "ctl";
 const LANE_DATA = "data";
 const DEFAULT_DATA_REPLAY_RESEND_MS = 750;
+const DNS_FRAME_TYPES = new Set([FRAME_DNS_QUERY, FRAME_DNS_RESPONSE, FRAME_DNS_FAIL]);
 
 function coerceInt(value, fallbackValue, minimum = 1) {
   const parsed = Number.parseInt(value, 10);
@@ -386,6 +390,22 @@ class StreamState {
   }
 }
 
+class DnsQueryState {
+  constructor(helperSessionId, helperPeerLabel, helperRequestId, agentSessionId, agentRequestId) {
+    this.helperSessionId = helperSessionId;
+    this.helperPeerLabel = helperPeerLabel;
+    this.helperRequestId = Number(helperRequestId);
+    this.agentSessionId = agentSessionId;
+    this.agentRequestId = Number(agentRequestId);
+    this.createdAtMs = nowMs();
+    this.lastSeenMs = this.createdAtMs;
+  }
+
+  touch() {
+    this.lastSeenMs = nowMs();
+  }
+}
+
 class BrokerState {
   constructor(config) {
     this.config = config;
@@ -394,6 +414,7 @@ class BrokerState {
     this.agentTokens = new Set(config.agent_tokens || []);
     this.peerTtlMs = Number(config.peer_ttl_seconds || 90) * 1000;
     this.streamTtlMs = Number(config.stream_ttl_seconds || 300) * 1000;
+    this.dnsQueryTtlMs = Number(config.dns_query_ttl_seconds || 30) * 1000;
     this.maxLaneBytes = Number(config.max_lane_bytes || 16 * 1024 * 1024);
     this.maxPeerBufferedBytes = Number(
       config.max_peer_buffered_bytes || Math.min(this.maxLaneBytes * 2, 32 * 1024 * 1024)
@@ -410,9 +431,12 @@ class BrokerState {
     this.peers = new Map();
     this.streamsByHelper = new Map();
     this.streamsByAgent = new Map();
+    this.dnsQueriesByHelper = new Map();
+    this.dnsQueriesByAgent = new Map();
     this.agentSessionId = "";
     this.agentPeerLabel = "";
     this.nextAgentStreamId = 1;
+    this.nextAgentDnsRequestId = 1;
     this.metrics = {
       peer_connects: 0,
       peer_disconnects: 0,
@@ -461,6 +485,10 @@ class BrokerState {
     return `${peerSessionId}:${streamId}`;
   }
 
+  dnsHelperKey(peerSessionId, requestId) {
+    return `${peerSessionId}:${requestId}`;
+  }
+
   auth(role, token) {
     if (role === "helper") {
       return this.clientTokens.has(token);
@@ -505,6 +533,22 @@ class BrokerState {
     return peer;
   }
 
+  allocateAgentDnsRequestId() {
+    let requestId = Number(this.nextAgentDnsRequestId) >>> 0;
+    if (requestId <= 0) {
+      requestId = 1;
+    }
+    const start = requestId;
+    while (this.dnsQueriesByAgent.has(requestId)) {
+      requestId = requestId >= 0xFFFFFFFF ? 1 : requestId + 1;
+      if (requestId === start) {
+        throw new Error("no available agent dns request ids");
+      }
+    }
+    this.nextAgentDnsRequestId = requestId >= 0xFFFFFFFF ? 1 : requestId + 1;
+    return requestId;
+  }
+
   bindChannel(role, peerLabel, peerSessionId, lane, ws) {
     const peer = this.ensurePeer(role, peerLabel, peerSessionId);
     peer.channels[lane] = ws;
@@ -532,7 +576,7 @@ class BrokerState {
     }
   }
 
-  queueFrame(role, peerSessionId, frame) {
+  queueFrame(role, peerSessionId, frame, queueLane = null) {
     const peer = this.peers.get(this.peerKey(role, peerSessionId));
     if (!peer) {
       trace(`drop frame type=${frame.typeId} stream=${frame.streamId} role=${role} session=${peerSessionId} reason=no-peer`);
@@ -557,8 +601,9 @@ class BrokerState {
       });
       return false;
     }
-    if (frame.typeId === FRAME_DATA) {
-      const targetQueue = (frame.flags & FLAG_DATA_BULK) ? peer.dataBulkQueue : peer.dataPriQueue;
+    if (frame.typeId === FRAME_DATA || queueLane === "pri" || queueLane === "bulk") {
+      const dataLane = queueLane || ((frame.flags & FLAG_DATA_BULK) ? "bulk" : "pri");
+      const targetQueue = dataLane === "bulk" ? peer.dataBulkQueue : peer.dataPriQueue;
       if (targetQueue.bufferedBytes >= this.maxLaneBytes) {
         trace(`drop data stream=${frame.streamId} role=${role} session=${peerSessionId} reason=data-queue-full`);
         this.recordEvent("queue_drop", {
@@ -570,18 +615,28 @@ class BrokerState {
         });
         return false;
       }
-      const replayLane = (frame.flags & FLAG_DATA_BULK) ? "bulk" : "pri";
-      const entry = {
-        encoded,
-        streamId: frame.streamId,
-        endOffset: Number(frame.offset || 0) + encoded.readUInt32BE(16),
-        sentAtMs: 0,
-        replayLane
-      };
       targetQueue.push(encoded);
-      peer.dataReplay[replayLane].push(entry);
-      peer.dataReplayByPayload.set(encoded, entry);
-      this.metrics.frames_out[(frame.flags & FLAG_DATA_BULK) ? "bulk" : "pri"] += 1;
+      if (frame.typeId === FRAME_DATA) {
+        const entry = {
+          encoded,
+          streamId: frame.streamId,
+          endOffset: Number(frame.offset || 0) + encoded.readUInt32BE(16),
+          sentAtMs: 0,
+          replayLane: dataLane
+        };
+        peer.dataReplay[dataLane].push(entry);
+        peer.dataReplayByPayload.set(encoded, entry);
+      } else {
+        this.recordEvent("queue_ctl", {
+          role,
+          peer_session_id: peerSessionId,
+          lane: dataLane,
+          type_id: frame.typeId,
+          stream_id: frame.streamId,
+          payload_bytes: frame.payload ? frame.payload.length : 0
+        }, { durable: false });
+      }
+      this.metrics.frames_out[dataLane] += 1;
       peer.notifyWaiters(LANE_DATA);
       this.scheduleFlush(peer, LANE_DATA);
       return true;
@@ -833,6 +888,14 @@ class BrokerState {
       this.handleOpen(senderPeerSessionId, frame);
       return;
     }
+    if (frame.typeId === FRAME_DNS_QUERY && senderRole === "helper") {
+      this.handleDnsQuery(senderPeerSessionId, lane, frame);
+      return;
+    }
+    if (frame.typeId === FRAME_DNS_RESPONSE || frame.typeId === FRAME_DNS_FAIL) {
+      this.handleDnsResult(senderRole, senderPeerSessionId, lane, frame);
+      return;
+    }
     const stream = senderRole === "helper"
       ? this.streamsByHelper.get(this.streamHelperKey(senderPeerSessionId, frame.streamId))
       : this.streamsByAgent.get(frame.streamId);
@@ -878,7 +941,8 @@ class BrokerState {
       offset: frame.offset,
       payload: frame.payload
     };
-    const queued = this.queueFrame(targetRole, targetPeerSessionId, outboundFrame);
+    const targetLane = (frame.typeId === FRAME_DATA || DNS_FRAME_TYPES.has(frame.typeId)) ? lane : null;
+    const queued = this.queueFrame(targetRole, targetPeerSessionId, outboundFrame, targetLane);
     if (queued) {
       this.recordEvent("frame_forward", {
         sender_role: senderRole,
@@ -905,6 +969,118 @@ class BrokerState {
     }
     if ((frame.typeId === FRAME_FIN || frame.typeId === FRAME_WINDOW) && this.streamDeliveryComplete(stream)) {
       this.dropStream(stream);
+    }
+  }
+
+  handleDnsQuery(helperSessionId, lane, frame) {
+    let openError = "";
+    let agentSessionId = this.agentSessionId;
+    const helperPeer = this.peers.get(this.peerKey("helper", helperSessionId));
+    const helperPeerLabel = helperPeer ? helperPeer.peerLabel : helperSessionId;
+    if (!helperPeer) {
+      openError = "helper session unavailable";
+    }
+    if (agentSessionId && !this.peers.has(this.peerKey("agent", agentSessionId))) {
+      agentSessionId = "";
+    }
+    let agentRequestId = 0;
+    if (agentSessionId && !openError) {
+      agentRequestId = this.allocateAgentDnsRequestId();
+      const query = new DnsQueryState(
+        helperSessionId,
+        helperPeerLabel,
+        frame.streamId,
+        agentSessionId,
+        agentRequestId
+      );
+      this.dnsQueriesByHelper.set(this.dnsHelperKey(helperSessionId, frame.streamId), query);
+      this.dnsQueriesByAgent.set(agentRequestId, query);
+      this.recordEvent("dns_query_map", {
+        helper_session_id: helperSessionId,
+        helper_peer_label: helperPeerLabel,
+        helper_request_id: frame.streamId,
+        agent_session_id: agentSessionId,
+        agent_request_id: agentRequestId
+      });
+    }
+    if (openError) {
+      this.queueFrame("helper", helperSessionId, {
+        typeId: FRAME_DNS_FAIL,
+        flags: 0,
+        streamId: frame.streamId,
+        offset: 0,
+        payload: makeErrorPayload(openError)
+      }, "pri");
+      return;
+    }
+    if (!agentSessionId) {
+      this.queueFrame("helper", helperSessionId, {
+        typeId: FRAME_DNS_FAIL,
+        flags: 0,
+        streamId: frame.streamId,
+        offset: 0,
+        payload: makeErrorPayload("hidden agent unavailable")
+      }, "pri");
+      return;
+    }
+    const queued = this.queueFrame("agent", agentSessionId, {
+      typeId: FRAME_DNS_QUERY,
+      flags: frame.flags,
+      streamId: agentRequestId,
+      offset: frame.offset,
+      payload: frame.payload
+    }, lane === "bulk" ? "bulk" : "pri");
+    if (queued) {
+      return;
+    }
+    const query = this.dnsQueriesByHelper.get(this.dnsHelperKey(helperSessionId, frame.streamId));
+    if (query) {
+      this.dropDnsQuery(query, "agent-queue-failed");
+    }
+    this.queueFrame("helper", helperSessionId, {
+      typeId: FRAME_DNS_FAIL,
+      flags: 0,
+      streamId: frame.streamId,
+      offset: 0,
+      payload: makeErrorPayload("hidden agent unavailable")
+    }, "pri");
+  }
+
+  handleDnsResult(senderRole, senderPeerSessionId, lane, frame) {
+    if (senderRole !== "agent") {
+      this.recordEvent("frame_drop", {
+        reason: "unexpected-dns-result-sender",
+        sender_role: senderRole,
+        sender_peer_session_id: senderPeerSessionId,
+        lane,
+        type_id: frame.typeId,
+        stream_id: frame.streamId
+      });
+      return;
+    }
+    const query = this.dnsQueriesByAgent.get(frame.streamId);
+    if (!query) {
+      this.recordEvent("frame_drop", {
+        reason: "unknown-dns-query",
+        sender_role: senderRole,
+        sender_peer_session_id: senderPeerSessionId,
+        lane,
+        type_id: frame.typeId,
+        stream_id: frame.streamId
+      });
+      return;
+    }
+    query.touch();
+    this.queueFrame("helper", query.helperSessionId, {
+      typeId: frame.typeId,
+      flags: frame.flags,
+      streamId: query.helperRequestId,
+      offset: frame.offset,
+      payload: frame.payload
+    }, lane === "bulk" ? "bulk" : "pri");
+    const liveQuery = this.dnsQueriesByAgent.get(frame.streamId);
+    if (liveQuery) {
+      this.dropDnsQuery(liveQuery, "completed");
     }
   }
 
@@ -1017,6 +1193,19 @@ class BrokerState {
     }
   }
 
+  dropDnsQuery(query, reason = "") {
+    this.dnsQueriesByHelper.delete(this.dnsHelperKey(query.helperSessionId, query.helperRequestId));
+    this.dnsQueriesByAgent.delete(query.agentRequestId);
+    this.recordEvent("drop_dns_query", {
+      helper_session_id: query.helperSessionId,
+      helper_peer_label: query.helperPeerLabel,
+      helper_request_id: query.helperRequestId,
+      agent_session_id: query.agentSessionId,
+      agent_request_id: query.agentRequestId,
+      reason
+    });
+  }
+
   streamDeliveryComplete(stream) {
     if (!(stream.helperFinSeen && stream.agentFinSeen)) {
       return false;
@@ -1029,6 +1218,7 @@ class BrokerState {
   cleanup() {
     const peerCutoff = nowMs() - this.peerTtlMs;
     const streamCutoff = nowMs() - this.streamTtlMs;
+    const dnsQueryCutoff = nowMs() - this.dnsQueryTtlMs;
     for (const [key, peer] of this.peers.entries()) {
       if (peer.lastSeenMs >= peerCutoff) {
         continue;
@@ -1069,6 +1259,24 @@ class BrokerState {
         }
         this.dropStream(stream);
       }
+      const staleDnsQueries = [];
+      for (const query of this.dnsQueriesByAgent.values()) {
+        if (query.helperSessionId === peer.peerSessionId || query.agentSessionId === peer.peerSessionId) {
+          staleDnsQueries.push(query);
+        }
+      }
+      for (const query of staleDnsQueries) {
+        if (peer.role === "agent") {
+          this.queueFrame("helper", query.helperSessionId, {
+            typeId: FRAME_DNS_FAIL,
+            flags: 0,
+            streamId: query.helperRequestId,
+            offset: 0,
+            payload: makeErrorPayload("peer expired")
+          }, "pri");
+        }
+        this.dropDnsQuery(query, "peer-expired");
+      }
       this.peers.delete(key);
       if (peer.role === "agent" && this.agentSessionId === peer.peerSessionId) {
         this.agentSessionId = "";
@@ -1101,6 +1309,25 @@ class BrokerState {
       });
       this.dropStream(stream);
     }
+    for (const query of Array.from(this.dnsQueriesByAgent.values())) {
+      if (query.lastSeenMs >= dnsQueryCutoff) {
+        continue;
+      }
+      this.recordEvent("cleanup_dns_query_expired", {
+        helper_session_id: query.helperSessionId,
+        helper_request_id: query.helperRequestId,
+        agent_session_id: query.agentSessionId,
+        agent_request_id: query.agentRequestId
+      });
+      this.queueFrame("helper", query.helperSessionId, {
+        typeId: FRAME_DNS_FAIL,
+        flags: 0,
+        streamId: query.helperRequestId,
+        offset: 0,
+        payload: makeErrorPayload("dns query expired")
+      }, "pri");
+      this.dropDnsQuery(query, "query-expired");
+    }
   }
 
   stats() {
@@ -1132,6 +1359,7 @@ class BrokerState {
       pid: process.pid,
       peers: this.peers.size,
       streams: this.streamsByAgent.size,
+      dns_queries: this.dnsQueriesByAgent.size,
       agent_peer_label: this.agentPeerLabel,
       agent_session_id: this.agentSessionId,
       base_uri: this.baseUri,
@@ -1384,6 +1612,8 @@ function processInboundFrames(role, sessionId, externalLane, decoder, chunk) {
     if (externalLane === LANE_DATA) {
       if (frame.typeId === FRAME_DATA) {
         logicalLane = (frame.flags & FLAG_DATA_BULK) ? "bulk" : "pri";
+      } else if (DNS_FRAME_TYPES.has(frame.typeId)) {
+        logicalLane = "pri";
       } else {
         logicalLane = LANE_CTL;
       }

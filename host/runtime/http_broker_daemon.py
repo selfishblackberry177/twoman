@@ -29,6 +29,9 @@ from twoman_protocol import (
     Frame,
     FrameDecoder,
     FRAME_DATA,
+    FRAME_DNS_FAIL,
+    FRAME_DNS_QUERY,
+    FRAME_DNS_RESPONSE,
     FRAME_FIN,
     FRAME_OPEN,
     FRAME_OPEN_FAIL,
@@ -57,6 +60,7 @@ LOGGER = logging.getLogger("twoman.http_broker")
 RUNTIME_LOG_PATH = ""
 EVENT_LOG_PATH = ""
 EVENT_RECORDER = None
+DNS_FRAME_TYPES = {FRAME_DNS_QUERY, FRAME_DNS_RESPONSE, FRAME_DNS_FAIL}
 
 
 def now_ms():
@@ -226,6 +230,20 @@ class StreamState(object):
         self.last_seen_ms = now_ms()
 
 
+class DnsQueryState(object):
+    def __init__(self, helper_session_id, helper_peer_label, helper_request_id, agent_session_id, agent_request_id):
+        self.helper_session_id = helper_session_id
+        self.helper_peer_label = helper_peer_label
+        self.helper_request_id = int(helper_request_id)
+        self.agent_session_id = agent_session_id
+        self.agent_request_id = int(agent_request_id)
+        self.created_at_ms = now_ms()
+        self.last_seen_ms = self.created_at_ms
+
+    def touch(self):
+        self.last_seen_ms = now_ms()
+
+
 def _normalize_lane_profiles(config):
     defaults = {
         LANE_CTL: {"max_bytes": 4096, "max_frames": 8, "hold_ms": 1, "pad_min": 1024},
@@ -261,6 +279,7 @@ class BrokerState(object):
         self.agent_tokens = set(self.agent_token_list)
         self.peer_ttl_ms = int(config.get("peer_ttl_seconds", 90)) * 1000
         self.stream_ttl_ms = int(config.get("stream_ttl_seconds", 300)) * 1000
+        self.dns_query_ttl_ms = int(config.get("dns_query_ttl_seconds", 30)) * 1000
         self.max_lane_bytes = int(config.get("max_lane_bytes", 16 * 1024 * 1024))
         self.max_streams_per_peer_session = max(1, int(config.get("max_streams_per_peer_session", 256)))
         self.max_open_rate_per_peer_session = max(1, int(config.get("max_open_rate_per_peer_session", 120)))
@@ -273,9 +292,12 @@ class BrokerState(object):
         self.peers = {}
         self.streams_by_helper = {}
         self.streams_by_agent = {}
+        self.dns_queries_by_helper = {}
+        self.dns_queries_by_agent = {}
         self.agent_session_id = ""
         self.agent_peer_label = ""
         self.next_agent_stream_id = random.randint(1, 0xFFFFFFFF)
+        self.next_agent_dns_request_id = random.randint(1, 0xFFFFFFFF)
         self.metrics = {
             "down_responses": dict((lane, 0) for lane in LANES),
             "down_frames": dict((lane, 0) for lane in LANES),
@@ -299,6 +321,18 @@ class BrokerState(object):
                 raise RuntimeError("no available agent stream ids")
         self.next_agent_stream_id = 1 if stream_id >= 0xFFFFFFFF else stream_id + 1
         return stream_id
+
+    def _allocate_agent_dns_request_id_locked(self):
+        request_id = int(self.next_agent_dns_request_id) & 0xFFFFFFFF
+        if request_id <= 0:
+            request_id = 1
+        start = request_id
+        while request_id in self.dns_queries_by_agent:
+            request_id = 1 if request_id >= 0xFFFFFFFF else request_id + 1
+            if request_id == start:
+                raise RuntimeError("no available agent dns request ids")
+        self.next_agent_dns_request_id = 1 if request_id >= 0xFFFFFFFF else request_id + 1
+        return request_id
 
     async def auth(self, role, token):
         if role == "helper":
@@ -400,6 +434,12 @@ class BrokerState(object):
         if frame.type_id == FRAME_OPEN and sender_role == "helper":
             await self._handle_open(sender_peer_session_id, frame)
             return
+        if frame.type_id == FRAME_DNS_QUERY and sender_role == "helper":
+            await self._handle_dns_query(sender_peer_session_id, lane, frame)
+            return
+        if frame.type_id in (FRAME_DNS_RESPONSE, FRAME_DNS_FAIL):
+            await self._handle_dns_result(sender_role, sender_peer_session_id, lane, frame)
+            return
 
         async with self.lock:
             if sender_role == "helper":
@@ -450,7 +490,7 @@ class BrokerState(object):
             payload=frame.payload,
             flags=frame.flags,
         )
-        target_lane = lane if frame.type_id == FRAME_DATA else LANE_CTL
+        target_lane = lane if (frame.type_id == FRAME_DATA or frame.type_id in DNS_FRAME_TYPES) else LANE_CTL
         queued = await self.queue_frame(target_role, target_peer_session_id, target_lane, outbound_frame)
         if not queued and sender_role == "helper":
             await self.queue_frame(
@@ -479,6 +519,119 @@ class BrokerState(object):
             async with self.lock:
                 if self._stream_delivery_complete_locked(stream):
                     self._drop_stream_locked(stream)
+
+    async def _handle_dns_query(self, helper_session_id, lane, frame):
+        open_error = ""
+        async with self.lock:
+            agent_session_id = self.agent_session_id
+            helper_peer = self.peers.get(("helper", helper_session_id))
+            helper_peer_label = helper_peer.peer_label if helper_peer is not None else helper_session_id
+            if helper_peer is None:
+                open_error = "helper session unavailable"
+            if not agent_session_id or ("agent", agent_session_id) not in self.peers:
+                agent_session_id = ""
+            if agent_session_id and not open_error:
+                agent_request_id = self._allocate_agent_dns_request_id_locked()
+                query = DnsQueryState(
+                    helper_session_id,
+                    helper_peer_label,
+                    frame.stream_id,
+                    agent_session_id,
+                    agent_request_id,
+                )
+                self.dns_queries_by_helper[(helper_session_id, frame.stream_id)] = query
+                self.dns_queries_by_agent[agent_request_id] = query
+                record_event(
+                    "dns_query_map",
+                    helper_session_id=helper_session_id,
+                    helper_peer_label=helper_peer_label,
+                    helper_request_id=frame.stream_id,
+                    agent_session_id=agent_session_id,
+                    agent_request_id=agent_request_id,
+                )
+        if open_error:
+            await self.queue_frame(
+                "helper",
+                helper_session_id,
+                LANE_PRI,
+                Frame(FRAME_DNS_FAIL, stream_id=frame.stream_id, payload=make_error_payload(open_error)),
+            )
+            return
+        if not agent_session_id:
+            await self.queue_frame(
+                "helper",
+                helper_session_id,
+                LANE_PRI,
+                Frame(FRAME_DNS_FAIL, stream_id=frame.stream_id, payload=make_error_payload("hidden agent unavailable")),
+            )
+            return
+        queued = await self.queue_frame(
+            "agent",
+            agent_session_id,
+            lane if lane in ("pri", "bulk") else "pri",
+            Frame(
+                FRAME_DNS_QUERY,
+                stream_id=agent_request_id,
+                offset=frame.offset,
+                payload=frame.payload,
+                flags=frame.flags,
+            ),
+        )
+        if queued:
+            return
+        async with self.lock:
+            query = self.dns_queries_by_helper.get((helper_session_id, frame.stream_id))
+            if query is not None:
+                self._drop_dns_query_locked(query, reason="agent-queue-failed")
+        await self.queue_frame(
+            "helper",
+            helper_session_id,
+            LANE_PRI,
+            Frame(FRAME_DNS_FAIL, stream_id=frame.stream_id, payload=make_error_payload("hidden agent unavailable")),
+        )
+
+    async def _handle_dns_result(self, sender_role, sender_peer_session_id, lane, frame):
+        if sender_role != "agent":
+            record_event(
+                "frame_drop",
+                reason="unexpected-dns-result-sender",
+                sender_role=sender_role,
+                sender_peer_session_id=sender_peer_session_id,
+                lane=lane,
+                type_id=frame.type_id,
+                stream_id=frame.stream_id,
+            )
+            return
+        async with self.lock:
+            query = self.dns_queries_by_agent.get(frame.stream_id)
+            if query is None:
+                record_event(
+                    "frame_drop",
+                    reason="unknown-dns-query",
+                    sender_role=sender_role,
+                    sender_peer_session_id=sender_peer_session_id,
+                    lane=lane,
+                    type_id=frame.type_id,
+                    stream_id=frame.stream_id,
+                )
+                return
+            query.touch()
+        await self.queue_frame(
+            "helper",
+            query.helper_session_id,
+            lane if lane in ("pri", "bulk") else "pri",
+            Frame(
+                frame.type_id,
+                stream_id=query.helper_request_id,
+                offset=frame.offset,
+                payload=frame.payload,
+                flags=frame.flags,
+            ),
+        )
+        async with self.lock:
+            live_query = self.dns_queries_by_agent.get(frame.stream_id)
+            if live_query is not None:
+                self._drop_dns_query_locked(live_query, reason="completed")
 
     async def _handle_open(self, helper_session_id, frame):
         open_error = ""
@@ -596,6 +749,19 @@ class BrokerState(object):
         if agent_peer is not None and agent_peer.active_streams > 0:
             agent_peer.active_streams -= 1
 
+    def _drop_dns_query_locked(self, query, reason=""):
+        self.dns_queries_by_helper.pop((query.helper_session_id, query.helper_request_id), None)
+        self.dns_queries_by_agent.pop(query.agent_request_id, None)
+        record_event(
+            "drop_dns_query",
+            helper_session_id=query.helper_session_id,
+            helper_peer_label=query.helper_peer_label,
+            helper_request_id=query.helper_request_id,
+            agent_session_id=query.agent_session_id,
+            agent_request_id=query.agent_request_id,
+            reason=reason,
+        )
+
     def _stream_delivery_complete_locked(self, stream):
         if not (stream.helper_fin_seen and stream.agent_fin_seen):
             return False
@@ -624,6 +790,7 @@ class BrokerState(object):
     async def cleanup(self):
         peer_cutoff = now_ms() - self.peer_ttl_ms
         stream_cutoff = now_ms() - self.stream_ttl_ms
+        dns_query_cutoff = now_ms() - self.dns_query_ttl_ms
         resets = []
         async with self.lock:
             stale_peers = [key for key, peer in self.peers.items() if peer.last_seen_ms < peer_cutoff]
@@ -638,6 +805,24 @@ class BrokerState(object):
                 for stream in stale_streams_for_peer:
                     resets.extend(self._reset_frames_for_stale_peer_locked(role, peer_session_id, stream))
                     self._drop_stream_locked(stream)
+                stale_dns_queries_for_peer = [
+                    query
+                    for query in self.dns_queries_by_agent.values()
+                    if query.helper_session_id == peer_session_id or query.agent_session_id == peer_session_id
+                ]
+                for query in stale_dns_queries_for_peer:
+                    if role == "agent" and ("helper", query.helper_session_id) in self.peers:
+                        resets.append((
+                            "helper",
+                            query.helper_session_id,
+                            "pri",
+                            Frame(
+                                FRAME_DNS_FAIL,
+                                stream_id=query.helper_request_id,
+                                payload=make_error_payload("peer expired"),
+                            ),
+                        ))
+                    self._drop_dns_query_locked(query, reason="peer-expired")
                 del self.peers[key]
                 if role == "agent" and self.agent_session_id == peer_session_id:
                     self.agent_session_id = ""
@@ -654,6 +839,30 @@ class BrokerState(object):
                 )
                 resets.extend(self._reset_frames_for_stale_stream_locked(stream))
                 self._drop_stream_locked(stream)
+
+            stale_dns_queries = [
+                query for query in self.dns_queries_by_agent.values() if query.last_seen_ms < dns_query_cutoff
+            ]
+            for query in stale_dns_queries:
+                record_event(
+                    "cleanup_dns_query_expired",
+                    helper_session_id=query.helper_session_id,
+                    helper_request_id=query.helper_request_id,
+                    agent_session_id=query.agent_session_id,
+                    agent_request_id=query.agent_request_id,
+                )
+                if ("helper", query.helper_session_id) in self.peers:
+                    resets.append((
+                        "helper",
+                        query.helper_session_id,
+                        "pri",
+                        Frame(
+                            FRAME_DNS_FAIL,
+                            stream_id=query.helper_request_id,
+                            payload=make_error_payload("dns query expired"),
+                        ),
+                    ))
+                self._drop_dns_query_locked(query, reason="query-expired")
 
         for role, peer_session_id, lane, frame in resets:
             await self.queue_frame(role, peer_session_id, lane, frame)
@@ -704,6 +913,7 @@ class BrokerState(object):
             return {
                 "peers": len(self.peers),
                 "streams": len(self.streams_by_agent),
+                "dns_queries": len(self.dns_queries_by_agent),
                 "agent_peer_label": self.agent_peer_label,
                 "agent_session_id": self.agent_session_id,
                 "log_paths": {
@@ -1201,6 +1411,8 @@ class AsyncBrokerServer(object):
                 frame_lane = "bulk" if (frame.flags & FLAG_DATA_BULK) else "pri"
                 if frame_lane == "bulk":
                     batch_lane = "bulk"
+            elif lane == LANE_DATA and frame.type_id in DNS_FRAME_TYPES:
+                frame_lane = "pri"
             elif lane == LANE_DATA:
                 frame_lane = LANE_CTL
             if frame.type_id != FRAME_DATA:

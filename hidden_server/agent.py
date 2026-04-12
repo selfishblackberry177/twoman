@@ -21,6 +21,9 @@ if os.path.isdir(VENDOR_DIR) and VENDOR_DIR not in sys.path:
 from twoman_protocol import (
     Frame,
     FRAME_DATA,
+    FRAME_DNS_FAIL,
+    FRAME_DNS_QUERY,
+    FRAME_DNS_RESPONSE,
     FRAME_FIN,
     FRAME_OPEN,
     FRAME_OPEN_FAIL,
@@ -42,6 +45,13 @@ from runtime_diagnostics import (
     runtime_log_path,
     runtime_log_settings,
 )
+from twoman_dns import (
+    format_error_summary,
+    parse_dns_query_frame_payload,
+    resolve_dns_via_upstreams,
+    vpn_dns_proxy_ip,
+    vpn_dns_servers,
+)
 from twoman_transport import create_transport
 
 
@@ -52,7 +62,8 @@ WINDOW_FLUSH_BYTES = 16 * 1024
 WINDOW_FLUSH_DELAY = 0.005
 SMALL_WRITE_BYTES = 8 * 1024
 MAX_RECV_REORDER_BYTES = 1024 * 1024
-DNS_CTL_LANE_LIMIT = 2048
+DNS_QUERY_TIMEOUT = max(0.5, float(os.environ.get("TWOMAN_DNS_QUERY_TIMEOUT", "2.5")))
+DNS_MAX_INFLIGHT = max(1, int(os.environ.get("TWOMAN_DNS_MAX_INFLIGHT", "8")))
 
 TRACE_ENABLED = os.environ.get("TWOMAN_TRACE", "").strip().lower() in ("1", "true", "yes", "on", "debug", "verbose")
 DEFAULT_OPEN_CONNECT_TIMEOUT_SECONDS = 12.0
@@ -418,10 +429,8 @@ class RemoteStream(object):
             self.agent.release_stream(self.stream_id, self)
 
     def _data_lane(self, chunk_len):
-        # Keep short DNS exchanges on ctl so OPEN/DATA/FIN stay ordered while
-        # the collapsed data lane warms up under tunnel startup load.
-        if self.target_port == 53 and (self.send_offset + int(chunk_len)) <= DNS_CTL_LANE_LIMIT:
-            return LANE_CTL
+        # Keep early bytes on the priority lane so interactive traffic is not
+        # immediately pushed onto the bulk path.
         if self.send_offset < PRI_LIMIT and (self.send_offset + int(chunk_len)) <= PRI_LIMIT:
             return LANE_PRI
         return LANE_BULK
@@ -442,6 +451,12 @@ class AgentRuntime(object):
         )
         self.prefer_ipv4 = bool(config.get("prefer_ipv4", True))
         self.disable_ipv6_origin = bool(config.get("disable_ipv6_origin", False))
+        self.dns_query_timeout = max(
+            0.5,
+            float(config.get("dns_query_timeout_seconds", config.get("vpn_dns_query_timeout_seconds", DNS_QUERY_TIMEOUT))),
+        )
+        self.dns_semaphore = asyncio.Semaphore(max(1, int(config.get("dns_max_inflight", DNS_MAX_INFLIGHT))))
+        self.dns_tasks = set()
 
     async def start(self):
         await self.transport.start()
@@ -467,12 +482,41 @@ class AgentRuntime(object):
             record_event("agent_stopped", transport_session_id=self.transport.peer_session_id)
 
     async def stop(self):
+        for task in list(self.dns_tasks):
+            task.cancel()
+        if self.dns_tasks:
+            with contextlib.suppress(Exception):
+                await asyncio.gather(*list(self.dns_tasks), return_exceptions=True)
+        self.dns_tasks.clear()
         for stream in list(self.streams.values()):
             with contextlib.suppress(Exception):
                 await stream.close()
         await self.transport.stop()
 
     async def on_frame(self, frame, _lane):
+        if frame.type_id == FRAME_DNS_QUERY:
+            try:
+                details = parse_dns_query_frame_payload(frame.payload)
+            except Exception as error:
+                error_text = format_error_summary(error) or "invalid dns query"
+                await self.transport.send_frame(
+                    LANE_PRI,
+                    Frame(FRAME_DNS_FAIL, stream_id=frame.stream_id, payload=make_error_payload(error_text)),
+                )
+                return
+            trace("recv DNS_QUERY request=%s target=%s bytes=%s" % (frame.stream_id, details["target_host"], len(details["dns_payload"])))
+            record_event(
+                "dns_query_received",
+                request_id=frame.stream_id,
+                target_host=details["target_host"],
+                payload_bytes=len(details["dns_payload"]),
+            )
+            task = asyncio.create_task(
+                self._handle_dns_query(frame.stream_id, details["target_host"], details["dns_payload"])
+            )
+            self.dns_tasks.add(task)
+            task.add_done_callback(self.dns_tasks.discard)
+            return
         if frame.type_id == FRAME_OPEN:
             details = parse_open_payload(frame.payload)
             trace("recv OPEN stream=%s host=%s port=%s" % (frame.stream_id, details['host'], details['port']))
@@ -504,6 +548,50 @@ class AgentRuntime(object):
 
     def _record_transport_event(self, event):
         record_event(**event)
+
+    async def _handle_dns_query(self, request_id, target_host, payload):
+        upstream_hosts = []
+        proxy_ip = vpn_dns_proxy_ip(self.config)
+        if target_host and target_host != proxy_ip:
+            upstream_hosts.append(target_host)
+        for fallback_host in vpn_dns_servers(self.config):
+            if fallback_host not in upstream_hosts:
+                upstream_hosts.append(fallback_host)
+        try:
+            async with self.dns_semaphore:
+                upstream_host, response = await resolve_dns_via_upstreams(
+                    upstream_hosts,
+                    payload,
+                    self.dns_query_timeout,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            error_text = format_error_summary(error) or "dns query failed"
+            trace("dns query fail request=%s target=%s error=%s" % (request_id, target_host, error_text))
+            record_event(
+                "dns_query_failed",
+                request_id=request_id,
+                target_host=target_host,
+                error=error_text,
+            )
+            await self.transport.send_frame(
+                LANE_PRI,
+                Frame(FRAME_DNS_FAIL, stream_id=request_id, payload=make_error_payload(error_text)),
+            )
+            return
+        trace("dns query ok request=%s target=%s upstream=%s bytes=%s" % (request_id, target_host, upstream_host, len(response)))
+        record_event(
+            "dns_query_resolved",
+            request_id=request_id,
+            target_host=target_host,
+            upstream_host=upstream_host,
+            payload_bytes=len(response),
+        )
+        await self.transport.send_frame(
+            LANE_PRI,
+            Frame(FRAME_DNS_RESPONSE, stream_id=request_id, payload=response),
+        )
 
     async def open_origin_connection(self, host, port):
         loop = asyncio.get_running_loop()

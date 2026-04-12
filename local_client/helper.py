@@ -27,6 +27,9 @@ from twoman_protocol import (
     Frame,
     FLAG_DATA_BULK,
     FRAME_DATA,
+    FRAME_DNS_FAIL,
+    FRAME_DNS_QUERY,
+    FRAME_DNS_RESPONSE,
     FRAME_FIN,
     FRAME_OPEN,
     FRAME_OPEN_FAIL,
@@ -43,6 +46,21 @@ from twoman_protocol import (
     random_peer_id,
 )
 from runtime_diagnostics import DurableEventRecorder, event_log_path, event_log_settings, runtime_log_settings
+from twoman_dns import (
+    DNS_TYPE_AAAA,
+    DNS_TYPE_HTTPS,
+    dns_query_cache_key,
+    dns_question_type,
+    dns_transaction_id,
+    expire_dns_cache,
+    format_error_summary,
+    make_dns_query_frame_payload,
+    synthesize_empty_dns_response,
+    vpn_dns_proxy_ip,
+    vpn_dns_servers,
+    vpn_filter_aaaa,
+    with_dns_transaction_id,
+)
 from twoman_transport import create_transport
 
 
@@ -53,7 +71,6 @@ WINDOW_FLUSH_BYTES = 16 * 1024
 WINDOW_FLUSH_DELAY = 0.005
 SMALL_WRITE_BYTES = 8 * 1024
 MAX_RECV_REORDER_BYTES = 1024 * 1024
-DNS_CTL_LANE_LIMIT = 2048
 DNS_QUERY_TIMEOUT = max(0.5, float(os.environ.get("TWOMAN_DNS_QUERY_TIMEOUT", "2.5")))
 DNS_CACHE_TTL_SECONDS = max(1.0, float(os.environ.get("TWOMAN_DNS_CACHE_TTL_SECONDS", "20.0")))
 DNS_CACHE_MAX_ENTRIES = max(32, int(os.environ.get("TWOMAN_DNS_CACHE_MAX_ENTRIES", "256")))
@@ -62,9 +79,6 @@ SHUTDOWN_STREAM_RESET_GRACE_SECONDS = max(
     0.0,
     float(os.environ.get("TWOMAN_SHUTDOWN_STREAM_RESET_GRACE_SECONDS", "0.2")),
 )
-DEFAULT_VPN_DNS_SERVERS = ["1.1.1.1", "8.8.8.8"]
-DNS_TYPE_AAAA = 28
-DNS_TYPE_HTTPS = 65
 
 TRACE_ENABLED = os.environ.get("TWOMAN_TRACE", "").strip().lower() in ("1", "true", "yes", "on", "debug", "verbose")
 LOGGER = logging.getLogger("twoman.helper")
@@ -473,139 +487,32 @@ def build_socks_udp_packet(host, port, payload):
     return b"\x00\x00\x00" + encode_socks_address(host, port) + payload
 
 
-def config_flag(config, key, default=False):
-    value = config.get(key, default)
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower()
-    if text in ("1", "true", "yes", "on"):
-        return True
-    if text in ("0", "false", "no", "off"):
-        return False
-    return bool(default)
-
-
-def vpn_filter_aaaa(config):
-    if "vpn_filter_aaaa" in config:
-        return config_flag(config, "vpn_filter_aaaa", False)
-    return config_flag(config, "vpn_prefer_ipv4", False)
-
-
-def dns_question_type(payload):
-    data = bytes(payload)
-    if len(data) < 12:
-        return None
-    question_count = struct.unpack("!H", data[4:6])[0]
-    if question_count != 1:
-        return None
-    index = 12
-    while True:
-        if index >= len(data):
-            return None
-        label_length = data[index]
-        index += 1
-        if label_length == 0:
-            break
-        if label_length & 0xC0:
-            return None
-        index += label_length
-        if index > len(data):
-            return None
-    if index + 4 > len(data):
-        return None
-    return struct.unpack("!H", data[index : index + 2])[0]
-
-
-def synthesize_empty_dns_response(payload):
-    data = bytes(payload)
-    if len(data) < 12:
-        return data
-    flags = struct.unpack("!H", data[2:4])[0]
-    response_flags = 0x8000 | (flags & 0x7910) | 0x0080
-    return data[:2] + struct.pack("!H", response_flags) + data[4:6] + b"\x00\x00\x00\x00" + data[10:]
-
-
-def vpn_dns_servers(config):
-    configured = config.get("vpn_dns_servers")
-    if isinstance(configured, list):
-        values = [str(item).strip() for item in configured if str(item).strip()]
-        if values:
-            return values
-    return list(DEFAULT_VPN_DNS_SERVERS)
-
-
-def vpn_dns_proxy_ip(config):
-    return str(config.get("vpn_dns_proxy_ip", "")).strip()
-
-
-def dns_query_cache_key(payload):
-    data = bytes(payload)
-    if len(data) < 2:
-        return data
-    return data[2:]
-
-
-def dns_transaction_id(payload):
-    data = bytes(payload)
-    if len(data) >= 2:
-        return data[:2]
-    return b"\x00\x00"
-
-
-def with_dns_transaction_id(payload, transaction_id):
-    data = bytes(payload)
-    if len(data) < 2 or len(transaction_id) != 2:
-        return data
-    return bytes(transaction_id) + data[2:]
-
-
-def format_error_summary(error):
-    if error is None:
-        return ""
-    text = str(error).strip()
-    if text:
-        return text
-    return error.__class__.__name__
-
-
-def expire_dns_cache(cache, now_monotonic, max_entries):
-    expired_keys = [key for key, entry in cache.items() if entry["expires_at"] <= now_monotonic]
-    for key in expired_keys:
-        cache.pop(key, None)
-    while len(cache) > max_entries:
-        cache.pop(next(iter(cache)))
-
-
-async def tcp_dns_query(runtime, host, port, payload):
-    stream = runtime.new_stream(host, port)
-    buffered = bytearray()
-    failure = None
+async def query_dns_transport(runtime, target_host, payload):
+    request_id = runtime.allocate_dns_request_id()
+    loop = asyncio.get_running_loop()
+    response_future = loop.create_future()
+    runtime.dns_requests[request_id] = response_future
     try:
-        await asyncio.wait_for(stream.open(), timeout=runtime.dns_query_timeout)
-        await stream.send_data(struct.pack("!H", len(payload)) + payload)
-        await stream.finish()
-        while len(buffered) < 2:
-            chunk = await asyncio.wait_for(stream.recv_queue.get(), timeout=runtime.dns_query_timeout)
-            if chunk is None:
-                raise RuntimeError("dns response closed before length")
-            buffered.extend(chunk)
-            await stream.grant_window(len(chunk))
-        response_length = struct.unpack("!H", buffered[:2])[0]
-        while len(buffered) - 2 < response_length:
-            chunk = await asyncio.wait_for(stream.recv_queue.get(), timeout=runtime.dns_query_timeout)
-            if chunk is None:
-                raise RuntimeError("dns response closed early")
-            buffered.extend(chunk)
-            await stream.grant_window(len(chunk))
-        return bytes(buffered[2 : 2 + response_length])
-    except Exception as error:
-        failure = error
-        raise
+        trace("dns query send request=%s target=%s bytes=%s" % (request_id, target_host, len(payload)))
+        record_event(
+            "dns_query_sent",
+            request_id=request_id,
+            target_host=target_host,
+            payload_bytes=len(payload),
+        )
+        await runtime.transport.send_frame(
+            LANE_PRI,
+            Frame(
+                FRAME_DNS_QUERY,
+                stream_id=request_id,
+                payload=make_dns_query_frame_payload(target_host, payload),
+            ),
+        )
+        return await asyncio.wait_for(response_future, timeout=runtime.dns_query_timeout)
     finally:
-        if failure is not None:
-            with contextlib.suppress(Exception):
-                await stream.reset("dns query failed")
-        await runtime.release_stream(stream.stream_id)
+        current = runtime.dns_requests.get(request_id)
+        if current is response_future:
+            runtime.dns_requests.pop(request_id, None)
 
 
 async def resolve_dns_query(runtime, target_host, payload):
@@ -642,57 +549,16 @@ async def resolve_dns_query(runtime, target_host, payload):
 
 
 async def _resolve_dns_query_uncached(runtime, target_host, payload):
-    upstream_hosts = []
-    proxy_ip = vpn_dns_proxy_ip(runtime.config)
-    if target_host and target_host != proxy_ip:
-        upstream_hosts.append(target_host)
-    for fallback_host in vpn_dns_servers(runtime.config):
-        if fallback_host not in upstream_hosts:
-            upstream_hosts.append(fallback_host)
-    last_error = None
-    tasks = []
-    try:
-        async with runtime.dns_semaphore:
-            async def query_upstream(upstream_host):
-                response = await tcp_dns_query(runtime, upstream_host, 53, payload)
-                return upstream_host, response
-
-            tasks = [asyncio.create_task(query_upstream(upstream_host)) for upstream_host in upstream_hosts]
-            while tasks:
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                tasks = list(pending)
-                for completed in done:
-                    try:
-                        upstream_host, response = completed.result()
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as error:
-                        last_error = error
-                        trace(
-                            "dns udp relay upstream error target=%s error=%s"
-                            % (target_host, format_error_summary(error))
-                        )
-                        continue
-                    for pending_task in tasks:
-                        pending_task.cancel()
-                    if tasks:
-                        await asyncio.gather(*tasks, return_exceptions=True)
-                        tasks = []
-                    async with runtime.dns_cache_lock:
-                        expire_dns_cache(runtime.dns_cache, time.monotonic(), runtime.dns_cache_max_entries)
-                        runtime.dns_cache[dns_query_cache_key(payload)] = {
-                            "expires_at": time.monotonic() + runtime.dns_cache_ttl_seconds,
-                            "response": response,
-                        }
-                    trace("dns udp relay target=%s upstream=%s bytes=%s" % (target_host, upstream_host, len(response)))
-                    return response
-    finally:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-    raise last_error or RuntimeError("dns query failed")
+    async with runtime.dns_semaphore:
+        response = await query_dns_transport(runtime, target_host, payload)
+    async with runtime.dns_cache_lock:
+        expire_dns_cache(runtime.dns_cache, time.monotonic(), runtime.dns_cache_max_entries)
+        runtime.dns_cache[dns_query_cache_key(payload)] = {
+            "expires_at": time.monotonic() + runtime.dns_cache_ttl_seconds,
+            "response": response,
+        }
+    trace("dns relay target=%s bytes=%s via=protocol" % (target_host, len(response)))
+    return response
 
 
 class SocksUdpAssociation(asyncio.DatagramProtocol):
@@ -1088,10 +954,8 @@ class ProxyStream(object):
         self.closed = True
 
     def _data_lane(self, chunk_len):
-        # Keep small DNS exchanges on ctl so OPEN/DATA/FIN stay ordered while
-        # the collapsed data lane warms up under VPN startup bursts.
-        if self.target_port == 53 and (self.send_offset + int(chunk_len)) <= DNS_CTL_LANE_LIMIT:
-            return LANE_CTL
+        # Keep early bytes on the priority lane so interactive traffic is not
+        # immediately pushed onto the bulk path.
         if self.send_offset < PRI_LIMIT and (self.send_offset + int(chunk_len)) <= PRI_LIMIT:
             return LANE_PRI
         return LANE_BULK
@@ -1112,7 +976,10 @@ class HelperRuntime(object):
         self.dns_semaphore = asyncio.Semaphore(max(1, int(config.get("vpn_dns_max_inflight", DNS_MAX_INFLIGHT))))
         self.dns_cache = {}
         self.dns_inflight = {}
+        self.dns_requests = {}
         self.dns_cache_lock = asyncio.Lock()
+        dns_seed = int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFE
+        self.next_dns_request_id = dns_seed if dns_seed > 0 else 2
         self.active_connection_tasks = set()
         self.active_connection_writers = set()
 
@@ -1122,13 +989,43 @@ class HelperRuntime(object):
     async def stop(self):
         await self.shutdown_active_connections()
         await self._reset_active_streams_for_shutdown()
+        self._fail_pending_dns_requests("helper stopping")
         await self.transport.stop()
 
     async def on_frame(self, frame, _lane):
+        if frame.type_id in (FRAME_DNS_RESPONSE, FRAME_DNS_FAIL):
+            future = self.dns_requests.get(frame.stream_id)
+            if future is None or future.done():
+                return
+            if frame.type_id == FRAME_DNS_RESPONSE:
+                trace("dns query recv request=%s bytes=%s" % (frame.stream_id, len(frame.payload)))
+                record_event("dns_query_response", request_id=frame.stream_id, payload_bytes=len(frame.payload))
+                future.set_result(frame.payload)
+            else:
+                error_text = parse_error_payload(frame.payload) or "dns query failed"
+                trace("dns query fail request=%s error=%s" % (frame.stream_id, error_text))
+                record_event("dns_query_fail", request_id=frame.stream_id, error=error_text)
+                future.set_exception(RuntimeError(error_text))
+            return
         stream = self.streams.get(frame.stream_id)
         if stream is None:
             return
         await stream.on_frame(frame)
+
+    def allocate_dns_request_id(self):
+        request_id = int(self.next_dns_request_id) & 0xFFFFFFFF
+        if request_id <= 0:
+            request_id = 2
+        start = request_id
+        while request_id in self.dns_requests:
+            request_id += 2
+            if request_id > 0xFFFFFFFF:
+                request_id = 2
+            if request_id == start:
+                raise RuntimeError("no available dns request ids")
+        next_request_id = request_id + 2
+        self.next_dns_request_id = 2 if next_request_id > 0xFFFFFFFF else next_request_id
+        return request_id
 
     def new_stream(self, target_host, target_port):
         stream_id = self.next_stream_id
@@ -1140,6 +1037,14 @@ class HelperRuntime(object):
     async def release_stream(self, stream_id):
         self.streams.pop(stream_id, None)
         record_event("stream_released", stream_id=stream_id)
+
+    def _fail_pending_dns_requests(self, message):
+        for request_id, future in list(self.dns_requests.items()):
+            if future.done():
+                continue
+            future.set_exception(RuntimeError(message))
+            record_event("dns_query_cancelled", request_id=request_id, reason=message)
+        self.dns_requests.clear()
 
     def register_connection(self, task, writer):
         if task is not None:
