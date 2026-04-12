@@ -38,6 +38,8 @@ TWOMAN_DISABLE_IPV6_ORIGIN="${TWOMAN_DISABLE_IPV6_ORIGIN:-false}"
 TWOMAN_HAPPY_EYEBALLS_DELAY_SECONDS="${TWOMAN_HAPPY_EYEBALLS_DELAY_SECONDS:-0.25}"
 TWOMAN_UPSTREAM_PROXY_URL="${TWOMAN_UPSTREAM_PROXY_URL:-}"
 TWOMAN_UPSTREAM_PROXY_LABEL="${TWOMAN_UPSTREAM_PROXY_LABEL:-}"
+TWOMAN_OUTBOUND_PROXY_URL="${TWOMAN_OUTBOUND_PROXY_URL:-}"
+TWOMAN_OUTBOUND_PROXY_LABEL="${TWOMAN_OUTBOUND_PROXY_LABEL:-}"
 TWOMAN_AUTH_MODE="${TWOMAN_AUTH_MODE:-bearer}"
 TWOMAN_LEGACY_CUSTOM_HEADERS_ENABLED="${TWOMAN_LEGACY_CUSTOM_HEADERS_ENABLED:-false}"
 TWOMAN_BINARY_MEDIA_TYPE="${TWOMAN_BINARY_MEDIA_TYPE:-image/webp}"
@@ -67,9 +69,18 @@ PY
 )"
 fi
 
+OUTBOUND_PROXY_JSON="null"
+if [ -n "${TWOMAN_OUTBOUND_PROXY_URL}" ]; then
+  OUTBOUND_PROXY_JSON="$(python3 - <<'PY'
+import json, os
+print(json.dumps(os.environ["TWOMAN_OUTBOUND_PROXY_URL"]))
+PY
+)"
+fi
+
 SYSTEMD_AFTER="After=network-online.target"
 SYSTEMD_WANTS="Wants=network-online.target"
-if [ "${TWOMAN_UPSTREAM_PROXY_LABEL}" = "wireproxy" ]; then
+if [ "${TWOMAN_UPSTREAM_PROXY_LABEL}" = "wireproxy" ] || [ "${TWOMAN_OUTBOUND_PROXY_LABEL}" = "wireproxy" ]; then
   SYSTEMD_AFTER="After=network-online.target wireproxy.service"
   SYSTEMD_WANTS="Wants=network-online.target wireproxy.service"
 fi
@@ -97,6 +108,7 @@ echo "Uploading agent files..."
   twoman_crypto.py \
   twoman_dns.py \
   twoman_http.py \
+  twoman_proxy.py \
   twoman_protocol.py \
   twoman_transport.py \
   hidden_server/agent.py \
@@ -112,6 +124,7 @@ CONFIG_JSON="$(cat <<EOF
   "transport_profile": "auto",
   "broker_base_url": "${TWOMAN_BROKER_BASE_URL}",
   "upstream_proxy_url": ${UPSTREAM_PROXY_JSON},
+  "outbound_proxy_url": ${OUTBOUND_PROXY_JSON},
   "agent_token": "${TWOMAN_AGENT_TOKEN}",
   "auth_mode": "${TWOMAN_AUTH_MODE}",
   "legacy_custom_headers_enabled": ${TWOMAN_LEGACY_CUSTOM_HEADERS_ENABLED},
@@ -129,6 +142,7 @@ CONFIG_JSON="$(cat <<EOF
   "max_batch_bytes": 65536,
   "verify_tls": ${TWOMAN_VERIFY_TLS},
   "peer_id": "${TWOMAN_AGENT_PEER_ID}",
+  "outbound_proxy_label": "${TWOMAN_OUTBOUND_PROXY_LABEL}",
   "open_connect_timeout_seconds": ${TWOMAN_OPEN_CONNECT_TIMEOUT_SECONDS},
   "prefer_ipv4": ${TWOMAN_PREFER_IPV4},
   "disable_ipv6_origin": ${TWOMAN_DISABLE_IPV6_ORIGIN},

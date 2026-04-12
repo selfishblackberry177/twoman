@@ -59,6 +59,8 @@ class InstallArgs:
     watchdog_timer_name: str
     hidden_upstream_proxy_url: str
     hidden_upstream_proxy_label: str
+    hidden_outbound_proxy_url: str
+    hidden_outbound_proxy_label: str
     verify_tls: bool | None
     skip_helper_probe: bool
 
@@ -148,6 +150,7 @@ def _copy_selected_paths(source_root: Path, bundle_root: Path) -> None:
         "runtime_diagnostics.py",
         "twoman_crypto.py",
         "twoman_http.py",
+        "twoman_proxy.py",
         "twoman_protocol.py",
         "twoman_transport.py",
     ]:
@@ -235,7 +238,7 @@ def _proxy_display_name(proxy_label: str, proxy_url: str) -> str:
     return f"custom upstream proxy via {proxy_url}"
 
 
-def _normalize_hidden_upstream_proxy_url(proxy_url: str) -> str:
+def _normalize_proxy_url(proxy_url: str) -> str:
     normalized = str(proxy_url or "").strip()
     if not normalized:
         return ""
@@ -467,6 +470,8 @@ def _install_local_hidden_server(bundle_root: Path, state: InstallState) -> None
         "TWOMAN_PREFER_IPV4": "true",
         "TWOMAN_UPSTREAM_PROXY_URL": state.hidden_upstream_proxy_url,
         "TWOMAN_UPSTREAM_PROXY_LABEL": state.hidden_upstream_proxy_label,
+        "TWOMAN_OUTBOUND_PROXY_URL": state.hidden_outbound_proxy_url,
+        "TWOMAN_OUTBOUND_PROXY_LABEL": state.hidden_outbound_proxy_label,
     }
     result = _run_script(bundle_root / "scripts" / "install_hidden_server_local.sh", env, cwd=bundle_root)
     if result.returncode != 0:
@@ -562,7 +567,7 @@ def collect_install_args(namespace: object) -> InstallArgs:
     if not site_name and not non_interactive:
         site_name = _prompt_text("Optional camouflage site name", allow_blank=True)
 
-    hidden_upstream_proxy_url = _normalize_hidden_upstream_proxy_url(
+    hidden_upstream_proxy_url = _normalize_proxy_url(
         getattr(namespace, "hidden_upstream_proxy_url", "")
         or (existing_state.hidden_upstream_proxy_url if existing_state else "")
     )
@@ -583,7 +588,7 @@ def collect_install_args(namespace: object) -> InstallArgs:
         )
         if use_hidden_upstream_proxy:
             proxy_default = hidden_upstream_proxy_url or detected_proxy_url or "socks5h://127.0.0.1:1280"
-            hidden_upstream_proxy_url = _normalize_hidden_upstream_proxy_url(_prompt_text(
+            hidden_upstream_proxy_url = _normalize_proxy_url(_prompt_text(
                 "Hidden upstream proxy URL",
                 proxy_default,
             ))
@@ -597,6 +602,52 @@ def collect_install_args(namespace: object) -> InstallArgs:
             hidden_upstream_proxy_label = ""
     elif hidden_upstream_proxy_url and not hidden_upstream_proxy_label:
         hidden_upstream_proxy_label = _proxy_label_for_url(hidden_upstream_proxy_url)
+
+    hidden_outbound_proxy_url = _normalize_proxy_url(
+        getattr(namespace, "hidden_outbound_proxy_url", "")
+        or (existing_state.hidden_outbound_proxy_url if existing_state else "")
+    )
+    hidden_outbound_proxy_label = str(
+        getattr(namespace, "hidden_outbound_proxy_label", "")
+        or (existing_state.hidden_outbound_proxy_label if existing_state else "")
+    ).strip()
+    if not non_interactive:
+        default_enabled = bool(
+            hidden_outbound_proxy_url
+            or (
+                hidden_upstream_proxy_label == "wireproxy"
+                and (hidden_upstream_proxy_url or detected_proxy_url)
+            )
+        )
+        use_hidden_outbound_proxy = _prompt_bool(
+            "Route hidden-server outbound internet traffic through a local WARP / outbound proxy too?",
+            default_enabled,
+        )
+        if use_hidden_outbound_proxy:
+            proxy_default = (
+                hidden_outbound_proxy_url
+                or hidden_upstream_proxy_url
+                or detected_proxy_url
+                or "socks5h://127.0.0.1:1280"
+            )
+            hidden_outbound_proxy_url = _normalize_proxy_url(
+                _prompt_text("Hidden outbound proxy URL", proxy_default)
+            )
+            hidden_outbound_proxy_label = (
+                hidden_outbound_proxy_label
+                or (
+                    hidden_upstream_proxy_label
+                    if hidden_upstream_proxy_url and hidden_outbound_proxy_url == hidden_upstream_proxy_url
+                    else ""
+                )
+                or detected_proxy_label
+                or _proxy_label_for_url(hidden_outbound_proxy_url)
+            )
+        else:
+            hidden_outbound_proxy_url = ""
+            hidden_outbound_proxy_label = ""
+    elif hidden_outbound_proxy_url and not hidden_outbound_proxy_label:
+        hidden_outbound_proxy_label = _proxy_label_for_url(hidden_outbound_proxy_url)
 
     backend = str(getattr(namespace, "backend", "") or (existing_state.backend if existing_state else "")).strip()
     verify_tls = getattr(namespace, "verify_tls", None)
@@ -655,6 +706,8 @@ def collect_install_args(namespace: object) -> InstallArgs:
         ).strip(),
         hidden_upstream_proxy_url=hidden_upstream_proxy_url,
         hidden_upstream_proxy_label=hidden_upstream_proxy_label,
+        hidden_outbound_proxy_url=hidden_outbound_proxy_url,
+        hidden_outbound_proxy_label=hidden_outbound_proxy_label,
         verify_tls=verify_tls,
         skip_helper_probe=bool(getattr(namespace, "skip_helper_probe", False)),
     )
@@ -805,12 +858,15 @@ def install(namespace: object) -> InstallState:
         admin_script_name=admin_script_name,
         hidden_upstream_proxy_url=args.hidden_upstream_proxy_url,
         hidden_upstream_proxy_label=args.hidden_upstream_proxy_label,
+        hidden_outbound_proxy_url=args.hidden_outbound_proxy_url,
+        hidden_outbound_proxy_label=args.hidden_outbound_proxy_label,
         host_capabilities=capabilities,
         notes=[
             "TLS verification defaulted from a live public-origin probe."
             if args.verify_tls is None
             else "TLS verification was chosen explicitly.",
             f"Hidden route: {_proxy_display_name(args.hidden_upstream_proxy_label, args.hidden_upstream_proxy_url)}",
+            f"Outbound route: {_proxy_display_name(args.hidden_outbound_proxy_label, args.hidden_outbound_proxy_url)}",
         ],
     )
 
@@ -821,6 +877,7 @@ def install(namespace: object) -> InstallState:
     print(f"  hidden install root: {state.hidden_install_root}")
     print(f"  hidden service: {state.hidden_service_name}")
     print(f"  hidden route: {_proxy_display_name(state.hidden_upstream_proxy_label, state.hidden_upstream_proxy_url)}")
+    print(f"  outbound route: {_proxy_display_name(state.hidden_outbound_proxy_label, state.hidden_outbound_proxy_url)}")
     if not args.non_interactive and not _prompt_bool("Proceed with deployment?", True):
         raise SystemExit("Cancelled.")
 

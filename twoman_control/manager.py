@@ -58,11 +58,18 @@ class ManagerController:
             return f"WARP WireProxy via {self.state.hidden_upstream_proxy_url}"
         return f"custom upstream proxy via {self.state.hidden_upstream_proxy_url}"
 
+    def outbound_route_text(self) -> str:
+        if not self.state.hidden_outbound_proxy_url:
+            return "direct"
+        if self.state.hidden_outbound_proxy_label == "wireproxy":
+            return f"WARP WireProxy via {self.state.hidden_outbound_proxy_url}"
+        return f"custom outbound proxy via {self.state.hidden_outbound_proxy_url}"
+
     def verify(self) -> ActionResult:
         service_state = self._run(["systemctl", "is-active", self.state.hidden_service_name])
         timer_state = self._run(["systemctl", "is-active", self.state.watchdog_timer_name])
         route_state = None
-        if self.state.hidden_upstream_proxy_label == "wireproxy":
+        if "wireproxy" in {self.state.hidden_upstream_proxy_label, self.state.hidden_outbound_proxy_label}:
             route_state = self._run(["systemctl", "is-active", "wireproxy.service"])
         try:
             response = httpx_request(
@@ -83,7 +90,8 @@ class ManagerController:
             details_payload = {
                 "service": service_state.summary,
                 "watchdog": timer_state.summary,
-                "route": self.hidden_route_text(),
+                "host_route": self.hidden_route_text(),
+                "outbound_route": self.outbound_route_text(),
                 "broker_ok": payload.get("ok"),
                 "peers": payload.get("stats", {}).get("peers"),
                 "streams": payload.get("stats", {}).get("streams"),
@@ -102,8 +110,8 @@ class ManagerController:
         return self._run(["systemctl", "start", self.state.watchdog_service_name])
 
     def restart_upstream_proxy(self) -> ActionResult:
-        if self.state.hidden_upstream_proxy_label != "wireproxy":
-            return ActionResult(False, "no managed upstream proxy", "This deployment is not using managed WARP WireProxy.")
+        if "wireproxy" not in {self.state.hidden_upstream_proxy_label, self.state.hidden_outbound_proxy_label}:
+            return ActionResult(False, "no managed WARP proxy", "This deployment is not using managed WARP WireProxy.")
         return self._run(["systemctl", "restart", "wireproxy.service"])
 
     def journal_tail(self) -> str:
@@ -214,6 +222,7 @@ def run_basic_manager(control_root: Path) -> None:
         print(f"Hidden service: {state.hidden_service_name}")
         print(f"Install root: {state.hidden_install_root}")
         print(f"Hidden route: {controller.hidden_route_text()}")
+        print(f"Outbound route: {controller.outbound_route_text()}")
         print("")
         print("1. Verify health")
         print("2. Restart hidden agent")
@@ -407,6 +416,7 @@ ModalScreen {
                         f"Hidden root: {state.hidden_install_root}",
                         f"Agent peer: {state.agent_peer_id}",
                         f"Hidden route: {self.controller.hidden_route_text()}",
+                        f"Outbound route: {self.controller.outbound_route_text()}",
                         f"TLS verify: {state.verify_tls}",
                     ]
                 )

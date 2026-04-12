@@ -36,6 +36,7 @@ should become the hidden Twoman server. The installer:
 - recommends the best backend automatically
 - generates Persian-style default names and paths, while still letting you override them
 - can route the hidden server through local WARP WireProxy when the Linux machine cannot reach the host directly
+- can separately route hidden-server outbound internet traffic through a SOCKS5 / HTTP CONNECT proxy such as local WireProxy
 - deploys the public broker and installs the hidden agent on the same machine
 - prints the final Twoman import text and installs a `twoman` management command
 
@@ -69,6 +70,10 @@ Easy-deploy guide:
 If this Linux machine can only reach the public host through WARP, answer `yes`
 when the installer asks about a local WARP / upstream proxy and keep the default
 `socks5h://127.0.0.1:1280` when you already run `wireproxy.service`.
+
+If you also want the final public egress IP to be the WARP exit instead of the
+hidden server IP, enable the separate hidden outbound proxy option and point it
+at the same `socks5h://127.0.0.1:1280` listener.
 
 ## Status
 
@@ -203,6 +208,8 @@ export TWOMAN_SERVER_DIR='/opt/twoman'
 export TWOMAN_BROKER_BASE_URL='https://your-host.example/api/v1/telemetry'
 export TWOMAN_AGENT_TOKEN='replace-with-agent-token'
 export TWOMAN_AGENT_PEER_ID='agent-main'
+export TWOMAN_OUTBOUND_PROXY_URL='socks5h://127.0.0.1:1280'
+export TWOMAN_OUTBOUND_PROXY_LABEL='wireproxy'
 
 ./scripts/deploy_hidden_server.sh
 ```
@@ -257,7 +264,8 @@ HTTP egress:
 curl --proxy http://127.0.0.1:18092 https://api.ipify.org
 ```
 
-Expected result: the origin IP should be the hidden server, not the local client.
+Expected result: the origin IP should be the hidden server or the configured
+hidden outbound proxy exit, not the local client.
 
 ## Development
 

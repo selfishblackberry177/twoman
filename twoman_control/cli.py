@@ -36,6 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     install_parser.add_argument("--watchdog-timer-name", default="")
     install_parser.add_argument("--hidden-upstream-proxy-url", default="")
     install_parser.add_argument("--hidden-upstream-proxy-label", default="")
+    install_parser.add_argument("--hidden-outbound-proxy-url", default="")
+    install_parser.add_argument("--hidden-outbound-proxy-label", default="")
     install_parser.add_argument("--non-interactive", action="store_true")
     install_parser.add_argument("--customize", action="store_true")
     install_parser.add_argument("--skip-helper-probe", action="store_true")

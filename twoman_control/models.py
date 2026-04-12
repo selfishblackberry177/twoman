@@ -102,6 +102,8 @@ class InstallState:
     admin_script_name: str = ""
     hidden_upstream_proxy_url: str = ""
     hidden_upstream_proxy_label: str = ""
+    hidden_outbound_proxy_url: str = ""
+    hidden_outbound_proxy_label: str = ""
     host_capabilities: list[BackendCapability] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -156,6 +158,8 @@ class InstallState:
             admin_script_name=str(payload.get("admin_script_name", "")).strip(),
             hidden_upstream_proxy_url=str(payload.get("hidden_upstream_proxy_url", "")).strip(),
             hidden_upstream_proxy_label=str(payload.get("hidden_upstream_proxy_label", "")).strip(),
+            hidden_outbound_proxy_url=str(payload.get("hidden_outbound_proxy_url", "")).strip(),
+            hidden_outbound_proxy_label=str(payload.get("hidden_outbound_proxy_label", "")).strip(),
             host_capabilities=[
                 BackendCapability.from_dict(item)
                 for item in list(payload.get("host_capabilities") or [])

@@ -52,6 +52,7 @@ from twoman_dns import (
     vpn_dns_proxy_ip,
     vpn_dns_servers,
 )
+from twoman_proxy import open_connection_via_proxy
 from twoman_transport import create_transport
 
 
@@ -454,6 +455,8 @@ class AgentRuntime(object):
         )
         self.prefer_ipv4 = bool(config.get("prefer_ipv4", True))
         self.disable_ipv6_origin = bool(config.get("disable_ipv6_origin", False))
+        self.outbound_proxy_url = str(config.get("outbound_proxy_url", "")).strip()
+        self.outbound_proxy_label = str(config.get("outbound_proxy_label", "")).strip()
         self.dns_query_timeout = max(
             0.5,
             float(config.get("dns_query_timeout_seconds", config.get("vpn_dns_query_timeout_seconds", DNS_QUERY_TIMEOUT))),
@@ -563,10 +566,11 @@ class AgentRuntime(object):
         try:
             async with self.dns_semaphore:
                 upstream_host, response = await resolve_dns_via_upstreams(
-                    upstream_hosts,
-                    payload,
-                    self.dns_query_timeout,
-                )
+                upstream_hosts,
+                payload,
+                self.dns_query_timeout,
+                proxy_url=self.outbound_proxy_url,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -599,7 +603,7 @@ class AgentRuntime(object):
     async def open_origin_connection(self, host, port):
         loop = asyncio.get_running_loop()
 
-        async def attempt(label, **kwargs):
+        async def attempt(label, *, proxy_url="", **kwargs):
             trace(
                 "origin connect start host=%s port=%s strategy=%s timeout=%s"
                 % (host, port, label, self.open_connect_timeout_seconds)
@@ -613,10 +617,18 @@ class AgentRuntime(object):
             )
             started_at = loop.time()
             try:
-                result = await asyncio.wait_for(
-                    asyncio.open_connection(host, port, **kwargs),
-                    timeout=self.open_connect_timeout_seconds,
-                )
+                if proxy_url:
+                    result = await open_connection_via_proxy(
+                        proxy_url,
+                        host,
+                        port,
+                        self.open_connect_timeout_seconds,
+                    )
+                else:
+                    result = await asyncio.wait_for(
+                        asyncio.open_connection(host, port, **kwargs),
+                        timeout=self.open_connect_timeout_seconds,
+                    )
             except Exception as error:
                 trace(
                     "origin connect fail host=%s port=%s strategy=%s elapsed=%0.3f error=%r"
@@ -668,7 +680,15 @@ class AgentRuntime(object):
                 )
                 raise error
             attempts.append(("ipv6-literal", {"family": socket.AF_INET6}))
-        else:
+        if self.outbound_proxy_url:
+            proxy_label = self.outbound_proxy_label or "custom"
+            try:
+                return await attempt(f"outbound-proxy:{proxy_label}", proxy_url=self.outbound_proxy_url)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                raise error
+        elif literal_ip is None:
             infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
             has_ipv4 = any(info[0] == socket.AF_INET for info in infos)
             has_ipv6 = any(info[0] == socket.AF_INET6 for info in infos)

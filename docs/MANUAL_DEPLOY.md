@@ -112,6 +112,8 @@ Example:
 {
   "broker_base_url": "https://your-host.example/api/v1/telemetry",
   "upstream_proxy_url": "socks5h://127.0.0.1:1280",
+  "outbound_proxy_url": "socks5h://127.0.0.1:1280",
+  "outbound_proxy_label": "wireproxy",
   "agent_token": "replace-with-agent-token",
   "http_timeout_seconds": 30,
   "flush_delay_seconds": 0.01,
@@ -139,6 +141,10 @@ Example:
 
 `upstream_proxy_url` is optional. Set it only when the hidden server must reach
 the public host through a local upstream proxy such as `wireproxy`.
+
+`outbound_proxy_url` is optional. Set it when the hidden server should make its
+final outbound TCP and DNS traffic through a SOCKS5 or HTTP CONNECT proxy
+instead of using the hidden server IP directly.
 
 Use HTTP/1.1 for the hidden-agent control lane by default on the current public
 Passenger path. In live validation, `ctl=true` on the hidden agent caused
@@ -274,7 +280,8 @@ curl --proxy http://127.0.0.1:18092 https://api.ipify.org
 
 Expected result:
 
-- the returned IP should be the hidden server
+- the returned IP should be the hidden server when no hidden outbound proxy is configured
+- the returned IP should be the configured proxy exit when `outbound_proxy_url` is enabled
 
 ## Troubleshooting
 

@@ -26,7 +26,7 @@ class TwomanDnsTests(unittest.IsolatedAsyncioTestCase):
     async def test_resolve_dns_via_upstreams_returns_fast_success(self):
         start = time.monotonic()
 
-        async def fake_query_dns_upstream(host, _port, _payload, _timeout):
+        async def fake_query_dns_upstream(host, _port, _payload, _timeout, *, proxy_url=""):
             if host == "1.1.1.1":
                 await asyncio.sleep(0.25)
                 raise asyncio.TimeoutError()
@@ -46,6 +46,30 @@ class TwomanDnsTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(elapsed, 0.2)
         self.assertEqual(upstream_host, "8.8.8.8")
         self.assertEqual(response[:2], b"\x12\x34")
+
+    async def test_query_dns_upstream_uses_tcp_only_when_proxy_is_configured(self):
+        with mock.patch("twoman_dns.udp_dns_query") as udp_dns_query, \
+             mock.patch(
+                 "twoman_dns.tcp_dns_query",
+                 return_value=b"\xaa\xbb\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00",
+             ) as tcp_dns_query:
+            response = await twoman_dns.query_dns_upstream(
+                "1.1.1.1",
+                53,
+                b"query",
+                1.0,
+                proxy_url="socks5h://127.0.0.1:1280",
+            )
+
+        udp_dns_query.assert_not_called()
+        tcp_dns_query.assert_awaited_once_with(
+            "1.1.1.1",
+            53,
+            b"query",
+            1.0,
+            proxy_url="socks5h://127.0.0.1:1280",
+        )
+        self.assertEqual(response[:2], b"\xaa\xbb")
 
 
 if __name__ == "__main__":

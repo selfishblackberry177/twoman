@@ -44,6 +44,32 @@ class HiddenAgentConnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(frame.stream_id, 19)
         self.assertEqual(frame.payload, b"\x12\x34\x81\x80")
 
+    async def test_open_origin_connection_uses_outbound_proxy_when_configured(self):
+        with mock.patch.object(agent, "create_transport", return_value=_FakeTransport()):
+            runtime = agent.AgentRuntime(
+                {
+                    "prefer_ipv4": True,
+                    "outbound_proxy_url": "socks5h://127.0.0.1:1280",
+                    "outbound_proxy_label": "wireproxy",
+                }
+            )
+
+        with mock.patch.object(
+            agent,
+            "open_connection_via_proxy",
+            mock.AsyncMock(return_value=("reader", "writer")),
+        ) as open_connection_via_proxy, mock.patch.object(agent.asyncio, "open_connection") as direct_open:
+            reader, writer = await runtime.open_origin_connection("example.com", 443)
+
+        open_connection_via_proxy.assert_awaited_once_with(
+            "socks5h://127.0.0.1:1280",
+            "example.com",
+            443,
+            runtime.open_connect_timeout_seconds,
+        )
+        direct_open.assert_not_called()
+        self.assertEqual((reader, writer), ("reader", "writer"))
+
 
 if __name__ == "__main__":
     unittest.main()

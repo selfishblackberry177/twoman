@@ -18,7 +18,8 @@ Twoman is designed for environments where:
    named transport profile automatically unless an explicit profile is pinned.
 4. Preferred shared-host deployments use internal application-server integration such as Passenger WSGI.
 5. The hidden agent maintains a reverse session to the broker.
-6. The hidden server opens the real outbound TCP connection.
+6. The hidden server opens the real outbound TCP connection directly or through
+   an optional hidden outbound proxy.
 
 ## Lanes
 
@@ -108,7 +109,8 @@ Current model:
 - helper captures DNS queries locally
 - helper sends `FRAME_DNS_QUERY`
 - broker routes DNS requests separately from TCP stream lifecycle
-- agent resolves DNS directly and returns `FRAME_DNS_RESPONSE` or `FRAME_DNS_FAIL`
+- agent resolves DNS directly or through the configured hidden outbound proxy
+  and returns `FRAME_DNS_RESPONSE` or `FRAME_DNS_FAIL`
 
 This keeps DNS out of normal TCP OPEN/WINDOW/FIN churn while preserving the
 same public camouflage surface.

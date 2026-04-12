@@ -58,6 +58,8 @@ def _sample_state(control_root: Path) -> InstallState:
         admin_script_name="sahar_honar_221b_negahban.php",
         hidden_upstream_proxy_url="socks5h://127.0.0.1:1280",
         hidden_upstream_proxy_label="wireproxy",
+        hidden_outbound_proxy_url="socks5h://127.0.0.1:1280",
+        hidden_outbound_proxy_label="wireproxy",
     )
 
 
@@ -120,6 +122,8 @@ class TwomanInstallerTests(unittest.TestCase):
                     watchdog_timer_name="",
                     hidden_upstream_proxy_url="",
                     hidden_upstream_proxy_label="",
+                    hidden_outbound_proxy_url="",
+                    hidden_outbound_proxy_label="",
                     non_interactive=True,
                     customize=False,
                     skip_helper_probe=False,
@@ -139,6 +143,8 @@ class TwomanInstallerTests(unittest.TestCase):
         self.assertFalse(args.verify_tls)
         self.assertEqual(args.hidden_upstream_proxy_url, "socks5h://127.0.0.1:1280")
         self.assertEqual(args.hidden_upstream_proxy_label, "wireproxy")
+        self.assertEqual(args.hidden_outbound_proxy_url, "socks5h://127.0.0.1:1280")
+        self.assertEqual(args.hidden_outbound_proxy_label, "wireproxy")
 
     def test_collect_install_args_keeps_explicit_noninteractive_values_without_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -168,6 +174,8 @@ class TwomanInstallerTests(unittest.TestCase):
                     watchdog_timer_name="twoman-agent-watchdog.timer",
                     hidden_upstream_proxy_url="",
                     hidden_upstream_proxy_label="",
+                    hidden_outbound_proxy_url="",
+                    hidden_outbound_proxy_label="",
                     non_interactive=True,
                     customize=False,
                     skip_helper_probe=False,
@@ -184,6 +192,7 @@ class TwomanInstallerTests(unittest.TestCase):
         self.assertEqual(args.public_base_path, "/darvazeh")
         self.assertTrue(args.verify_tls)
         self.assertEqual(args.hidden_upstream_proxy_url, "")
+        self.assertEqual(args.hidden_outbound_proxy_url, "")
 
     @patch("twoman_control.installer._run_script")
     def test_install_local_hidden_server_passes_hidden_proxy_env(self, run_script_mock) -> None:
@@ -201,6 +210,8 @@ class TwomanInstallerTests(unittest.TestCase):
         env = run_script_mock.call_args.args[1]
         self.assertEqual(env["TWOMAN_UPSTREAM_PROXY_URL"], "socks5h://127.0.0.1:1280")
         self.assertEqual(env["TWOMAN_UPSTREAM_PROXY_LABEL"], "wireproxy")
+        self.assertEqual(env["TWOMAN_OUTBOUND_PROXY_URL"], "socks5h://127.0.0.1:1280")
+        self.assertEqual(env["TWOMAN_OUTBOUND_PROXY_LABEL"], "wireproxy")
 
 
 if __name__ == "__main__":

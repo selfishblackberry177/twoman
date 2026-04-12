@@ -16,10 +16,11 @@ Twoman installer, and then:
 4. recommends the best supported backend
 5. generates randomized Persian-style defaults for paths and site naming
 6. optionally routes cPanel deployment and hidden-agent runtime through local WARP WireProxy
-7. deploys the selected host backend
-8. installs the hidden agent locally as a systemd service with a watchdog
-9. validates broker health and performs a local helper probe
-10. installs `/usr/local/bin/twoman` for management
+7. can separately route hidden-server outbound internet traffic through a SOCKS5 or HTTP CONNECT proxy
+8. deploys the selected host backend
+9. installs the hidden agent locally as a systemd service with a watchdog
+10. validates broker health and performs a local helper probe
+11. installs `/usr/local/bin/twoman` for management
 
 The current Linux machine becomes the hidden server. You do not need a second
 manual SSH deploy step for the hidden agent.
@@ -58,7 +59,7 @@ If the Linux machine cannot reach the public host directly, the installer can
 route both the deployment traffic and the hidden-agent runtime through a local
 upstream proxy.
 
-Recommended path:
+Recommended path for hidden-server reachability:
 
 - run `wireproxy` locally on the hidden server
 - expose SOCKS5 on `127.0.0.1:1280`
@@ -68,6 +69,17 @@ Recommended path:
 
 This affects only the hidden server and the installer that runs on it. Twoman
 clients on desktop and Android do not need WARP for this mode.
+
+Optional outbound path:
+
+- answer `yes` when the installer asks whether hidden-server outbound internet
+  traffic should also use a local proxy
+- keep `socks5h://127.0.0.1:1280` if you want the final public egress IP to be
+  the WARP exit instead of the hidden server IP
+
+The host route and the outbound route are separate settings. The first fixes
+hidden-server -> public-host reachability. The second changes what IP websites
+see for the final egress.
 
 ## Run it
 
@@ -101,13 +113,16 @@ sudo bash scripts/install_twoman.sh \
   --cpanel-home /home/cpanel-user \
   --backend passenger_python \
   --hidden-upstream-proxy-url socks5h://127.0.0.1:1280 \
-  --hidden-upstream-proxy-label wireproxy
+  --hidden-upstream-proxy-label wireproxy \
+  --hidden-outbound-proxy-url socks5h://127.0.0.1:1280 \
+  --hidden-outbound-proxy-label wireproxy
 ```
 
 Useful flags:
 
 - `--customize`: override generated paths, app roots, and service names
 - `--verify-tls` / `--no-verify-tls`: control TLS verification for broker traffic
+- `--hidden-outbound-proxy-url`: route final hidden-server egress through a SOCKS5 or HTTP CONNECT proxy
 - `--skip-helper-probe`: skip the final helper traffic probe when you only need
   deployment and service install
 
