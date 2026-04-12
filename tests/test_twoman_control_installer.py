@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from twoman_control.installer import (
     _normalize_base_path,
+    _normalize_optional_base_path,
     _install_local_hidden_server,
     build_broker_base_url,
     collect_install_args,
@@ -49,13 +50,13 @@ def _sample_state(control_root: Path) -> InstallState:
         deployment_id="deadbeefcafe",
         site_name="سحر هنر",
         site_slug="sahar-honar-221b",
-        bridge_public_base_path="/api/v1/telemetry",
+        bridge_public_base_path="",
         passenger_app_name="sahar_honar_221b",
         passenger_app_root="/home/cpanel-user/sahar_honar_221b",
         node_app_root="/home/cpanel-user/sahar_honar_221b_node",
         node_app_uri="/sahar-honar-221b/ertebat-negah",
         admin_script_name="sahar_honar_221b_negahban.php",
-        hidden_upstream_proxy_url="socks5://127.0.0.1:1280",
+        hidden_upstream_proxy_url="socks5h://127.0.0.1:1280",
         hidden_upstream_proxy_label="wireproxy",
     )
 
@@ -65,6 +66,10 @@ class TwomanInstallerTests(unittest.TestCase):
         self.assertEqual(_normalize_base_path("darvazeh"), "/darvazeh")
         self.assertEqual(_normalize_base_path("/api/v1/telemetry/"), "/api/v1/telemetry")
         self.assertEqual(_normalize_base_path(""), "/")
+
+    def test_normalize_optional_base_path_preserves_blank_value(self) -> None:
+        self.assertEqual(_normalize_optional_base_path(""), "")
+        self.assertEqual(_normalize_optional_base_path("/api/v1/telemetry/"), "/api/v1/telemetry")
 
     def test_build_broker_base_url_uses_backend_specific_shape(self) -> None:
         self.assertEqual(
@@ -80,9 +85,9 @@ class TwomanInstallerTests(unittest.TestCase):
                 "https://host.example.com",
                 BACKEND_BRIDGE,
                 "/rahkar",
-                bridge_public_base_path="/api/v1/telemetry",
+                bridge_public_base_path="",
             ),
-            "https://host.example.com/rahkar/api/v1/telemetry",
+            "https://host.example.com/rahkar",
         )
 
     def test_collect_install_args_reuses_existing_state(self) -> None:
@@ -129,10 +134,10 @@ class TwomanInstallerTests(unittest.TestCase):
         self.assertEqual(args.cpanel_home, "/home/cpanel-user")
         self.assertEqual(args.backend, BACKEND_PASSENGER)
         self.assertEqual(args.public_base_path, "/sahar-honar-221b/payesh-asnad")
-        self.assertEqual(args.bridge_public_base_path, "/api/v1/telemetry")
+        self.assertEqual(args.bridge_public_base_path, "")
         self.assertEqual(args.install_root, Path("/opt/twoman-existing"))
         self.assertFalse(args.verify_tls)
-        self.assertEqual(args.hidden_upstream_proxy_url, "socks5://127.0.0.1:1280")
+        self.assertEqual(args.hidden_upstream_proxy_url, "socks5h://127.0.0.1:1280")
         self.assertEqual(args.hidden_upstream_proxy_label, "wireproxy")
 
     def test_collect_install_args_keeps_explicit_noninteractive_values_without_state(self) -> None:
@@ -150,7 +155,7 @@ class TwomanInstallerTests(unittest.TestCase):
                     site_name="سحر هنر",
                     backend=BACKEND_PASSENGER,
                     public_base_path="/darvazeh",
-                    bridge_public_base_path="/api/v1/telemetry",
+                    bridge_public_base_path="",
                     passenger_app_name="darvazeh_app",
                     passenger_app_root="/home/cpanel-user/darvazeh_app",
                     node_app_root="",
@@ -194,7 +199,7 @@ class TwomanInstallerTests(unittest.TestCase):
             _install_local_hidden_server(Path("/tmp/repo"), state)
 
         env = run_script_mock.call_args.args[1]
-        self.assertEqual(env["TWOMAN_UPSTREAM_PROXY_URL"], "socks5://127.0.0.1:1280")
+        self.assertEqual(env["TWOMAN_UPSTREAM_PROXY_URL"], "socks5h://127.0.0.1:1280")
         self.assertEqual(env["TWOMAN_UPSTREAM_PROXY_LABEL"], "wireproxy")
 
 

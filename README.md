@@ -68,7 +68,7 @@ Easy-deploy guide:
 
 If this Linux machine can only reach the public host through WARP, answer `yes`
 when the installer asks about a local WARP / upstream proxy and keep the default
-`socks5://127.0.0.1:1280` when you already run `wireproxy.service`.
+`socks5h://127.0.0.1:1280` when you already run `wireproxy.service`.
 
 ## Status
 
@@ -112,6 +112,8 @@ Start here:
 - `host/public/api.php`: public health/bootstrap endpoint for bridge-style deployments
 - `tests/run_e2e.sh`: local smoke test
 - `tests/run_e2e_node_http.sh`: local smoke test for the Node selector broker
+- `tests/run_e2e_node_ws.sh`: local smoke test for the managed-host WebSocket profile
+- `tests/benchmark_transport_profiles.sh`: local throughput comparison for managed-host HTTP vs WebSocket profiles
 
 Backend families:
 
@@ -136,8 +138,16 @@ Twoman uses:
 - internal scheduler classes: `ctl`, `pri`, `bulk`
 
 Key design points:
-- helper downlinks are streamed HTTP/1.1 responses
+- helpers and agents default to `transport_profile: auto`, which reads broker
+  capabilities from `/health` and selects the right transport profile for the
+  current backend family
+- Passenger/shared-host deployments stay on short-request HTTP polling profiles
+- managed Node-capable hosts can use a lower-churn managed-host profile and
+  opportunistically upgrade to WebSocket transport when the host advertises it
+  and no hidden-side upstream SOCKS/HTTP proxy is in the path
 - helper uplinks are bounded POST batches
+- tunnel DNS is now a dedicated protocol subsystem instead of short-lived proxy
+  streams mixed into normal TCP control flow
 - the broker assigns agent-side stream IDs and scopes helper streams by session
 - public authentication prefers `Authorization: Bearer <token>` with standard cookies for peer/session identity
 

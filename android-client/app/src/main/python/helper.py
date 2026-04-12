@@ -729,6 +729,7 @@ class ProxyStream(object):
         self.recv_offset = 0
         self.fin_offset = None
         self.closed = False
+        self.send_closed = False
         self.pending_window = 0
         self.window_flush_task = None
         self.recv_frame_count = 0
@@ -751,7 +752,7 @@ class ProxyStream(object):
             stream_id=self.stream_id,
             payload=make_open_payload(self.target_host, self.target_port, MODE_TCP),
         )
-        await self.helper.transport.send_frame(LANE_CTL, frame)
+        await self.helper.transport.send_frame(self._control_lane(), frame)
         await asyncio.wait_for(self.open_event.wait(), timeout=30)
         if self.open_failed:
             trace("open failed stream=%s error=%s" % (self.stream_id, self.open_failed))
@@ -896,7 +897,7 @@ class ProxyStream(object):
 
     async def send_data(self, payload):
         view = memoryview(payload)
-        while view and not self.closed:
+        while view and not self.closed and not self.send_closed:
             if self.send_credit <= 0:
                 self.send_credit_event.clear()
                 await self.send_credit_event.wait()
@@ -927,7 +928,7 @@ class ProxyStream(object):
         value = self.pending_window
         self.pending_window = 0
         await self.helper.transport.send_frame(
-            LANE_CTL,
+            self._control_lane(),
             Frame(FRAME_WINDOW, stream_id=self.stream_id, offset=int(value)),
         )
 
@@ -936,11 +937,11 @@ class ProxyStream(object):
         await self.flush_window()
 
     async def finish(self):
-        if self.closed:
+        if self.closed or self.send_closed:
             return
         await self.flush_window()
-        await self.helper.transport.send_frame(LANE_CTL, Frame(FRAME_FIN, stream_id=self.stream_id, offset=self.send_offset))
-        self.closed = True
+        await self.helper.transport.send_frame(self._control_lane(), Frame(FRAME_FIN, stream_id=self.stream_id, offset=self.send_offset))
+        self.send_closed = True
 
     async def reset(self, message):
         if self.closed:
@@ -948,7 +949,7 @@ class ProxyStream(object):
         if self.window_flush_task is not None and not self.window_flush_task.done():
             self.window_flush_task.cancel()
         await self.helper.transport.send_frame(
-            LANE_CTL,
+            self._control_lane(),
             Frame(FRAME_RST, stream_id=self.stream_id, payload=make_error_payload(message)),
         )
         self.closed = True
@@ -959,6 +960,9 @@ class ProxyStream(object):
         if self.send_offset < PRI_LIMIT and (self.send_offset + int(chunk_len)) <= PRI_LIMIT:
             return LANE_PRI
         return LANE_BULK
+
+    def _control_lane(self):
+        return getattr(self.helper.transport, "stream_control_lane", LANE_CTL)
 
 
 class HelperRuntime(object):
@@ -1215,15 +1219,30 @@ async def relay_stream(runtime, stream, reader, writer, initial_payload=b"", con
                 )
                 await stream.grant_window(len(payload))
 
-        child_tasks = [asyncio.create_task(local_to_remote()), asyncio.create_task(remote_to_local())]
-        done, pending = await asyncio.wait(child_tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        for task in done:
-            with contextlib.suppress(asyncio.CancelledError):
-                error = task.exception()
-                if error:
-                    raise error
+        local_task = asyncio.create_task(local_to_remote())
+        remote_task = asyncio.create_task(remote_to_local())
+        child_tasks = [local_task, remote_task]
+        pending = set(child_tasks)
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            if local_task in done:
+                with contextlib.suppress(asyncio.CancelledError):
+                    error = local_task.exception()
+                    if error:
+                        raise error
+                local_task = None
+                if remote_task in pending:
+                    continue
+            if remote_task in done:
+                with contextlib.suppress(asyncio.CancelledError):
+                    error = remote_task.exception()
+                    if error:
+                        raise error
+                if local_task is not None and local_task in pending:
+                    local_task.cancel()
+                    await asyncio.gather(local_task, return_exceptions=True)
+                    pending.discard(local_task)
+                break
     except asyncio.CancelledError as error:
         failure = error
         raise

@@ -98,6 +98,7 @@ for source in \
   requirements.txt \
   runtime_diagnostics.py \
   twoman_crypto.py \
+  twoman_dns.py \
   twoman_http.py \
   twoman_protocol.py \
   twoman_transport.py \
@@ -114,6 +115,7 @@ chmod 0755 "${TWOMAN_INSTALL_ROOT}/install_watchdog.sh" "${TWOMAN_INSTALL_ROOT}/
 CONFIG_JSON="$(cat <<EOF
 {
   "transport": "${TWOMAN_TRANSPORT}",
+  "transport_profile": "auto",
   "broker_base_url": "${TWOMAN_BROKER_BASE_URL}",
   "upstream_proxy_url": ${UPSTREAM_PROXY_JSON},
   "agent_token": "${TWOMAN_AGENT_TOKEN}",

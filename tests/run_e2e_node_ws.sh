@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TMP_DIR="$ROOT/tests/tmp-node-http"
+TMP_DIR="$ROOT/tests/tmp-node-ws"
 
 rm -rf "$TMP_DIR"
 mkdir -p "$TMP_DIR" "$ROOT/tests/certs"
@@ -23,14 +23,15 @@ cat > "$TMP_DIR/broker-config.json" <<'JSON'
   "stream_ttl_seconds": 300,
   "max_lane_bytes": 16777216,
   "max_peer_buffered_bytes": 33554432,
-  "base_uri": "/api/v1/telemetry"
+  "base_uri": "/api/v1/telemetry",
+  "websocket_public_enabled": true
 }
 JSON
 
 cat > "$TMP_DIR/agent.json" <<'JSON'
 {
   "transport": "http",
-  "transport_profile": "auto",
+  "transport_profile": "managed_host_ws",
   "broker_base_url": "http://127.0.0.1:18095/api/v1/telemetry",
   "agent_token": "test-agent-token",
   "auth_mode": "bearer",
@@ -42,18 +43,14 @@ cat > "$TMP_DIR/agent.json" <<'JSON'
   "http_timeout_seconds": 10,
   "flush_delay_seconds": 0.01,
   "max_batch_bytes": 65536,
-  "verify_tls": true,
-  "http2_enabled": {
-    "ctl": false,
-    "data": false
-  }
+  "verify_tls": true
 }
 JSON
 
 cat > "$TMP_DIR/helper.json" <<'JSON'
 {
   "transport": "http",
-  "transport_profile": "auto",
+  "transport_profile": "managed_host_ws",
   "broker_base_url": "http://127.0.0.1:18095/api/v1/telemetry",
   "client_token": "test-client-token",
   "auth_mode": "bearer",
@@ -69,11 +66,7 @@ cat > "$TMP_DIR/helper.json" <<'JSON'
   "http_timeout_seconds": 10,
   "flush_delay_seconds": 0.01,
   "max_batch_bytes": 65536,
-  "verify_tls": true,
-  "http2_enabled": {
-    "ctl": false,
-    "data": false
-  }
+  "verify_tls": true
 }
 JSON
 
@@ -143,9 +136,6 @@ PY
   return 1
 }
 
-wait_for_port 127.0.0.1 18095 broker
-wait_for_port 127.0.0.1 19090 origin
-wait_for_port 127.0.0.1 19443 tls-origin
 wait_for_listen_state() {
   local path="$1"
   for _ in $(seq 1 50); do
@@ -176,6 +166,10 @@ print(int(payload[sys.argv[2]]))
 PY
 }
 
+wait_for_port 127.0.0.1 18095 broker
+wait_for_port 127.0.0.1 19090 origin
+wait_for_port 127.0.0.1 19443 tls-origin
+
 wait_for_listen_state "$TMP_DIR/helper-listen-state.json"
 HELPER_HTTP_PORT="$(read_listen_port "$TMP_DIR/helper-listen-state.json" http_port)"
 HELPER_SOCKS_PORT="$(read_listen_port "$TMP_DIR/helper-listen-state.json" socks_port)"
@@ -191,33 +185,43 @@ python3 - "$TMP_DIR/health.json" <<'PY'
 import json, sys
 with open(sys.argv[1], "r", encoding="utf-8") as handle:
     payload = json.load(handle)
-assert payload["log_paths"]["runtime"].endswith("node-broker.log"), payload
-assert payload["log_paths"]["events"].endswith("node-broker-events.ndjson"), payload
 assert payload["capabilities"]["recommended_profile"] == "managed_host_http", payload
-assert payload["capabilities"]["supported_profiles"] == ["managed_host_http"], payload
-assert payload["capabilities"]["profiles"]["managed_host_http"]["helper"]["down_parallelism"] == {"data": 2}, payload
-assert isinstance(payload.get("recent_events", []), list), payload
+assert "managed_host_ws" in payload["capabilities"]["supported_profiles"], payload
 PY
 
 curl --fail --silent --show-error \
   --socks5-hostname "127.0.0.1:${HELPER_SOCKS_PORT}" \
-  "http://127.0.0.1:19090/socks-test?via=socks" \
+  "http://127.0.0.1:19090/socks-test?via=ws-socks" \
   > "$TMP_DIR/socks.json"
 
 python3 - "$TMP_DIR/socks.json" <<'PY'
 import json, sys
 with open(sys.argv[1], "r", encoding="utf-8") as handle:
     payload = json.load(handle)
-assert payload["path"] == "/socks-test?via=socks", payload
+assert payload["path"] == "/socks-test?via=ws-socks", payload
 assert payload["method"] == "GET", payload
 PY
 
 curl --fail --silent --show-error --insecure \
   --proxy "http://127.0.0.1:${HELPER_HTTP_PORT}" \
-  "https://127.0.0.1:19443/secure-test?via=http" \
+  "https://127.0.0.1:19443/secure-test?via=ws-http" \
   > "$TMP_DIR/http.txt"
 
-grep -q 'secure:/secure-test?via=http' "$TMP_DIR/http.txt"
+grep -q 'secure:/secure-test?via=ws-http' "$TMP_DIR/http.txt"
+
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer test-client-token" \
+  "http://127.0.0.1:18095/api/v1/telemetry/health" \
+  > "$TMP_DIR/health-post.json"
+
+python3 - "$TMP_DIR/health-post.json" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+metrics = payload["metrics"]
+assert metrics["ws_messages_in"]["ctl"] > 0 or metrics["ws_messages_in"]["data"] > 0, payload
+assert metrics["ws_messages_out"]["ctl"] > 0 or metrics["ws_messages_out"]["data"] > 0, payload
+PY
 
 assert_nonempty() {
   local path="$1"
@@ -234,8 +238,4 @@ assert_nonempty "$TMP_DIR/logs/agent-events.ndjson"
 assert_nonempty "$TMP_DIR/logs/helper.log"
 assert_nonempty "$TMP_DIR/logs/helper-events.ndjson"
 
-grep -q '"kind":"open_map"' "$TMP_DIR/logs/node-broker-events.ndjson"
-grep -q '"kind":"origin_connect_ok"' "$TMP_DIR/logs/agent-events.ndjson"
-grep -q '"kind":"stream_open_ok"' "$TMP_DIR/logs/helper-events.ndjson"
-
-echo "TWOMAN NODE HTTP E2E OK"
+echo "TWOMAN NODE WS E2E OK"

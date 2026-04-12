@@ -20,6 +20,7 @@ data class ClientProfile(
     val maxBatchBytes: Int = 65536,
     val dataUploadMaxBatchBytes: Int = 65536,
     val dataUploadFlushDelaySeconds: Double = 0.004,
+    val vpnDnsProxyIp: String = DEFAULT_VPN_DNS_PROXY_IP,
     val vpnDnsServers: List<String> = listOf("1.1.1.1", "8.8.8.8"),
     val idleRepollCtlSeconds: Double = 0.05,
     val idleRepollDataSeconds: Double = 0.1,
@@ -41,6 +42,7 @@ data class ClientProfile(
         put("maxBatchBytes", maxBatchBytes)
         put("dataUploadMaxBatchBytes", dataUploadMaxBatchBytes)
         put("dataUploadFlushDelaySeconds", dataUploadFlushDelaySeconds)
+        put("vpnDnsProxyIp", vpnDnsProxyIp)
         put("vpnDnsServers", org.json.JSONArray(vpnDnsServers))
         put("idleRepollCtlSeconds", idleRepollCtlSeconds)
         put("idleRepollDataSeconds", idleRepollDataSeconds)
@@ -49,6 +51,7 @@ data class ClientProfile(
 
     fun toRuntimeConfig(logPath: String, listenStatePath: String): JSONObject = JSONObject().apply {
         put("transport", "http")
+        put("transport_profile", "auto")
         put("broker_base_url", brokerBaseUrl)
         put("client_token", clientToken)
         put("listen_host", "127.0.0.1")
@@ -68,6 +71,7 @@ data class ClientProfile(
         put("max_batch_bytes", maxBatchBytes)
         put("verify_tls", verifyTls)
         put("streaming_up_lanes", org.json.JSONArray())
+        put("vpn_dns_proxy_ip", vpnDnsProxyIp)
         put("vpn_dns_servers", org.json.JSONArray(vpnDnsServers))
         put(
             "upload_profiles",
@@ -113,6 +117,7 @@ data class ClientProfile(
             put("maxBatchBytes", maxBatchBytes)
             put("dataUploadMaxBatchBytes", dataUploadMaxBatchBytes)
             put("dataUploadFlushDelaySeconds", dataUploadFlushDelaySeconds)
+            put("vpnDnsProxyIp", vpnDnsProxyIp)
             put("vpnDnsServers", org.json.JSONArray(vpnDnsServers))
             put("idleRepollCtlSeconds", idleRepollCtlSeconds)
             put("idleRepollDataSeconds", idleRepollDataSeconds)
@@ -127,6 +132,7 @@ data class ClientProfile(
 
     companion object {
         private const val SHARE_PREFIX = "twoman://profile?data="
+        private const val DEFAULT_VPN_DNS_PROXY_IP = "198.18.0.2"
 
         fun fromJson(json: JSONObject): ClientProfile = ClientProfile(
             id = json.optString("id").ifBlank { UUID.randomUUID().toString() },
@@ -144,6 +150,7 @@ data class ClientProfile(
             maxBatchBytes = json.optInt("maxBatchBytes", 65536),
             dataUploadMaxBatchBytes = json.optInt("dataUploadMaxBatchBytes", 65536),
             dataUploadFlushDelaySeconds = json.optDouble("dataUploadFlushDelaySeconds", 0.004),
+            vpnDnsProxyIp = json.optString("vpnDnsProxyIp").ifBlank { DEFAULT_VPN_DNS_PROXY_IP },
             vpnDnsServers = json.optJSONArray("vpnDnsServers")?.let { array ->
                 buildList {
                     for (index in 0 until array.length()) {

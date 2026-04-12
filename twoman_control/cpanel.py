@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import secrets
 import shutil
 import time
@@ -11,6 +12,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from twoman_http import httpx_request
 from twoman_control.models import (
     BACKEND_BRIDGE,
     BACKEND_NODE,
@@ -24,6 +26,25 @@ def _public_host_from_origin(public_origin: str) -> str:
     return parsed.netloc or parsed.path
 
 
+def _normalize_proxy_url(proxy_url: str) -> str:
+    normalized = str(proxy_url or "").strip()
+    if not normalized:
+        return ""
+    parsed = urlparse(normalized)
+    if parsed.scheme != "socks5":
+        return normalized
+    hostname = (parsed.hostname or "").strip()
+    is_loopback = hostname == "localhost"
+    if not is_loopback and hostname:
+        try:
+            is_loopback = ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            is_loopback = False
+    if not is_loopback:
+        return normalized
+    return parsed._replace(scheme="socks5h").geturl()
+
+
 @dataclass(slots=True)
 class CpanelClient:
     base_url: str
@@ -33,17 +54,20 @@ class CpanelClient:
     verify: bool = True
     proxy_url: str = ""
 
+    def __post_init__(self) -> None:
+        self.proxy_url = _normalize_proxy_url(self.proxy_url)
+
     def _request_with_retry(self, method: str, endpoint: str, *, timeout: float, retries: int = 3, **kwargs: Any) -> httpx.Response:
         last_error: Exception | None = None
         for attempt in range(1, retries + 1):
             try:
-                return httpx.request(
+                return httpx_request(
                     method,
                     f"{self.base_url.rstrip('/')}/execute/{endpoint}",
                     auth=(self.username, self.password),
                     timeout=timeout,
                     verify=self.verify,
-                    proxy=self.proxy_url or None,
+                    proxy_url=self.proxy_url or None,
                     follow_redirects=True,
                     **kwargs,
                 )
@@ -56,12 +80,12 @@ class CpanelClient:
         raise last_error
 
     def _public_get(self, url: str, *, timeout: float, verify: bool) -> httpx.Response:
-        response = httpx.request(
+        response = httpx_request(
             "GET",
             url,
             timeout=timeout,
             verify=verify,
-            proxy=self.proxy_url or None,
+            proxy_url=self.proxy_url or None,
             follow_redirects=True,
         )
         response.raise_for_status()
@@ -273,7 +297,7 @@ echo json_encode($result);
         ]
         for capability in capabilities:
             capability.recommended = False
-        for backend_key in (BACKEND_NODE, BACKEND_PASSENGER, BACKEND_BRIDGE):
+        for backend_key in (BACKEND_NODE, BACKEND_BRIDGE, BACKEND_PASSENGER):
             for capability in capabilities:
                 if capability.key == backend_key and capability.available:
                     capability.recommended = True
@@ -282,12 +306,12 @@ echo json_encode($result);
 
     def verify_public_tls(self, public_origin: str) -> bool:
         try:
-            response = httpx.request(
+            response = httpx_request(
                 "GET",
                 public_origin.rstrip("/"),
                 timeout=10.0,
                 verify=True,
-                proxy=self.proxy_url or None,
+                proxy_url=self.proxy_url or None,
                 follow_redirects=True,
             )
             response.read()

@@ -111,7 +111,7 @@ Example:
 ```json
 {
   "broker_base_url": "https://your-host.example/api/v1/telemetry",
-  "upstream_proxy_url": "socks5://127.0.0.1:1280",
+  "upstream_proxy_url": "socks5h://127.0.0.1:1280",
   "agent_token": "replace-with-agent-token",
   "http_timeout_seconds": 30,
   "flush_delay_seconds": 0.01,

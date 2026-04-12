@@ -6,8 +6,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-import httpx
-
+from twoman_http import httpx_request
 from twoman_control.installer import LAUNCHER_PATH, state_path
 from twoman_control.models import (
     BACKEND_BRIDGE,
@@ -66,12 +65,13 @@ class ManagerController:
         if self.state.hidden_upstream_proxy_label == "wireproxy":
             route_state = self._run(["systemctl", "is-active", "wireproxy.service"])
         try:
-            response = httpx.get(
+            response = httpx_request(
+                "GET",
                 f"{self.state.broker_base_url.rstrip('/')}/health",
                 headers={"Authorization": f"Bearer {self.state.client_token}"},
                 timeout=20.0,
                 verify=self.state.verify_tls,
-                proxy=self.state.hidden_upstream_proxy_url or None,
+                proxy_url=self.state.hidden_upstream_proxy_url or None,
                 follow_redirects=True,
             )
             response.raise_for_status()
@@ -173,6 +173,9 @@ class ManagerController:
                 "TWOMAN_BRIDGE_PUBLIC_BASE_PATH": state.bridge_public_base_path,
                 "TWOMAN_CLIENT_TOKEN": state.client_token,
                 "TWOMAN_AGENT_TOKEN": state.agent_token,
+                "TWOMAN_CAMOUFLAGE_SITE_ENABLED": "true",
+                "TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID": state.deployment_id,
+                "TWOMAN_CAMOUFLAGE_SITE_NAME": state.site_name,
             }
             script = self.bundle_root / "scripts" / "deploy_host.sh"
         merged_env = os.environ.copy()
@@ -400,7 +403,7 @@ ModalScreen {
                     [
                         f"Public origin: {state.public_origin}",
                         f"Base path: {state.public_base_path}",
-                        f"Bridge path: {state.bridge_public_base_path}",
+                        f"Bridge path: {state.bridge_public_base_path or '(same as base path)'}",
                         f"Hidden root: {state.hidden_install_root}",
                         f"Agent peer: {state.agent_peer_id}",
                         f"Hidden route: {self.controller.hidden_route_text()}",

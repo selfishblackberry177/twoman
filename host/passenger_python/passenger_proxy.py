@@ -187,14 +187,16 @@ def ping_daemon(timeout_seconds=1.5):
         return False
 
 
-def ensure_daemon_running(perform_healthcheck=True):
+def ensure_daemon_running(perform_healthcheck=True, force_restart=False):
     global LAST_DAEMON_CHECK_AT, LAST_DAEMON_CHECK_PID
     ensure_runtime_dir()
     with open(LOCK_PATH, "a+", encoding="utf-8") as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
         pid = read_pid()
         now_monotonic = time.monotonic()
-        if process_is_alive(pid) and os.path.exists(SOCKET_PATH):
+        socket_exists = os.path.exists(SOCKET_PATH)
+        pid_alive = process_is_alive(pid)
+        if pid_alive and socket_exists and not force_restart:
             if not perform_healthcheck:
                 LAST_DAEMON_CHECK_PID = pid
                 LAST_DAEMON_CHECK_AT = now_monotonic
@@ -209,7 +211,11 @@ def ensure_daemon_running(perform_healthcheck=True):
                 LAST_DAEMON_CHECK_PID = pid
                 LAST_DAEMON_CHECK_AT = now_monotonic
                 return
-        if process_is_alive(pid):
+            # A transient health probe miss is not enough evidence to kill the
+            # daemon. Let the request path attempt a real socket connection and
+            # only restart on an actual connect failure.
+            return
+        if pid_alive:
             stop_pid(pid)
         LAST_DAEMON_CHECK_PID = 0
         LAST_DAEMON_CHECK_AT = 0.0
@@ -316,7 +322,7 @@ def send_request_to_daemon(environ):
     try:
         client = _connect_daemon_client()
     except OSError:
-        ensure_daemon_running(perform_healthcheck=True)
+        ensure_daemon_running(perform_healthcheck=True, force_restart=True)
         client = _connect_daemon_client()
     header_lines = ["%s: %s" % (name, value) for name, value in request_headers_from_environ(environ)]
     payload = (

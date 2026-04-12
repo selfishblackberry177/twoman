@@ -28,6 +28,8 @@ class _FakeWriter:
     def __init__(self):
         self.closed = False
         self.wait_closed_calls = 0
+        self.writes = []
+        self.eof_written = False
 
     def close(self):
         self.closed = True
@@ -40,10 +42,11 @@ class _FakeWriter:
         return self.closed
 
     def write(self, _payload):
+        self.writes.append(_payload)
         return None
 
     def write_eof(self):
-        self.closed = True
+        self.eof_written = True
 
     async def drain(self):
         return None
@@ -57,6 +60,17 @@ class _SlowWriter(_FakeWriter):
 
 class _BlockingReader:
     async def read(self, _size):
+        await asyncio.sleep(10)
+
+
+class _SequenceReader:
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+
+    async def read(self, _size):
+        await asyncio.sleep(0)
+        if self.chunks:
+            return self.chunks.pop(0)
         await asyncio.sleep(10)
 
 
@@ -80,16 +94,21 @@ class _FakeRelayStream:
         self.send_offset = 0
         self.finish_calls = 0
         self.reset_reasons = []
+        self.send_payloads = []
+        self.send_closed = False
 
     async def open(self):
         return None
 
-    async def send_data(self, _payload):
-        return None
+    async def send_data(self, payload):
+        self.send_payloads.append(payload)
+        self.send_offset += len(payload)
 
     async def finish(self):
+        if self.send_closed or self.closed:
+            return
         self.finish_calls += 1
-        self.closed = True
+        self.send_closed = True
 
     async def reset(self, reason):
         self.reset_reasons.append(reason)
@@ -170,6 +189,26 @@ class HelperShutdownTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stream.reset_reasons, ["relay cancelled"])
         self.assertEqual(runtime.released_stream_ids, [stream.stream_id])
         self.assertTrue(writer.closed)
+
+    async def test_local_half_close_keeps_remote_drain_alive(self):
+        runtime = _FakeRuntime()
+        stream = _FakeRelayStream()
+        reader = _SequenceReader([b"client-hello", b""])
+        writer = _FakeWriter()
+
+        relay_task = asyncio.create_task(
+            helper.relay_stream(runtime, stream, reader, writer, open_stream=False)
+        )
+        await asyncio.sleep(0.05)
+        await stream.recv_queue.put(b"server-hello")
+        await stream.recv_queue.put(None)
+        await relay_task
+
+        self.assertEqual(stream.send_payloads, [b"client-hello"])
+        self.assertEqual(stream.finish_calls, 1)
+        self.assertTrue(writer.eof_written)
+        self.assertIn(b"server-hello", writer.writes)
+        self.assertEqual(runtime.released_stream_ids, [stream.stream_id])
 
 
 if __name__ == "__main__":

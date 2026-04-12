@@ -61,6 +61,10 @@ RUNTIME_LOG_PATH = ""
 EVENT_LOG_PATH = ""
 EVENT_RECORDER = None
 DNS_FRAME_TYPES = {FRAME_DNS_QUERY, FRAME_DNS_RESPONSE, FRAME_DNS_FAIL}
+PROFILE_SHARED_HOST_SAFE = "shared_host_safe"
+PROFILE_MANAGED_HOST_HTTP = "managed_host_http"
+PROFILE_MANAGED_HOST_WS = "managed_host_ws"
+CAPABILITY_VERSION = 1
 
 
 def now_ms():
@@ -270,6 +274,101 @@ def _normalize_lane_profiles(config):
     return normalized
 
 
+def _normalize_role_down_wait_ms(config):
+    base = {"ctl": 1000, "data": 1000}
+    configured = config.get("down_wait_ms", {})
+    if isinstance(configured, dict):
+        for lane in ("ctl", "data"):
+            try:
+                if lane in configured:
+                    base[lane] = max(0, int(configured[lane]))
+            except (TypeError, ValueError):
+                continue
+    roles = {
+        "helper": dict(base),
+        "agent": dict(base),
+    }
+    configured_roles = config.get("down_wait_ms_by_role", {})
+    if isinstance(configured_roles, dict):
+        for role in ("helper", "agent"):
+            override = configured_roles.get(role)
+            if not isinstance(override, dict):
+                continue
+            for lane in ("ctl", "data"):
+                try:
+                    if lane in override:
+                        roles[role][lane] = max(0, int(override[lane]))
+                except (TypeError, ValueError):
+                    continue
+    return roles
+
+
+def _broker_capabilities(config):
+    backend_family = str(config.get("backend_family", "bridge_runtime")).strip() or "bridge_runtime"
+    agent_down_wait_ms = _normalize_role_down_wait_ms(config).get("agent", {"ctl": 1000, "data": 1000})
+    agent_down_read_timeout_seconds = max(
+        15.0,
+        (max(agent_down_wait_ms["ctl"], agent_down_wait_ms["data"]) / 1000.0) + 10.0,
+    )
+    helper_down_combined_data_lane = bool(config.get("helper_down_combined_data_lane", False))
+    agent_down_combined_data_lane = bool(config.get("agent_down_combined_data_lane", False))
+    helper_profile = {
+        "http2_enabled": {"ctl": False, "data": False},
+        "down_lanes": ["data"] if helper_down_combined_data_lane else [],
+        "upload_profiles": {
+            "data": {"max_batch_bytes": 65536, "flush_delay_seconds": 0.004},
+        },
+        "idle_repoll_delay_seconds": {"ctl": 0.05, "data": 0.10},
+        "streaming_up_lanes": [],
+    }
+    if backend_family == "bridge_runtime" and helper_down_combined_data_lane:
+        # The PHP bridge path can add a few seconds of per-request jitter under
+        # load; two bounded helper polls hide that variance without switching
+        # back to long-lived streaming responses.
+        helper_profile["down_parallelism"] = {"data": 2}
+    agent_profile = {
+        "http2_enabled": {"ctl": False, "data": False},
+        "down_lanes": ["data"] if agent_down_combined_data_lane else [],
+        "upload_profiles": {
+            "data": {"max_batch_bytes": 131072, "flush_delay_seconds": 0.006},
+        },
+        "down_read_timeout_seconds": agent_down_read_timeout_seconds,
+        "idle_repoll_delay_seconds": {"ctl": 0.05, "data": 0.10},
+        "streaming_up_lanes": [],
+    }
+    if agent_down_combined_data_lane and backend_family in ("bridge_runtime", "passenger_python"):
+        # Shared-host/WARP paths are more reliable with bounded agent polls than
+        # with a single long-lived data/down response that can be reset mid-TLS
+        # record. Keep two agent polls alive so the hidden side still has one
+        # ready while the other is being reopened.
+        agent_profile["down_parallelism"] = {"data": 2}
+    elif agent_down_combined_data_lane:
+        agent_profile["down_parallelism"] = {"data": 1}
+    if backend_family in ("bridge_runtime", "passenger_python") and agent_down_combined_data_lane:
+        # Shared-host hidden agents behind WARP or unstable server->host routes
+        # should send stream lifecycle control on the active priority/data path
+        # instead of depending on a separate ctl POST for OPEN_OK/FIN delivery.
+        agent_profile["stream_control_lane"] = "pri"
+    return {
+        "version": CAPABILITY_VERSION,
+        "backend_family": backend_family,
+        "recommended_profile": PROFILE_SHARED_HOST_SAFE,
+        "supported_profiles": [PROFILE_SHARED_HOST_SAFE],
+        "profiles": {
+            PROFILE_SHARED_HOST_SAFE: {
+                "transport": "http",
+                "helper": helper_profile,
+                "agent": agent_profile,
+            },
+        },
+        "camouflage": {
+            "binary_media_type": expected_binary_media_type(config),
+            "route_template": config.get("route_template", "/{lane}/{direction}"),
+            "health_template": config.get("health_template", "/health"),
+        },
+    }
+
+
 class BrokerState(object):
     def __init__(self, config):
         self.config = config
@@ -288,6 +387,8 @@ class BrokerState(object):
             self.max_lane_bytes,
             int(config.get("max_peer_buffered_bytes", min(self.max_lane_bytes * 2, 32 * 1024 * 1024))),
         )
+        self.helper_down_combined_data_lane = bool(config.get("helper_down_combined_data_lane", False))
+        self.agent_down_combined_data_lane = bool(config.get("agent_down_combined_data_lane", False))
         self.lane_profiles = _normalize_lane_profiles(config)
         self.peers = {}
         self.streams_by_helper = {}
@@ -351,6 +452,16 @@ class BrokerState(object):
     def token_for_peer(self, peer):
         token = str(getattr(peer, "auth_token", "") or "").strip()
         return token or self.default_token_for_role(peer.role)
+
+    def helper_control_lane(self):
+        return "pri" if self.helper_down_combined_data_lane else LANE_CTL
+
+    def target_lane_for_role(self, target_role, inbound_lane, frame_type_id):
+        if target_role == "agent" and self.agent_down_combined_data_lane:
+            return inbound_lane if frame_type_id == FRAME_DATA else "pri"
+        if target_role == "helper" and self.helper_down_combined_data_lane:
+            return inbound_lane if (frame_type_id == FRAME_DATA or frame_type_id in DNS_FRAME_TYPES) else "pri"
+        return inbound_lane if (frame_type_id == FRAME_DATA or frame_type_id in DNS_FRAME_TYPES) else LANE_CTL
 
     async def ensure_peer(self, role, peer_label, peer_session_id, auth_token=""):
         async with self.lock:
@@ -490,13 +601,13 @@ class BrokerState(object):
             payload=frame.payload,
             flags=frame.flags,
         )
-        target_lane = lane if (frame.type_id == FRAME_DATA or frame.type_id in DNS_FRAME_TYPES) else LANE_CTL
+        target_lane = self.target_lane_for_role(target_role, lane, frame.type_id)
         queued = await self.queue_frame(target_role, target_peer_session_id, target_lane, outbound_frame)
         if not queued and sender_role == "helper":
             await self.queue_frame(
                 "helper",
                 sender_peer_session_id,
-                LANE_CTL,
+                self.helper_control_lane(),
                 Frame(FRAME_RST, stream_id=frame.stream_id, payload=make_error_payload("broker queue full")),
             )
         elif frame.type_id != FRAME_DATA:
@@ -680,7 +791,7 @@ class BrokerState(object):
             await self.queue_frame(
                 "helper",
                 helper_session_id,
-                LANE_CTL,
+                self.helper_control_lane(),
                 Frame(FRAME_OPEN_FAIL, stream_id=frame.stream_id, payload=make_error_payload(open_error)),
             )
             return
@@ -695,14 +806,14 @@ class BrokerState(object):
             await self.queue_frame(
                 "helper",
                 helper_session_id,
-                LANE_CTL,
+                self.helper_control_lane(),
                 Frame(FRAME_OPEN_FAIL, stream_id=frame.stream_id, payload=make_error_payload("hidden agent unavailable")),
             )
             return
         queued = await self.queue_frame(
             "agent",
             agent_session_id,
-            LANE_CTL,
+            "pri" if self.agent_down_combined_data_lane else LANE_CTL,
             Frame(FRAME_OPEN, stream_id=agent_stream_id, offset=frame.offset, payload=frame.payload, flags=frame.flags),
         )
         if queued:
@@ -721,7 +832,7 @@ class BrokerState(object):
         await self.queue_frame(
             "helper",
             helper_session_id,
-            LANE_CTL,
+            self.helper_control_lane(),
             Frame(FRAME_OPEN_FAIL, stream_id=frame.stream_id, payload=make_error_payload("hidden agent unavailable")),
         )
 
@@ -881,7 +992,7 @@ class BrokerState(object):
             resets.append((
                 "helper",
                 stream.helper_session_id,
-                LANE_CTL,
+                self.helper_control_lane(),
                 Frame(FRAME_RST, stream_id=stream.helper_stream_id, payload=payload),
             ))
         return resets
@@ -893,7 +1004,7 @@ class BrokerState(object):
             resets.append((
                 "helper",
                 stream.helper_session_id,
-                LANE_CTL,
+                self.helper_control_lane(),
                 Frame(FRAME_RST, stream_id=stream.helper_stream_id, payload=payload),
             ))
         if stream.agent_session_id and ("agent", stream.agent_session_id) in self.peers:
@@ -927,6 +1038,7 @@ class BrokerState(object):
                 "buffered_ctl_bytes": buffered[LANE_CTL],
                 "buffered_pri_bytes": buffered["pri"],
                 "buffered_bulk_bytes": buffered["bulk"],
+                "capabilities": _broker_capabilities(self.config),
                 "metrics": self.metrics,
                 "recent_events": EVENT_RECORDER.snapshot(64) if EVENT_RECORDER is not None else [],
             }
@@ -941,11 +1053,20 @@ class AsyncBrokerServer(object):
         self.port = int(port) if port is not None else 0
         self.unix_socket_path = unix_socket_path
         self.config = config
+        self.backend_family = str(config.get("backend_family", "bridge_runtime")).strip() or "bridge_runtime"
         self.binary_media_type = expected_binary_media_type(config)
         self.state = BrokerState(config)
-        self.down_wait_ms = self._normalize_down_wait_ms(config.get("down_wait_ms"))
+        self.down_wait_ms_by_role = _normalize_role_down_wait_ms(config)
         self.streaming_ctl_down_helper = bool(config.get("streaming_ctl_down_helper", True))
         self.streaming_data_down_helper = bool(config.get("streaming_data_down_helper", True))
+        self.streaming_ctl_down_agent = bool(config.get("streaming_ctl_down_agent", False))
+        self.streaming_data_down_agent = bool(config.get("streaming_data_down_agent", False))
+        self.agent_down_combined_data_lane = bool(config.get("agent_down_combined_data_lane", False))
+        if self.backend_family in ("bridge_runtime", "passenger_python"):
+            # Shared-host-safe is now explicitly a bounded-poll profile on the
+            # hidden side. Long-lived agent data/down streams were the unstable
+            # piece on audited WARP-backed bridge/Passenger paths.
+            self.streaming_data_down_agent = False
         self.server = None
         self.cleanup_task = None
 
@@ -1007,12 +1128,18 @@ class AsyncBrokerServer(object):
             peer = await self.state.ensure_peer(role, peer_label, peer_session_id, token)
             if method == "GET" and direction == "down":
                 if lane == LANE_DATA:
-                    if role == "helper" and self.streaming_data_down_helper:
+                    if (
+                        (role == "helper" and self.streaming_data_down_helper)
+                        or (role == "agent" and self.streaming_data_down_agent)
+                    ):
                         await self._handle_streaming_data_down(writer, peer)
                     else:
                         await self._handle_data_down(writer, peer)
-                elif lane == LANE_CTL and role == "helper" and self.streaming_ctl_down_helper:
-                    await self._handle_helper_ctl_down(writer, peer)
+                elif lane == LANE_CTL and (
+                    (role == "helper" and self.streaming_ctl_down_helper)
+                    or (role == "agent" and self.streaming_ctl_down_agent)
+                ):
+                    await self._handle_streaming_ctl_down(writer, peer)
                 elif lane == LANE_CTL:
                     await self._handle_ctl_down(writer, peer)
                 else:
@@ -1046,23 +1173,17 @@ class AsyncBrokerServer(object):
                 writer.close()
                 await writer.wait_closed()
 
-    def _normalize_down_wait_ms(self, configured):
-        values = {"ctl": 1000, "data": 1000}
-        if isinstance(configured, dict):
-            for lane in ("ctl", "data"):
-                try:
-                    if lane in configured:
-                        values[lane] = max(0, int(configured[lane]))
-                except (TypeError, ValueError):
-                    continue
-        return values
+    def _down_wait_ms_for(self, role, lane):
+        role_key = "agent" if str(role or "").strip().lower() == "agent" else "helper"
+        values = self.down_wait_ms_by_role.get(role_key, self.down_wait_ms_by_role["helper"])
+        return int(values.get(lane, self.down_wait_ms_by_role["helper"].get(lane, 1000)))
 
     async def _next_ctl_payload(self, peer, wait_timeout_ms):
         queue = peer.queues[LANE_CTL]
         try:
             payload = await asyncio.wait_for(queue.get(), timeout=max(0.0, float(wait_timeout_ms) / 1000.0))
         except asyncio.TimeoutError:
-            return padded_payload(encode_frame(Frame(FRAME_PING, offset=now_ms())), minimum_size=1024)
+            return None
         peer.touch()
         profile = self.state.lane_profile(LANE_CTL)
         payloads = [payload]
@@ -1161,7 +1282,7 @@ class AsyncBrokerServer(object):
             while True:
                 payload, source_lane, frames, hold_ms, pad_bytes = await self._next_data_payload(
                     peer,
-                    wait_timeout_ms=self.down_wait_ms["data"],
+                    wait_timeout_ms=self._down_wait_ms_for(peer.role, "data"),
                 )
                 if payload is None:
                     heartbeat = padded_payload(encode_frame(Frame(FRAME_PING, offset=now_ms())), minimum_size=1024)
@@ -1214,14 +1335,11 @@ class AsyncBrokerServer(object):
         trace("down open role=%s peer=%s session=%s lane=data" % (peer.role, peer.peer_label, peer.peer_session_id))
         payload, source_lane, frames, hold_ms, pad_bytes = await self._next_data_payload(
             peer,
-            wait_timeout_ms=self.down_wait_ms["data"],
+            wait_timeout_ms=self._down_wait_ms_for(peer.role, "data"),
         )
         if payload is None:
-            payload = padded_payload(encode_frame(Frame(FRAME_PING, offset=now_ms())), minimum_size=1024)
-            source_lane = "pri"
-            frames = 1
-            hold_ms = 0
-            pad_bytes = max(0, len(payload) - len(encode_frame(Frame(FRAME_PING, offset=0))))
+            await self._send_no_content(writer)
+            return
         self.state.metrics["down_responses"][source_lane] += 1
         self.state.metrics["down_frames"][source_lane] += frames
         self.state.metrics["down_bytes"][source_lane] += len(payload)
@@ -1253,7 +1371,10 @@ class AsyncBrokerServer(object):
 
     async def _handle_ctl_down(self, writer, peer):
         trace("down open role=%s peer=%s session=%s lane=ctl" % (peer.role, peer.peer_label, peer.peer_session_id))
-        payload = await self._next_ctl_payload(peer, self.down_wait_ms["ctl"])
+        payload = await self._next_ctl_payload(peer, self._down_wait_ms_for(peer.role, "ctl"))
+        if payload is None:
+            await self._send_no_content(writer)
+            return
         self.state.metrics["down_responses"][LANE_CTL] += 1
         self.state.metrics["down_frames"][LANE_CTL] += 1
         self.state.metrics["down_bytes"][LANE_CTL] += len(payload)
@@ -1272,7 +1393,7 @@ class AsyncBrokerServer(object):
         writer.write(encrypted_payload)
         await writer.drain()
 
-    async def _handle_helper_ctl_down(self, writer, peer):
+    async def _handle_streaming_ctl_down(self, writer, peer):
         trace("down stream open role=%s peer=%s session=%s lane=ctl" % (peer.role, peer.peer_label, peer.peer_session_id))
         queue = peer.queues[LANE_CTL]
         try:
@@ -1286,27 +1407,8 @@ class AsyncBrokerServer(object):
             await writer.drain()
             stream_cipher = None
             while True:
-                try:
-                    payload = await self._next_ctl_payload(peer, self.down_wait_ms["ctl"])
-                    self.state.metrics["down_responses"][LANE_CTL] += 1
-                    self.state.metrics["down_frames"][LANE_CTL] += 1
-                    self.state.metrics["down_bytes"][LANE_CTL] += len(payload)
-                    trace("down stream send role=%s peer=%s session=%s source=ctl frames=1 bytes=%s hold_ms=0" % (
-                        peer.role,
-                        peer.peer_label,
-                        peer.peer_session_id,
-                        len(payload),
-                    ))
-                    
-                    if stream_cipher is None:
-                        iv = os.urandom(16)
-                        token_str = self.state.token_for_peer(peer)
-                        stream_cipher = TransportCipher(token_str.encode('utf-8'), iv)
-                        await self._write_chunk(writer, iv + stream_cipher.process(payload))
-                    else:
-                        await self._write_chunk(writer, stream_cipher.process(payload))
-
-                except asyncio.TimeoutError:
+                payload = await self._next_ctl_payload(peer, self._down_wait_ms_for(peer.role, "ctl"))
+                if payload is None:
                     heartbeat = padded_payload(encode_frame(Frame(FRAME_PING, offset=now_ms())), minimum_size=1024)
                     if stream_cipher is None:
                         iv = os.urandom(16)
@@ -1315,6 +1417,25 @@ class AsyncBrokerServer(object):
                         await self._write_chunk(writer, iv + stream_cipher.process(heartbeat))
                     else:
                         await self._write_chunk(writer, stream_cipher.process(heartbeat))
+                    continue
+
+                self.state.metrics["down_responses"][LANE_CTL] += 1
+                self.state.metrics["down_frames"][LANE_CTL] += 1
+                self.state.metrics["down_bytes"][LANE_CTL] += len(payload)
+                trace("down stream send role=%s peer=%s session=%s source=ctl frames=1 bytes=%s hold_ms=0" % (
+                    peer.role,
+                    peer.peer_label,
+                    peer.peer_session_id,
+                    len(payload),
+                ))
+
+                if stream_cipher is None:
+                    iv = os.urandom(16)
+                    token_str = self.state.token_for_peer(peer)
+                    stream_cipher = TransportCipher(token_str.encode('utf-8'), iv)
+                    await self._write_chunk(writer, iv + stream_cipher.process(payload))
+                else:
+                    await self._write_chunk(writer, stream_cipher.process(payload))
 
         except Exception as error:
             trace("down stream error role=%s peer=%s session=%s lane=ctl error=%r" % (peer.role, peer.peer_label, peer.peer_session_id, error))
@@ -1439,6 +1560,15 @@ class AsyncBrokerServer(object):
             + ("Content-Length: %d\r\n" % len(body)).encode("ascii")
             + b"Connection: close\r\n\r\n"
             + body
+        )
+        await writer.drain()
+
+    async def _send_no_content(self, writer):
+        writer.write(
+            b"HTTP/1.1 204 No Content\r\n"
+            + b"Cache-Control: no-store\r\n"
+            + b"Connection: close\r\n"
+            + b"Content-Length: 0\r\n\r\n"
         )
         await writer.drain()
 

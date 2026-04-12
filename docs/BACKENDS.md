@@ -39,9 +39,27 @@ Primary files:
 
 - `host/runtime/http_broker_daemon.py`
 - `host/app/bridge_runtime.php`
-- `host/public/api.php`
-- `host/public/health.php`
+- `host/public/index.php`
+- `host/public/.htaccess`
 - `scripts/deploy_host.sh`
+
+Current status:
+
+- bridge deploy defaults keep helper downlinks bounded with
+  `streaming_ctl_down_helper=false` and `streaming_data_down_helper=false`
+- bridge deploy defaults keep the helper and hidden agent on combined data
+  lanes with `helper_down_combined_data_lane=true` and
+  `agent_down_combined_data_lane=true`
+- bridge deploy defaults now keep `streaming_data_down_agent=false`
+- the advertised `shared_host_safe` helper profile raises
+  `down_parallelism.data=2` on bridge_runtime to hide PHP relay jitter without
+  reopening long-lived helper responses on the public host
+- the advertised `shared_host_safe` agent profile also keeps
+  `down_parallelism.data=2` so one bounded hidden-agent poll can be reopened
+  while the other remains available
+- reason: on the audited bridge path, bounded helper polls preserve the
+  camouflage story and avoid public-host queue buildup, and bounded hidden-side
+  polls avoid the mid-stream resets seen on WARP-backed bridge sessions
 
 ### `cloudlinux_node_selector`
 
@@ -52,14 +70,28 @@ Implementation surface:
 
 - CloudLinux Node.js selector app
 - Node broker on the public host
-- HTTP transport with helper `ctl` on HTTP/2 and `data` on HTTP/1.1
+- broker-advertised transport capabilities
+- managed-host HTTP profile by default
+- optional managed-host WebSocket profile when the host and route allow it
 - reverse hidden agent
 
 Current status:
 
 - end-to-end tunnel is proven on the audited managed host
 - browser-grade smoke tests are passing on the current profile
-- raw public WebSocket upgrade is still not assumed
+- the broker now advertises `managed_host_http` as the default profile and
+  `managed_host_ws` as an optional higher-throughput profile
+- current cPanel Node deploy defaults keep helper downlinks bounded with
+  `streaming_data_down_helper=false`
+- current cPanel Node deploy defaults keep `streaming_data_down_agent=false`
+- the advertised `managed_host_http` helper profile now keeps
+  `down_parallelism.data=2` so a second bounded helper poll can reopen while
+  the first is draining
+- helper and agent probe WebSocket mode only when the host advertises it and no
+  hidden-side upstream proxy such as WARP is configured
+- reason: on the audited cPanel front-end, long-lived helper data streams were
+  buffered until the server-side stream window closed, which delayed `FIN` and
+  later response frames by roughly 30 seconds
 - camouflage deploys should publish the same generated `404.html` at both the
   site slug and the root `public_html` when `TWOMAN_CAMOUFLAGE_SITE_ROOT_INDEX=true`
 - camouflage deploys should also install matching `.htaccess` `ErrorDocument`
@@ -70,6 +102,8 @@ Primary files:
 - `host/node_selector/broker.js`
 - `scripts/deploy_host_node_selector.sh`
 - `tests/run_e2e_node_http.sh`
+- `tests/run_e2e_node_ws.sh`
+- `tests/benchmark_transport_profiles.sh`
 - `docs/CLPERSIST_METHOD.md`
 
 ### `passenger_python`
@@ -89,10 +123,18 @@ Current status:
 - `LSAPI_CHILDREN=1` and `LSAPI_AVOID_FORK=1` are required baseline settings
 - full broker traffic now expects Passenger-managed routing rather than `.htaccess` loopback proxying
 - current Passenger deploy defaults use `down_wait_ms={"ctl":250,"data":250}`
-- current Passenger deploy defaults keep `streaming_data_down_helper=false`
-- reason: long-lived helper `data/down` streams can monopolize the public Passenger
-  worker and starve helper control traffic on the audited CloudLinux host
+- current Passenger deploy defaults keep `streaming_ctl_down_helper=false` and
+  `streaming_data_down_helper=false`
+- current Passenger deploy defaults keep `streaming_ctl_down_agent=false` and
+  `streaming_data_down_agent=false`
+- the advertised `shared_host_safe` helper profile keeps `http2_enabled.ctl=false`
+  because the audited Passenger host behaves more reliably with short HTTP/1.1
+  control uploads than with helper-side HTTP/2 control requests
+- reason: long-lived helper or agent down streams can monopolize the public
+  Passenger queue or get cut mid-response on the audited CloudLinux host
 - current deploy defaults size broker lanes as `ctl=4096/8/1ms`, `pri=32768/16/2ms`, and `bulk=262144/64/4ms`
+- the broker advertises only `shared_host_safe`, and helpers/agents now select
+  that profile automatically
 - current public-host naming guidance is documented in
   `docs/HOST_APP_MAPPINGS.md`
 

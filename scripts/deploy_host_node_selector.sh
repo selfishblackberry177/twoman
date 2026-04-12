@@ -125,9 +125,15 @@ TWOMAN_NODE_APP_MODE="${TWOMAN_NODE_APP_MODE:-production}"
 TWOMAN_ADMIN_SCRIPT_NAME="${TWOMAN_ADMIN_SCRIPT_NAME:-rahkar_negahban.php}"
 TWOMAN_TRACE="${TWOMAN_TRACE:-0}"
 TWOMAN_DEBUG_STATS="${TWOMAN_DEBUG_STATS:-0}"
-TWOMAN_DOWN_WAIT_CTL_MS="${TWOMAN_DOWN_WAIT_CTL_MS:-1000}"
-TWOMAN_DOWN_WAIT_DATA_MS="${TWOMAN_DOWN_WAIT_DATA_MS:-1000}"
-TWOMAN_STREAMING_DATA_DOWN_HELPER="${TWOMAN_STREAMING_DATA_DOWN_HELPER:-true}"
+TWOMAN_DOWN_WAIT_CTL_MS="${TWOMAN_DOWN_WAIT_CTL_MS:-250}"
+TWOMAN_DOWN_WAIT_DATA_MS="${TWOMAN_DOWN_WAIT_DATA_MS:-250}"
+TWOMAN_HELPER_DOWN_COMBINED_DATA_LANE="${TWOMAN_HELPER_DOWN_COMBINED_DATA_LANE:-true}"
+TWOMAN_AGENT_DOWN_COMBINED_DATA_LANE="${TWOMAN_AGENT_DOWN_COMBINED_DATA_LANE:-true}"
+# The audited cPanel Node front buffers long-lived helper data streams and
+# delays FIN delivery. Keep helper downlinks bounded by default.
+TWOMAN_STREAMING_DATA_DOWN_HELPER="${TWOMAN_STREAMING_DATA_DOWN_HELPER:-false}"
+TWOMAN_STREAMING_DATA_DOWN_AGENT="${TWOMAN_STREAMING_DATA_DOWN_AGENT:-false}"
+TWOMAN_WEBSOCKET_PUBLIC_ENABLED="${TWOMAN_WEBSOCKET_PUBLIC_ENABLED:-false}"
 
 json_get() {
   local json_path="$1"
@@ -221,7 +227,11 @@ CONFIG_JSON="$(cat <<EOF
     "ctl": ${TWOMAN_DOWN_WAIT_CTL_MS},
     "data": ${TWOMAN_DOWN_WAIT_DATA_MS}
   },
+  "helper_down_combined_data_lane": ${TWOMAN_HELPER_DOWN_COMBINED_DATA_LANE},
+  "agent_down_combined_data_lane": ${TWOMAN_AGENT_DOWN_COMBINED_DATA_LANE},
   "streaming_data_down_helper": ${TWOMAN_STREAMING_DATA_DOWN_HELPER},
+  "streaming_data_down_agent": ${TWOMAN_STREAMING_DATA_DOWN_AGENT},
+  "websocket_public_enabled": ${TWOMAN_WEBSOCKET_PUBLIC_ENABLED},
   "lane_profiles": {
     "ctl": { "max_bytes": 4096, "max_frames": 8, "hold_ms": 1, "pad_min": 1024 },
     "pri": { "max_bytes": 32768, "max_frames": 16, "hold_ms": 2, "pad_min": 1024 },

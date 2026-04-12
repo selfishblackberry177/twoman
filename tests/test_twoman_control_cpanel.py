@@ -65,7 +65,7 @@ class CpanelClientTests(unittest.TestCase):
         with patch("twoman_control.cpanel.httpx.request", return_value=_response("GET", "https://host.example.com", {"ok": True})) as request_mock:
             self.assertTrue(client.verify_public_tls("https://host.example.com"))
 
-        self.assertEqual(request_mock.call_args.kwargs.get("proxy"), "socks5://127.0.0.1:1280")
+        self.assertEqual(request_mock.call_args.kwargs.get("proxy"), "socks5h://127.0.0.1:1280")
 
 
 if __name__ == "__main__":

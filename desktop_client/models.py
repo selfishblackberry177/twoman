@@ -102,6 +102,7 @@ class ClientProfile:
         self.validate()
         return {
             "transport": "http",
+            "transport_profile": "auto",
             "broker_base_url": self.broker_base_url,
             "client_token": self.client_token,
             "listen_host": "127.0.0.1",
@@ -219,4 +220,3 @@ class SharedSocksProxy:
             "password": self.password,
             "log_path": log_path,
         }
-

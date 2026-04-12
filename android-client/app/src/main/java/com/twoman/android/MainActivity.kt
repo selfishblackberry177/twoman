@@ -39,6 +39,10 @@ class MainActivity : AppCompatActivity() {
     private var pendingVpnProfile: ClientProfile? = null
     private var profiles: List<ClientProfile> = emptyList()
 
+    companion object {
+        private const val EXTRA_START_MODE = "twoman_start_mode"
+    }
+
     private val statusTicker = object : Runnable {
         override fun run() {
             renderStatus()
@@ -85,6 +89,14 @@ class MainActivity : AppCompatActivity() {
 
         requestNotificationPermissionIfNeeded()
         reloadProfiles()
+        handleIncomingIntent(intent)
+        renderStatus()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingIntent(intent)
         renderStatus()
     }
 
@@ -251,6 +263,72 @@ class MainActivity : AppCompatActivity() {
             ProxyService.MODE_VPN -> startVpn(profile)
             else -> startProxy(profile)
         }
+    }
+
+    private fun handleIncomingIntent(intent: Intent?) {
+        val importText = extractImportText(intent) ?: return
+        val imported = runCatching {
+            ClientProfile.fromShareText(importText)
+        }.getOrElse {
+            Toast.makeText(this, getString(R.string.import_failed), Toast.LENGTH_SHORT).show()
+            clearHandledIntent()
+            return
+        }
+        val savedProfile = persistImportedProfile(imported)
+        val requestedMode = requestedStartMode(intent)
+        selectionStore.write(
+            SelectionStore.Selection(
+                profileId = savedProfile.id,
+                mode = requestedMode ?: selectionStore.read().mode,
+            ),
+        )
+        reloadProfiles()
+        Toast.makeText(this, getString(R.string.import_applied), Toast.LENGTH_SHORT).show()
+        clearHandledIntent()
+        when (requestedMode) {
+            ProxyService.MODE_VPN -> startVpn(savedProfile)
+            ProxyService.MODE_PROXY -> startProxy(savedProfile)
+        }
+    }
+
+    private fun extractImportText(intent: Intent?): String? {
+        val action = intent?.action ?: return null
+        return when (action) {
+            Intent.ACTION_VIEW -> intent.dataString?.takeIf { it.startsWith("twoman://profile?data=") }
+            Intent.ACTION_SEND -> intent.getStringExtra(Intent.EXTRA_TEXT)?.trim()?.takeIf { it.isNotEmpty() }
+            else -> null
+        }
+    }
+
+    private fun requestedStartMode(intent: Intent?): String? {
+        return when (intent?.getStringExtra(EXTRA_START_MODE)?.trim()?.lowercase()) {
+            ProxyService.MODE_PROXY -> ProxyService.MODE_PROXY
+            ProxyService.MODE_VPN -> ProxyService.MODE_VPN
+            else -> null
+        }
+    }
+
+    private fun persistImportedProfile(imported: ClientProfile): ClientProfile {
+        val existing = profileStore.loadProfiles().firstOrNull {
+            it.name == imported.name &&
+                it.brokerBaseUrl == imported.brokerBaseUrl &&
+                it.clientToken == imported.clientToken
+        }
+        val persisted = imported.copy(id = existing?.id ?: imported.id)
+        val updated = profileStore.loadProfiles()
+            .filterNot { it.id == persisted.id }
+            .plus(persisted)
+        profileStore.saveProfiles(updated)
+        return persisted
+    }
+
+    private fun clearHandledIntent() {
+        val clearedIntent = Intent(intent).apply {
+            action = Intent.ACTION_MAIN
+            data = null
+            replaceExtras(Bundle())
+        }
+        setIntent(clearedIntent)
     }
 
     private fun startProxy(profile: ClientProfile) {

@@ -94,6 +94,8 @@ echo "Uploading agent files..."
 "${SCP_CMD[@]}" \
   requirements.txt \
   runtime_diagnostics.py \
+  twoman_crypto.py \
+  twoman_dns.py \
   twoman_http.py \
   twoman_protocol.py \
   twoman_transport.py \
@@ -107,6 +109,7 @@ echo "Uploading agent files..."
 CONFIG_JSON="$(cat <<EOF
 {
   "transport": "${TWOMAN_TRANSPORT}",
+  "transport_profile": "auto",
   "broker_base_url": "${TWOMAN_BROKER_BASE_URL}",
   "upstream_proxy_url": ${UPSTREAM_PROXY_JSON},
   "agent_token": "${TWOMAN_AGENT_TOKEN}",
@@ -162,7 +165,7 @@ User=${TWOMAN_AGENT_SERVICE_USER}
 Group=${TWOMAN_AGENT_SERVICE_GROUP}
 Environment=PYTHONUNBUFFERED=1
 Environment=TWOMAN_TRACE=${TWOMAN_TRACE}
-ExecStart=/usr/bin/python3 ${TWOMAN_SERVER_DIR}/agent.py --config ${TWOMAN_SERVER_DIR}/config.json
+ExecStart=${TWOMAN_SERVER_DIR}/.venv/bin/python ${TWOMAN_SERVER_DIR}/agent.py --config ${TWOMAN_SERVER_DIR}/config.json
 Restart=always
 RestartSec=2
 LimitNOFILE=65536
@@ -187,7 +190,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 ${TWOMAN_SERVER_DIR}/agent_watchdog.py --service ${TWOMAN_AGENT_SERVICE_NAME} --fd-threshold 16384 --close-wait-threshold 2048
+ExecStart=${TWOMAN_SERVER_DIR}/.venv/bin/python ${TWOMAN_SERVER_DIR}/agent_watchdog.py --service ${TWOMAN_AGENT_SERVICE_NAME} --fd-threshold 16384 --close-wait-threshold 2048
 EOF
 )"
 
@@ -206,18 +209,20 @@ ${WATCHDOG_SERVICE_CONTENT}
 EOF
 install -m 0644 '${TWOMAN_SERVER_DIR}/twoman-agent-watchdog.timer' /etc/systemd/system/twoman-agent-watchdog.timer
 chmod 755 '${TWOMAN_SERVER_DIR}/install_watchdog.sh' '${TWOMAN_SERVER_DIR}/agent_watchdog.py'
-if ! python3 -c 'import httpx, websockets' >/dev/null 2>&1; then
-  if python3 -m pip --version >/dev/null 2>&1; then
-    python3 -m pip install -r '${TWOMAN_SERVER_DIR}/requirements.txt'
-  elif command -v apt-get >/dev/null 2>&1; then
+if ! python3 -m venv --help >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y python3-httpx python3-websockets
+    DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv
   else
-    echo 'unable to install httpx/websockets automatically: pip and apt-get are unavailable' >&2
+    echo 'unable to bootstrap python virtual environments automatically' >&2
     exit 1
   fi
 fi
-python3 -m py_compile '${TWOMAN_SERVER_DIR}/agent.py' '${TWOMAN_SERVER_DIR}/agent_watchdog.py'
+if [ ! -d '${TWOMAN_SERVER_DIR}/.venv' ]; then
+  python3 -m venv '${TWOMAN_SERVER_DIR}/.venv'
+fi
+'${TWOMAN_SERVER_DIR}/.venv/bin/python' -m pip install --no-input -r '${TWOMAN_SERVER_DIR}/requirements.txt'
+'${TWOMAN_SERVER_DIR}/.venv/bin/python' -m py_compile '${TWOMAN_SERVER_DIR}/agent.py' '${TWOMAN_SERVER_DIR}/agent_watchdog.py'
 systemctl daemon-reload
 systemctl enable --now '${TWOMAN_AGENT_SERVICE_NAME}'
 systemctl enable --now twoman-agent-watchdog.timer

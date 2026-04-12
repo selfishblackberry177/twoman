@@ -12,7 +12,7 @@ require_env() {
 api_get() {
   local endpoint="$1"
   shift
-  curl -sk "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl "${CPANEL_CURL_ARGS[@]}" "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     --get \
     "$@" \
     "${TWOMAN_CPANEL_BASE_URL}/execute/${endpoint}"
@@ -21,7 +21,7 @@ api_get() {
 api_post() {
   local endpoint="$1"
   shift
-  curl -sk "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl "${CPANEL_CURL_ARGS[@]}" "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     "$@" \
     "${TWOMAN_CPANEL_BASE_URL}/execute/${endpoint}"
 }
@@ -30,7 +30,7 @@ upload_file() {
   local source_path="$1"
   local remote_dir="$2"
   local remote_name="$3"
-  curl -sk "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl "${CPANEL_CURL_ARGS[@]}" "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     -F "dir=${remote_dir}" \
     -F "overwrite=1" \
     -F "file-1=@${source_path};filename=${remote_name}" \
@@ -41,7 +41,7 @@ upload_content() {
   local remote_dir="$1"
   local remote_name="$2"
   local content="$3"
-  curl -sk "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl "${CPANEL_CURL_ARGS[@]}" "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     --data-urlencode "dir=${remote_dir}" \
     --data-urlencode "file=${remote_name}" \
     --data-urlencode "content=${content}" \
@@ -51,10 +51,21 @@ upload_content() {
     "${TWOMAN_CPANEL_BASE_URL}/execute/Fileman/save_file_content" >/dev/null
 }
 
+upload_generated_file() {
+  local remote_dir="$1"
+  local remote_name="$2"
+  local content="$3"
+  local temp_path
+  temp_path="$(mktemp)"
+  printf '%s' "${content}" > "${temp_path}"
+  upload_file "${temp_path}" "${remote_dir}" "${remote_name}"
+  rm -f "${temp_path}"
+}
+
 mkdir_api() {
   local parent_path="$1"
   local dir_name="$2"
-  curl -sk "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl "${CPANEL_CURL_ARGS[@]}" "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     --get \
     --data-urlencode "cpanel_jsonapi_user=${TWOMAN_CPANEL_USERNAME}" \
     --data-urlencode "cpanel_jsonapi_apiversion=2" \
@@ -89,11 +100,18 @@ require_env TWOMAN_PUBLIC_ORIGIN
 require_env TWOMAN_CLIENT_TOKEN
 require_env TWOMAN_AGENT_TOKEN
 TWOMAN_UPSTREAM_PROXY_URL="${TWOMAN_UPSTREAM_PROXY_URL:-}"
+TWOMAN_CPANEL_CONNECT_TIMEOUT_SECONDS="${TWOMAN_CPANEL_CONNECT_TIMEOUT_SECONDS:-10}"
+TWOMAN_CPANEL_MAX_TIME_SECONDS="${TWOMAN_CPANEL_MAX_TIME_SECONDS:-60}"
 
 CURL_PROXY_ARGS=()
 if [ -n "${TWOMAN_UPSTREAM_PROXY_URL}" ]; then
   CURL_PROXY_ARGS+=(--proxy "${TWOMAN_UPSTREAM_PROXY_URL}")
 fi
+CPANEL_CURL_ARGS=(
+  -sk
+  --connect-timeout "${TWOMAN_CPANEL_CONNECT_TIMEOUT_SECONDS}"
+  --max-time "${TWOMAN_CPANEL_MAX_TIME_SECONDS}"
+)
 
 TWOMAN_CAMOUFLAGE_SITE_ENABLED="${TWOMAN_CAMOUFLAGE_SITE_ENABLED:-false}"
 TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID="${TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID:-}"
@@ -104,6 +122,12 @@ TWOMAN_APP_NAME="${TWOMAN_APP_NAME:-rahkar}"
 TWOMAN_APP_ROOT="${TWOMAN_APP_ROOT:-${TWOMAN_CPANEL_HOME}/rahkar}"
 TWOMAN_DOWN_WAIT_CTL_MS="${TWOMAN_DOWN_WAIT_CTL_MS:-250}"
 TWOMAN_DOWN_WAIT_DATA_MS="${TWOMAN_DOWN_WAIT_DATA_MS:-250}"
+TWOMAN_AGENT_DOWN_WAIT_CTL_MS="${TWOMAN_AGENT_DOWN_WAIT_CTL_MS:-10000}"
+TWOMAN_AGENT_DOWN_WAIT_DATA_MS="${TWOMAN_AGENT_DOWN_WAIT_DATA_MS:-10000}"
+TWOMAN_HELPER_DOWN_COMBINED_DATA_LANE="${TWOMAN_HELPER_DOWN_COMBINED_DATA_LANE:-true}"
+TWOMAN_AGENT_DOWN_COMBINED_DATA_LANE="${TWOMAN_AGENT_DOWN_COMBINED_DATA_LANE:-true}"
+TWOMAN_STREAMING_CTL_DOWN_AGENT="${TWOMAN_STREAMING_CTL_DOWN_AGENT:-false}"
+TWOMAN_STREAMING_DATA_DOWN_AGENT="${TWOMAN_STREAMING_DATA_DOWN_AGENT:-false}"
 TWOMAN_STREAMING_DATA_DOWN_HELPER="${TWOMAN_STREAMING_DATA_DOWN_HELPER:-false}"
 if [ -z "${TWOMAN_ROUTE_TEMPLATE:-}" ]; then
   TWOMAN_ROUTE_TEMPLATE='/{lane}/{direction}'
@@ -159,6 +183,7 @@ REMOTE_LOG_DIR="${TWOMAN_APP_ROOT}/logs"
 
 CONFIG_JSON="$(cat <<EOF
 {
+  "backend_family": "passenger_python",
   "client_tokens": ["${TWOMAN_CLIENT_TOKEN}"],
   "agent_tokens": ["${TWOMAN_AGENT_TOKEN}"],
   "base_uri": "${TWOMAN_PUBLIC_BASE_PATH}",
@@ -169,8 +194,18 @@ CONFIG_JSON="$(cat <<EOF
     "ctl": ${TWOMAN_DOWN_WAIT_CTL_MS},
     "data": ${TWOMAN_DOWN_WAIT_DATA_MS}
   },
+  "down_wait_ms_by_role": {
+    "agent": {
+      "ctl": ${TWOMAN_AGENT_DOWN_WAIT_CTL_MS},
+      "data": ${TWOMAN_AGENT_DOWN_WAIT_DATA_MS}
+    }
+  },
   "streaming_ctl_down_helper": false,
   "streaming_data_down_helper": ${TWOMAN_STREAMING_DATA_DOWN_HELPER},
+  "helper_down_combined_data_lane": ${TWOMAN_HELPER_DOWN_COMBINED_DATA_LANE},
+  "streaming_ctl_down_agent": ${TWOMAN_STREAMING_CTL_DOWN_AGENT},
+  "streaming_data_down_agent": ${TWOMAN_STREAMING_DATA_DOWN_AGENT},
+  "agent_down_combined_data_lane": ${TWOMAN_AGENT_DOWN_COMBINED_DATA_LANE},
   "lane_profiles": {
     "ctl": { "max_bytes": 4096, "max_frames": 8, "hold_ms": 1, "pad_min": 1024 },
     "pri": { "max_bytes": 32768, "max_frames": 16, "hold_ms": 2, "pad_min": 1024 },
@@ -213,24 +248,24 @@ EOF
 )"
   
   ensure_remote_dir "public_html/${CAMOUFLAGE_SITE_SLUG}"
-  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "index.html" "${CAMOUFLAGE_INDEX}"
-  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "about.html" "${CAMOUFLAGE_ABOUT}"
-  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "contact.html" "${CAMOUFLAGE_CONTACT}"
-  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "404.html" "${CAMOUFLAGE_404}"
-  upload_content "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" ".htaccess" "${CAMOUFLAGE_SLUG_HTACCESS}"
+  upload_generated_file "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "index.html" "${CAMOUFLAGE_INDEX}"
+  upload_generated_file "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "about.html" "${CAMOUFLAGE_ABOUT}"
+  upload_generated_file "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "contact.html" "${CAMOUFLAGE_CONTACT}"
+  upload_generated_file "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" "404.html" "${CAMOUFLAGE_404}"
+  upload_generated_file "${TWOMAN_CPANEL_HOME}/public_html/${CAMOUFLAGE_SITE_SLUG}" ".htaccess" "${CAMOUFLAGE_SLUG_HTACCESS}"
   
   if [ "${TWOMAN_CAMOUFLAGE_SITE_ROOT_INDEX}" = "true" ]; then
-    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "index.html" "${CAMOUFLAGE_INDEX}"
-    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "about.html" "${CAMOUFLAGE_ABOUT}"
-    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "contact.html" "${CAMOUFLAGE_CONTACT}"
-    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "404.html" "${CAMOUFLAGE_404}"
-    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "robots.txt" "${CAMOUFLAGE_ROBOTS}"
-    upload_content "${TWOMAN_CPANEL_HOME}/public_html" "sitemap.xml" "${CAMOUFLAGE_SITEMAP}"
-    upload_content "${TWOMAN_CPANEL_HOME}/public_html" ".htaccess" "${CAMOUFLAGE_ROOT_HTACCESS}"
+    upload_generated_file "${TWOMAN_CPANEL_HOME}/public_html" "index.html" "${CAMOUFLAGE_INDEX}"
+    upload_generated_file "${TWOMAN_CPANEL_HOME}/public_html" "about.html" "${CAMOUFLAGE_ABOUT}"
+    upload_generated_file "${TWOMAN_CPANEL_HOME}/public_html" "contact.html" "${CAMOUFLAGE_CONTACT}"
+    upload_generated_file "${TWOMAN_CPANEL_HOME}/public_html" "404.html" "${CAMOUFLAGE_404}"
+    upload_generated_file "${TWOMAN_CPANEL_HOME}/public_html" "robots.txt" "${CAMOUFLAGE_ROBOTS}"
+    upload_generated_file "${TWOMAN_CPANEL_HOME}/public_html" "sitemap.xml" "${CAMOUFLAGE_SITEMAP}"
+    upload_generated_file "${TWOMAN_CPANEL_HOME}/public_html" ".htaccess" "${CAMOUFLAGE_ROOT_HTACCESS}"
   fi
   
   # Crucial for proxy camouflage: upload the themed 404 to the passenger runtime root
-  upload_content "${TWOMAN_APP_ROOT}/runtime" "camouflage_404.html" "${CAMOUFLAGE_404}"
+  upload_generated_file "${TWOMAN_APP_ROOT}/runtime" "camouflage_404.html" "${CAMOUFLAGE_404}"
 fi
 
 upload_file "runtime_diagnostics.py" "${TWOMAN_APP_ROOT}" "runtime_diagnostics.py"
@@ -238,13 +273,13 @@ upload_file "twoman_http.py" "${TWOMAN_APP_ROOT}" "twoman_http.py"
 upload_file "twoman_protocol.py" "${TWOMAN_APP_ROOT}" "twoman_protocol.py"
 upload_file "twoman_crypto.py" "${TWOMAN_APP_ROOT}" "twoman_crypto.py"
 upload_file "host/runtime/http_broker_daemon.py" "${TWOMAN_APP_ROOT}" "http_broker_daemon.py"
-upload_content "${TWOMAN_APP_ROOT}" "broker_app.py" "$(cat host/passenger_python/broker_app.py)"
-upload_content "${TWOMAN_APP_ROOT}" "passenger_proxy.py" "$(cat host/passenger_python/passenger_proxy.py)"
-upload_content "${TWOMAN_APP_ROOT}" "passenger_wsgi.py" "$(cat host/passenger_python/passenger_wsgi.py)"
-upload_content "${TWOMAN_APP_ROOT}" "config.json" "${CONFIG_JSON}"
+upload_generated_file "${TWOMAN_APP_ROOT}" "broker_app.py" "$(cat host/passenger_python/broker_app.py)"
+upload_generated_file "${TWOMAN_APP_ROOT}" "passenger_proxy.py" "$(cat host/passenger_python/passenger_proxy.py)"
+upload_generated_file "${TWOMAN_APP_ROOT}" "passenger_wsgi.py" "$(cat host/passenger_python/passenger_wsgi.py)"
+upload_generated_file "${TWOMAN_APP_ROOT}" "config.json" "${CONFIG_JSON}"
 # Force Passenger to respawn the detached broker daemon on the next request so
 # updated broker code actually takes effect.
-upload_content "${TWOMAN_APP_ROOT}/runtime" "broker.pid" "0"
+upload_generated_file "${TWOMAN_APP_ROOT}/runtime" "broker.pid" "0"
 
 HOST_DOMAIN="${TWOMAN_PUBLIC_ORIGIN#https://}"
 HOST_DOMAIN="${HOST_DOMAIN#http://}"

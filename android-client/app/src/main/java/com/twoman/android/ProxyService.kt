@@ -83,7 +83,9 @@ class ProxyService : Service() {
         val runtimeConfig = profile.toRuntimeConfig(logFile.absolutePath, listenStateFile.absolutePath).apply {
             put("vpn_filter_aaaa", mode == MODE_VPN)
             if (mode == MODE_VPN) {
-                put("vpn_dns_query_timeout_seconds", 8.0)
+                put("vpn_dns_query_timeout_seconds", 15.0)
+                put("vpn_dns_cache_ttl_seconds", 30.0)
+                put("vpn_dns_max_inflight", 32)
             }
         }
         configFile.writeText(runtimeConfig.toString(2), Charsets.UTF_8)

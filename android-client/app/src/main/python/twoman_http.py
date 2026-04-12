@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import http.cookies
+import inspect
 import random
 import re
 import urllib.parse
@@ -125,6 +126,30 @@ def normalize_request_path(path, base_path=None):
     return normalized
 
 
+def httpx_proxy_kwargs(proxy_url, *, async_client=False):
+    import httpx
+
+    normalized = str(proxy_url or "").strip()
+    if not normalized:
+        return {}
+    client_ctor = httpx.AsyncClient if async_client else httpx.Client
+    try:
+        parameters = inspect.signature(client_ctor.__init__).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "proxy" in parameters:
+        return {"proxy": normalized}
+    if "proxies" in parameters:
+        return {"proxies": normalized}
+    return {"proxy": normalized}
+
+
+def httpx_request(method, url, *, proxy_url=None, **kwargs):
+    import httpx
+
+    return httpx.request(method, url, **httpx_proxy_kwargs(proxy_url, async_client=False), **kwargs)
+
+
 class RouteProvider(object):
     def __init__(
         self,
@@ -155,7 +180,15 @@ class RouteProvider(object):
         return self._join_path(self._render(self.route_template, lane=lane, direction=direction))
 
     def ws_lane_url(self, lane):
-        return self._join_path(self._render(self.ws_route_template, lane=lane))
+        url = self._join_path(self._render(self.ws_route_template, lane=lane))
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme == "https":
+            scheme = "wss"
+        elif parsed.scheme == "http":
+            scheme = "ws"
+        else:
+            scheme = parsed.scheme
+        return urllib.parse.urlunsplit((scheme, parsed.netloc, parsed.path, parsed.query, parsed.fragment))
 
     def health_url(self):
         return self._join_path(self._render(self.health_template))

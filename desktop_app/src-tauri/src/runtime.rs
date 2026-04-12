@@ -640,6 +640,7 @@ impl DesktopRuntime {
             &config_path,
             serde_json::to_vec_pretty(&json!({
                 "transport": "http",
+                "transport_profile": "auto",
                 "broker_base_url": profile.broker_base_url,
                 "client_token": profile.client_token,
                 "listen_host": "127.0.0.1",

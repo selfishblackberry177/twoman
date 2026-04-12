@@ -64,7 +64,7 @@ Recommended path:
 - expose SOCKS5 on `127.0.0.1:1280`
 - answer `yes` when the installer asks whether to use a local WARP / upstream
   proxy
-- keep the default proxy URL: `socks5://127.0.0.1:1280`
+- keep the default proxy URL: `socks5h://127.0.0.1:1280`
 
 This affects only the hidden server and the installer that runs on it. Twoman
 clients on desktop and Android do not need WARP for this mode.
@@ -100,7 +100,7 @@ sudo bash scripts/install_twoman.sh \
   --cpanel-password cpanel-password \
   --cpanel-home /home/cpanel-user \
   --backend passenger_python \
-  --hidden-upstream-proxy-url socks5://127.0.0.1:1280 \
+  --hidden-upstream-proxy-url socks5h://127.0.0.1:1280 \
   --hidden-upstream-proxy-label wireproxy
 ```
 

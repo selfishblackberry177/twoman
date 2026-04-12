@@ -52,6 +52,7 @@ if [ ! -f "${CONFIG_PATH}" ]; then
   cat > "${CONFIG_PATH}" <<EOF
 {
   "transport": "${TWOMAN_TRANSPORT}",
+  "transport_profile": "auto",
   "broker_base_url": "${TWOMAN_BROKER_BASE_URL}",
   "client_token": "${TWOMAN_CLIENT_TOKEN}",
   "auth_mode": "${TWOMAN_AUTH_MODE}",

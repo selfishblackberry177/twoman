@@ -5,6 +5,7 @@
 Twoman is designed for environments where:
 - the public host must remain in the traffic path
 - the public host is a shared cPanel/LiteSpeed environment
+- some managed hosts expose a stronger Node runtime than the shared-host path
 - the hidden server can make outbound HTTPS requests to the host
 - end-user applications need a local HTTP/SOCKS5 proxy
 
@@ -13,9 +14,11 @@ Twoman is designed for environments where:
 1. An application talks to the local helper.
 2. The helper speaks Twoman frames to the public broker at a fully configured base URI such as
    `/api/v1/telemetry`, with relative route templates such as `/{lane}/{direction}`.
-3. Preferred shared-host deployments use internal application-server integration such as Passenger WSGI.
-4. The hidden agent maintains a reverse session to the broker.
-5. The hidden server opens the real outbound TCP connection.
+3. The helper and agent fetch broker capabilities from `/health` and select a
+   named transport profile automatically unless an explicit profile is pinned.
+4. Preferred shared-host deployments use internal application-server integration such as Passenger WSGI.
+5. The hidden agent maintains a reverse session to the broker.
+6. The hidden server opens the real outbound TCP connection.
 
 ## Lanes
 
@@ -29,6 +32,36 @@ Internal scheduling classes:
 - `bulk`
 
 The external `data` lane carries both `pri` and `bulk` traffic. `FRAME_DATA` bulk frames are marked with `FLAG_DATA_BULK` so the broker can preserve scheduling intent.
+
+## Transport Profiles
+
+Twoman 0.7 treats transport behavior as a backend capability instead of one
+global runtime shape.
+
+Current named profiles:
+
+- `shared_host_safe`
+- `managed_host_http`
+- `managed_host_ws`
+
+Default behavior:
+
+- helpers and agents set `transport_profile: auto`
+- the broker publishes `capabilities` in `/health`
+- the transport picks the broker-recommended profile, then falls back through
+  other supported profiles when needed
+
+Current selection rules:
+
+- Passenger and bridge-style shared hosts recommend `shared_host_safe`
+- `shared_host_safe` assumes short-request polling on the public host instead of
+  long-lived down streams, including the hidden-agent `data/down` path when the
+  hidden side is reaching the host through WARP or another upstream proxy
+- managed Node hosts recommend `managed_host_http`
+- managed Node hosts may advertise `managed_host_ws` as an optional higher-throughput path
+- WebSocket mode is skipped when the hidden server is using an upstream proxy
+  such as WireProxy/WARP, because the current transport intentionally keeps that
+  path on HTTP until proxy-aware WebSocket support is added
 
 ## Authentication
 
@@ -54,10 +87,31 @@ The broker is:
 ## Host Constraints
 
 Twoman is intentionally shaped around shared-host reality:
-- response streaming works better than aggressive request-body transport
-- helper downlinks use streamed HTTP/1.1
+- response behavior must match the host runtime instead of assuming one model
+- Passenger/shared hosts are safer with bounded polling responses
+- managed Node runtimes can sustain lower-churn long-lived transports
 - binary lane traffic defaults to `image/webp` so intermediaries see a standard media type
 - larger uploads and larger browser workloads are the practical ceiling
+
+## DNS
+
+Tunnel DNS is now a dedicated subsystem.
+
+Why:
+
+- VPN DNS is latency-sensitive and user-visible
+- treating each DNS query as an ordinary short proxy stream made Android VPN
+  mode look dead even when the transport was technically connected
+
+Current model:
+
+- helper captures DNS queries locally
+- helper sends `FRAME_DNS_QUERY`
+- broker routes DNS requests separately from TCP stream lifecycle
+- agent resolves DNS directly and returns `FRAME_DNS_RESPONSE` or `FRAME_DNS_FAIL`
+
+This keeps DNS out of normal TCP OPEN/WINDOW/FIN churn while preserving the
+same public camouflage surface.
 
 ## Production Reality
 

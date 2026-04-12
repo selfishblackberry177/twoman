@@ -14,8 +14,7 @@ from getpass import getpass
 from pathlib import Path
 from typing import Iterable
 
-import httpx
-
+from twoman_http import httpx_request
 from twoman_control.cpanel import CpanelClient
 from twoman_control.defaults import build_generated_defaults, build_profile_share_text
 from twoman_control.models import (
@@ -28,7 +27,7 @@ from twoman_control.models import (
 
 
 STATE_FILENAME = "install-state.json"
-DEFAULT_BRIDGE_PUBLIC_BASE_PATH = "/api/v1/telemetry"
+DEFAULT_BRIDGE_PUBLIC_BASE_PATH = ""
 LAUNCHER_PATH = Path(os.environ.get("TWOMAN_LAUNCHER_PATH", "/usr/local/bin/twoman"))
 
 
@@ -236,11 +235,30 @@ def _proxy_display_name(proxy_label: str, proxy_url: str) -> str:
     return f"custom upstream proxy via {proxy_url}"
 
 
+def _normalize_hidden_upstream_proxy_url(proxy_url: str) -> str:
+    normalized = str(proxy_url or "").strip()
+    if not normalized:
+        return ""
+    lowered = normalized.lower()
+    if lowered == "socks5://127.0.0.1:1280":
+        return "socks5h://127.0.0.1:1280"
+    if lowered == "socks5://localhost:1280":
+        return "socks5h://localhost:1280"
+    return normalized
+
+
 def _normalize_base_path(value: str) -> str:
     parts = [part for part in str(value or "").strip().split("/") if part]
     if not parts:
         return "/"
     return "/" + "/".join(parts)
+
+
+def _normalize_optional_base_path(value: str) -> str:
+    text = str(value or "").strip()
+    if text == "":
+        return ""
+    return _normalize_base_path(text)
 
 
 def _venv_builder_python() -> str:
@@ -281,7 +299,10 @@ def build_broker_base_url(
     public_path = "/" + public_base_path.strip().lstrip("/")
     if backend != BACKEND_BRIDGE:
         return f"{origin}{public_path}"
-    bridge_path = "/" + bridge_public_base_path.strip().lstrip("/")
+    bridge_path = str(bridge_public_base_path or "").strip()
+    if not bridge_path or bridge_path == "/":
+        return f"{origin}{public_path}"
+    bridge_path = "/" + bridge_path.lstrip("/")
     return f"{origin}{public_path.rstrip('/')}{bridge_path}"
 
 
@@ -417,6 +438,9 @@ def _deploy_host(bundle_root: Path, state: InstallState) -> None:
             "TWOMAN_CLIENT_TOKEN": state.client_token,
             "TWOMAN_AGENT_TOKEN": state.agent_token,
             "TWOMAN_UPSTREAM_PROXY_URL": state.hidden_upstream_proxy_url,
+            "TWOMAN_CAMOUFLAGE_SITE_ENABLED": "true",
+            "TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID": state.deployment_id,
+            "TWOMAN_CAMOUFLAGE_SITE_NAME": state.site_name,
         }
         script = bundle_root / "scripts" / "deploy_host.sh"
     result = _run_script(script, env, cwd=bundle_root)
@@ -452,12 +476,13 @@ def _install_local_hidden_server(bundle_root: Path, state: InstallState) -> None
 
 
 def _verify_final_health(state: InstallState) -> None:
-    response = httpx.get(
+    response = httpx_request(
+        "GET",
         f"{state.broker_base_url.rstrip('/')}/health",
         headers={"Authorization": f"Bearer {state.client_token}"},
         timeout=20.0,
         verify=state.verify_tls,
-        proxy=state.hidden_upstream_proxy_url or None,
+        proxy_url=state.hidden_upstream_proxy_url or None,
         follow_redirects=True,
     )
     response.raise_for_status()
@@ -537,10 +562,10 @@ def collect_install_args(namespace: object) -> InstallArgs:
     if not site_name and not non_interactive:
         site_name = _prompt_text("Optional camouflage site name", allow_blank=True)
 
-    hidden_upstream_proxy_url = str(
+    hidden_upstream_proxy_url = _normalize_hidden_upstream_proxy_url(
         getattr(namespace, "hidden_upstream_proxy_url", "")
         or (existing_state.hidden_upstream_proxy_url if existing_state else "")
-    ).strip()
+    )
     hidden_upstream_proxy_label = str(
         getattr(namespace, "hidden_upstream_proxy_label", "")
         or (existing_state.hidden_upstream_proxy_label if existing_state else "")
@@ -548,7 +573,7 @@ def collect_install_args(namespace: object) -> InstallArgs:
     detected_proxy_url = ""
     detected_proxy_label = ""
     if not hidden_upstream_proxy_url and _local_tcp_port_open("127.0.0.1", 1280):
-        detected_proxy_url = "socks5://127.0.0.1:1280"
+        detected_proxy_url = "socks5h://127.0.0.1:1280"
         detected_proxy_label = "wireproxy"
     if not non_interactive:
         default_enabled = bool(hidden_upstream_proxy_url or detected_proxy_url)
@@ -557,11 +582,11 @@ def collect_install_args(namespace: object) -> InstallArgs:
             default_enabled,
         )
         if use_hidden_upstream_proxy:
-            proxy_default = hidden_upstream_proxy_url or detected_proxy_url or "socks5://127.0.0.1:1280"
-            hidden_upstream_proxy_url = _prompt_text(
+            proxy_default = hidden_upstream_proxy_url or detected_proxy_url or "socks5h://127.0.0.1:1280"
+            hidden_upstream_proxy_url = _normalize_hidden_upstream_proxy_url(_prompt_text(
                 "Hidden upstream proxy URL",
                 proxy_default,
-            )
+            ))
             hidden_upstream_proxy_label = (
                 hidden_upstream_proxy_label
                 or detected_proxy_label
@@ -580,7 +605,7 @@ def collect_install_args(namespace: object) -> InstallArgs:
     bridge_public_base_path = str(
         getattr(namespace, "bridge_public_base_path", "")
         or (existing_state.bridge_public_base_path if existing_state else DEFAULT_BRIDGE_PUBLIC_BASE_PATH)
-    ).strip() or DEFAULT_BRIDGE_PUBLIC_BASE_PATH
+    ).strip()
     return InstallArgs(
         repo_root=repo_root,
         control_root=default_control_root,
@@ -707,7 +732,7 @@ def install(namespace: object) -> InstallState:
             public_base_path = node_app_uri
         elif backend == BACKEND_BRIDGE:
             public_base_path = _prompt_text("Bridge public site path", public_base_path)
-            bridge_public_base_path = _prompt_text("Bridge broker subpath", bridge_public_base_path)
+            bridge_public_base_path = _prompt_text("Bridge broker subpath", bridge_public_base_path, allow_blank=True)
         else:
             public_base_path = _prompt_text("Public base URI", public_base_path)
             if backend == BACKEND_PASSENGER:
@@ -721,7 +746,7 @@ def install(namespace: object) -> InstallState:
         verify_tls = _prompt_bool("Verify TLS for helper and hidden-agent traffic?", verify_tls)
 
     public_base_path = _normalize_base_path(public_base_path)
-    bridge_public_base_path = _normalize_base_path(bridge_public_base_path)
+    bridge_public_base_path = _normalize_optional_base_path(bridge_public_base_path)
     node_app_uri = _normalize_base_path(node_app_uri)
 
     broker_base_url = build_broker_base_url(

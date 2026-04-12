@@ -106,16 +106,15 @@ class TunnelVpnService : VpnService() {
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
+        val dnsProxyIp = profile.vpnDnsProxyIp.ifBlank { "198.18.0.2" }
         val builder = Builder()
             .setSession(BuildConfig.VPN_SESSION_NAME)
             .setMtu(1500)
-            .addAddress("198.18.0.1", 32)
+            .addAddress("198.18.0.1", 30)
             .addRoute("0.0.0.0", 0)
             .setConfigureIntent(configureIntent)
 
-        profile.vpnDnsServers.forEach { dnsServer ->
-            runCatching { builder.addDnsServer(dnsServer) }
-        }
+        runCatching { builder.addDnsServer(dnsProxyIp) }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             // Keep local-network access outside the VPN so same-Wi-Fi clients and wireless

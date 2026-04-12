@@ -13,6 +13,7 @@
   - `python3 -m unittest tests.test_transport_proxy tests.test_twoman_control_cpanel tests.test_twoman_control_installer tests.test_twoman_control_manager tests.test_desktop_client_tui`
   - `bash tests/run_e2e.sh`
   - `bash tests/run_e2e_node_http.sh`
+  - `bash tests/run_e2e_node_ws.sh`
   - `bash tests/run_desktop_client_e2e.sh`
 - Rebuild release artifacts when shared runtime files changed:
   - Android APK/AAB

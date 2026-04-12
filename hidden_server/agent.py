@@ -204,7 +204,7 @@ class RemoteStream(object):
             if sock is not None:
                 with contextlib.suppress(OSError):
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        await self.agent.transport.send_frame(LANE_CTL, Frame(FRAME_OPEN_OK, stream_id=self.stream_id))
+        await self.agent.transport.send_frame(self._control_lane(), Frame(FRAME_OPEN_OK, stream_id=self.stream_id))
         trace("open ok stream=%s" % self.stream_id)
         record_event(
             "stream_open_ok",
@@ -336,7 +336,7 @@ class RemoteStream(object):
                     record_event("remote_eof", stream_id=self.stream_id, send_offset=self.send_offset)
                     await self.flush_window()
                     await self.agent.transport.send_frame(
-                        LANE_CTL,
+                        self._control_lane(),
                         Frame(FRAME_FIN, stream_id=self.stream_id, offset=self.send_offset),
                     )
                     trace("send FIN stream=%s offset=%s" % (self.stream_id, self.send_offset))
@@ -372,7 +372,7 @@ class RemoteStream(object):
         value = self.pending_window
         self.pending_window = 0
         await self.agent.transport.send_frame(
-            LANE_CTL,
+            self._control_lane(),
             Frame(FRAME_WINDOW, stream_id=self.stream_id, offset=value),
         )
 
@@ -387,7 +387,7 @@ class RemoteStream(object):
             self.window_flush_task.cancel()
         record_event("stream_reset_sent", stream_id=self.stream_id, error=message)
         await self.agent.transport.send_frame(
-            LANE_CTL,
+            self._control_lane(),
             Frame(FRAME_RST, stream_id=self.stream_id, payload=make_error_payload(message)),
         )
         await self.close()
@@ -434,6 +434,9 @@ class RemoteStream(object):
         if self.send_offset < PRI_LIMIT and (self.send_offset + int(chunk_len)) <= PRI_LIMIT:
             return LANE_PRI
         return LANE_BULK
+
+    def _control_lane(self):
+        return getattr(self.agent.transport, "stream_control_lane", LANE_CTL)
 
 
 class AgentRuntime(object):
@@ -710,7 +713,7 @@ class AgentRuntime(object):
             record_event("stream_open_failed", stream_id=stream.stream_id, error=str(error))
             if self.streams.get(stream.stream_id) is stream:
                 await self.transport.send_frame(
-                    LANE_CTL,
+                    getattr(self.transport, "stream_control_lane", LANE_CTL),
                     Frame(FRAME_OPEN_FAIL, stream_id=stream.stream_id, payload=make_error_payload(str(error))),
                 )
                 self.streams.pop(stream.stream_id, None)

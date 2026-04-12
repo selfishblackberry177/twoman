@@ -61,6 +61,10 @@ RUNTIME_LOG_PATH = ""
 EVENT_LOG_PATH = ""
 EVENT_RECORDER = None
 DNS_FRAME_TYPES = {FRAME_DNS_QUERY, FRAME_DNS_RESPONSE, FRAME_DNS_FAIL}
+PROFILE_SHARED_HOST_SAFE = "shared_host_safe"
+PROFILE_MANAGED_HOST_HTTP = "managed_host_http"
+PROFILE_MANAGED_HOST_WS = "managed_host_ws"
+CAPABILITY_VERSION = 1
 
 
 def now_ms():
@@ -243,6 +247,95 @@ def _normalize_lane_profiles(config):
     return normalized
 
 
+def _normalize_role_down_wait_ms(config):
+    base = {"ctl": 1000, "data": 1000}
+    configured = config.get("down_wait_ms", {})
+    if isinstance(configured, dict):
+        for lane in ("ctl", "data"):
+            try:
+                if lane in configured:
+                    base[lane] = max(0, int(configured[lane]))
+            except (TypeError, ValueError):
+                continue
+    roles = {
+        "helper": dict(base),
+        "agent": dict(base),
+    }
+    configured_roles = config.get("down_wait_ms_by_role", {})
+    if isinstance(configured_roles, dict):
+        for role in ("helper", "agent"):
+            override = configured_roles.get(role)
+            if not isinstance(override, dict):
+                continue
+            for lane in ("ctl", "data"):
+                try:
+                    if lane in override:
+                        roles[role][lane] = max(0, int(override[lane]))
+                except (TypeError, ValueError):
+                    continue
+    return roles
+
+
+def _down_poll_timeout_seconds_for_role(config, role, lane):
+    role_key = "agent" if str(role or "").strip().lower() == "agent" else "helper"
+    waits = _normalize_role_down_wait_ms(config)
+    values = waits.get(role_key, waits["helper"])
+    return max(0.01, float(values.get(lane, waits["helper"].get(lane, 250))) / 1000.0)
+
+
+def _broker_capabilities(config):
+    agent_down_wait_ms = _normalize_role_down_wait_ms(config).get("agent", {"ctl": 1000, "data": 1000})
+    agent_down_read_timeout_seconds = max(
+        15.0,
+        (max(agent_down_wait_ms["ctl"], agent_down_wait_ms["data"]) / 1000.0) + 10.0,
+    )
+    helper_down_combined_data_lane = bool(config.get("helper_down_combined_data_lane", False))
+    agent_down_combined_data_lane = bool(config.get("agent_down_combined_data_lane", False))
+    streaming_data_down_agent = bool(config.get("streaming_data_down_agent", False))
+    agent_profile = {
+        "http2_enabled": {"ctl": False, "data": False},
+        "down_lanes": ["data"] if agent_down_combined_data_lane else [],
+        "upload_profiles": {
+            "data": {"max_batch_bytes": 131072, "flush_delay_seconds": 0.006},
+        },
+        "down_read_timeout_seconds": agent_down_read_timeout_seconds,
+        "idle_repoll_delay_seconds": {"ctl": 0.05, "data": 0.10},
+        "streaming_up_lanes": [],
+    }
+    if streaming_data_down_agent and agent_down_combined_data_lane:
+        # Passenger tolerates one hidden-agent stream far better than repeated
+        # WARP-backed short polls that stall before they enter the app.
+        agent_profile["down_parallelism"] = {"data": 1}
+    if agent_down_combined_data_lane:
+        agent_profile["stream_control_lane"] = "pri"
+    return {
+        "version": CAPABILITY_VERSION,
+        "backend_family": "passenger_python",
+        "recommended_profile": PROFILE_SHARED_HOST_SAFE,
+        "supported_profiles": [PROFILE_SHARED_HOST_SAFE],
+        "profiles": {
+            PROFILE_SHARED_HOST_SAFE: {
+                "transport": "http",
+                "helper": {
+                    "http2_enabled": {"ctl": False, "data": False},
+                    "down_lanes": ["data"] if helper_down_combined_data_lane else [],
+                    "upload_profiles": {
+                        "data": {"max_batch_bytes": 65536, "flush_delay_seconds": 0.004},
+                    },
+                    "idle_repoll_delay_seconds": {"ctl": 0.05, "data": 0.10},
+                    "streaming_up_lanes": [],
+                },
+                "agent": agent_profile,
+            },
+        },
+        "camouflage": {
+            "binary_media_type": expected_binary_media_type(config),
+            "route_template": config.get("route_template", "/{lane}/{direction}"),
+            "health_template": config.get("health_template", "/health"),
+        },
+    }
+
+
 class BrokerState(object):
     def __init__(self, config):
         self.config = config
@@ -259,6 +352,8 @@ class BrokerState(object):
             self.max_lane_bytes,
             int(config.get("max_peer_buffered_bytes", min(self.max_lane_bytes * 2, 32 * 1024 * 1024))),
         )
+        self.helper_down_combined_data_lane = bool(config.get("helper_down_combined_data_lane", False))
+        self.agent_down_combined_data_lane = bool(config.get("agent_down_combined_data_lane", False))
         self.lane_profiles = _normalize_lane_profiles(config)
         self.peers = {}
         self.streams_by_helper = {}
@@ -280,6 +375,16 @@ class BrokerState(object):
             "up_frames": dict((lane, 0) for lane in LANES),
             "up_bytes": dict((lane, 0) for lane in LANES),
         }
+
+    def helper_control_lane(self):
+        return "pri" if self.helper_down_combined_data_lane else LANE_CTL
+
+    def target_lane_for_role(self, target_role, inbound_lane, frame_type_id):
+        if target_role == "agent" and self.agent_down_combined_data_lane:
+            return inbound_lane if frame_type_id == FRAME_DATA else "pri"
+        if target_role == "helper" and self.helper_down_combined_data_lane:
+            return inbound_lane if (frame_type_id == FRAME_DATA or frame_type_id in DNS_FRAME_TYPES) else "pri"
+        return inbound_lane if (frame_type_id == FRAME_DATA or frame_type_id in DNS_FRAME_TYPES) else LANE_CTL
 
     def _allocate_agent_stream_id_locked(self):
         stream_id = int(self.next_agent_stream_id) & 0xFFFFFFFF
@@ -448,13 +553,13 @@ class BrokerState(object):
             payload=frame.payload,
             flags=frame.flags,
         )
-        target_lane = lane if (frame.type_id == FRAME_DATA or frame.type_id in DNS_FRAME_TYPES) else LANE_CTL
+        target_lane = self.target_lane_for_role(target_role, lane, frame.type_id)
         queued = self.queue_frame(target_role, target_peer_session_id, target_lane, outbound_frame)
         if not queued and sender_role == "helper":
             self.queue_frame(
                 "helper",
                 sender_peer_session_id,
-                LANE_CTL,
+                self.helper_control_lane(),
                 Frame(FRAME_RST, stream_id=frame.stream_id, payload=make_error_payload("broker queue full")),
             )
         elif frame.type_id != FRAME_DATA:
@@ -628,7 +733,7 @@ class BrokerState(object):
                 helper_stream_id=frame.stream_id,
                 reason=open_error,
             )
-            self.queue_frame("helper", helper_session_id, LANE_CTL, Frame(FRAME_OPEN_FAIL, stream_id=frame.stream_id, payload=make_error_payload(open_error)))
+            self.queue_frame("helper", helper_session_id, self.helper_control_lane(), Frame(FRAME_OPEN_FAIL, stream_id=frame.stream_id, payload=make_error_payload(open_error)))
             return
         if not agent_session_id:
             record_event(
@@ -637,9 +742,14 @@ class BrokerState(object):
                 helper_stream_id=frame.stream_id,
                 reason="no-agent",
             )
-            self.queue_frame("helper", helper_session_id, LANE_CTL, Frame(FRAME_OPEN_FAIL, stream_id=frame.stream_id, payload=make_error_payload("hidden agent unavailable")))
+            self.queue_frame("helper", helper_session_id, self.helper_control_lane(), Frame(FRAME_OPEN_FAIL, stream_id=frame.stream_id, payload=make_error_payload("hidden agent unavailable")))
             return
-        self.queue_frame("agent", agent_session_id, LANE_CTL, Frame(FRAME_OPEN, stream_id=agent_stream_id, offset=frame.offset, payload=frame.payload, flags=frame.flags))
+        self.queue_frame(
+            "agent",
+            agent_session_id,
+            "pri" if self.agent_down_combined_data_lane else LANE_CTL,
+            Frame(FRAME_OPEN, stream_id=agent_stream_id, offset=frame.offset, payload=frame.payload, flags=frame.flags),
+        )
 
     def _drop_stream_locked(self, stream):
         self.streams_by_helper.pop((stream.helper_session_id, stream.helper_stream_id), None)
@@ -785,14 +895,14 @@ class BrokerState(object):
         if stale_role == "helper" and stream.agent_session_id and ("agent", stream.agent_session_id) in self.peers:
             resets.append(("agent", stream.agent_session_id, LANE_CTL, Frame(FRAME_RST, stream_id=stream.agent_stream_id, payload=payload)))
         if stale_role == "agent" and stream.helper_session_id and ("helper", stream.helper_session_id) in self.peers:
-            resets.append(("helper", stream.helper_session_id, LANE_CTL, Frame(FRAME_RST, stream_id=stream.helper_stream_id, payload=payload)))
+            resets.append(("helper", stream.helper_session_id, self.helper_control_lane(), Frame(FRAME_RST, stream_id=stream.helper_stream_id, payload=payload)))
         return resets
 
     def _reset_frames_for_stale_stream_locked(self, stream):
         payload = make_error_payload("stream expired")
         resets = []
         if stream.helper_session_id and ("helper", stream.helper_session_id) in self.peers:
-            resets.append(("helper", stream.helper_session_id, LANE_CTL, Frame(FRAME_RST, stream_id=stream.helper_stream_id, payload=payload)))
+            resets.append(("helper", stream.helper_session_id, self.helper_control_lane(), Frame(FRAME_RST, stream_id=stream.helper_stream_id, payload=payload)))
         if stream.agent_session_id and ("agent", stream.agent_session_id) in self.peers:
             resets.append(("agent", stream.agent_session_id, LANE_CTL, Frame(FRAME_RST, stream_id=stream.agent_stream_id, payload=payload)))
         return resets
@@ -821,6 +931,7 @@ class BrokerState(object):
                 "buffered_ctl_bytes": buffered[LANE_CTL],
                 "buffered_pri_bytes": buffered["pri"],
                 "buffered_bulk_bytes": buffered["bulk"],
+                "capabilities": _broker_capabilities(self.config),
                 "metrics": self.metrics,
                 "recent_events": EVENT_RECORDER.snapshot(64) if EVENT_RECORDER is not None else [],
             }
@@ -927,6 +1038,17 @@ def json_response(start_response, status_code, payload):
     return [body]
 
 
+def no_content_response(start_response):
+    start_response(
+        "204 No Content",
+        [
+            ("Content-Length", "0"),
+            ("Cache-Control", "no-store"),
+        ],
+    )
+    return [b""]
+
+
 def parse_request(environ):
     method = environ.get("REQUEST_METHOD", "GET").upper()
     path = environ.get("PATH_INFO", "") or "/"
@@ -1018,13 +1140,12 @@ def application(environ, start_response):
         return json_response(start_response, 405, {"error": "method not allowed"})
 
     if lane == LANE_DATA:
-        payload, source_lane, frames, hold_ms, pad_bytes = _STATE.next_data_payload(peer, wait_timeout_seconds=DOWN_POLL_TIMEOUT_SECONDS)
+        payload, source_lane, frames, hold_ms, pad_bytes = _STATE.next_data_payload(
+            peer,
+            wait_timeout_seconds=_down_poll_timeout_seconds_for_role(_CONFIG, role, "data"),
+        )
         if payload is None:
-            payload = padded_payload(encode_frame(Frame(FRAME_PING, offset=now_ms())), minimum_size=1024)
-            source_lane = "pri"
-            frames = 1
-            hold_ms = 0
-            pad_bytes = 0
+            return no_content_response(start_response)
         _STATE.metrics["down_responses"][source_lane] += 1
         _STATE.metrics["down_frames"][source_lane] += frames
         _STATE.metrics["down_bytes"][source_lane] += len(payload)
@@ -1038,11 +1159,9 @@ def application(environ, start_response):
     payloads = []
     hold_started = time.time()
     try:
-        payloads.append(queue_obj.get(timeout=DOWN_POLL_TIMEOUT_SECONDS))
+        payloads.append(queue_obj.get(timeout=_down_poll_timeout_seconds_for_role(_CONFIG, role, lane)))
     except queue.Empty:
-        ping = padded_payload(encode_frame(Frame(FRAME_PING, offset=now_ms())), minimum_size=int(profile["pad_min"]))
-        start_response("200 OK", [("Content-Type", _BINARY_MEDIA_TYPE), ("Content-Length", str(len(ping))), ("Cache-Control", "no-store")])
-        return [ping]
+        return no_content_response(start_response)
     peer.touch()
     total = len(payloads[0])
     frames = 1

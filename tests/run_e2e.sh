@@ -24,6 +24,7 @@ JSON
 
 cat > "$TMP_DIR/agent.json" <<'JSON'
 {
+  "transport_profile": "auto",
   "broker_base_url": "http://127.0.0.1:18093/api/v1/telemetry",
   "agent_token": "test-agent-token",
   "auth_mode": "bearer",
@@ -44,6 +45,7 @@ JSON
 
 cat > "$TMP_DIR/helper.json" <<'JSON'
 {
+  "transport_profile": "auto",
   "broker_base_url": "http://127.0.0.1:18093/api/v1/telemetry",
   "client_token": "test-client-token",
   "auth_mode": "bearer",
@@ -188,6 +190,7 @@ with open(sys.argv[1], "r", encoding="utf-8") as handle:
 stats = payload["stats"]
 assert stats["log_paths"]["runtime"].endswith("http-broker.log"), stats
 assert stats["log_paths"]["events"].endswith("http-broker-events.ndjson"), stats
+assert stats["capabilities"]["recommended_profile"] == "shared_host_safe", stats
 PY
 
 curl --fail --silent --show-error \

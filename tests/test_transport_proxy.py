@@ -1,10 +1,12 @@
 import importlib.util
+import inspect
 import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from twoman_transport import LaneTransport
+from twoman_http import httpx_proxy_kwargs
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +26,32 @@ def load_android_transport_module():
 
 
 class TransportProxyTests(unittest.TestCase):
+    def test_httpx_proxy_kwargs_prefers_current_proxy_argument(self) -> None:
+        signature = inspect.Signature(
+            parameters=[
+                inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+                inspect.Parameter("proxy", inspect.Parameter.KEYWORD_ONLY, default=None),
+            ]
+        )
+        with patch("twoman_http.inspect.signature", return_value=signature):
+            self.assertEqual(
+                httpx_proxy_kwargs("socks5h://127.0.0.1:1280", async_client=True),
+                {"proxy": "socks5h://127.0.0.1:1280"},
+            )
+
+    def test_httpx_proxy_kwargs_supports_legacy_proxies_argument(self) -> None:
+        signature = inspect.Signature(
+            parameters=[
+                inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+                inspect.Parameter("proxies", inspect.Parameter.KEYWORD_ONLY, default=None),
+            ]
+        )
+        with patch("twoman_http.inspect.signature", return_value=signature):
+            self.assertEqual(
+                httpx_proxy_kwargs("socks5h://127.0.0.1:1280", async_client=True),
+                {"proxies": "socks5h://127.0.0.1:1280"},
+            )
+
     def test_root_transport_build_client_uses_proxy_url(self) -> None:
         captured = {}
 
@@ -44,7 +72,7 @@ class TransportProxyTests(unittest.TestCase):
             )
             transport._build_client("ctl", "up")
 
-        self.assertEqual(captured.get("proxy"), "socks5://127.0.0.1:1280")
+        self.assertEqual(captured.get("proxy"), "socks5h://127.0.0.1:1280")
 
     def test_android_transport_build_client_uses_proxy_url(self) -> None:
         android_transport = load_android_transport_module()
@@ -67,7 +95,7 @@ class TransportProxyTests(unittest.TestCase):
             )
             transport._build_client("ctl", "down")
 
-        self.assertEqual(captured.get("proxy"), "socks5://127.0.0.1:1280")
+        self.assertEqual(captured.get("proxy"), "socks5h://127.0.0.1:1280")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
@@ -12,6 +13,18 @@ class Handler(BaseHTTPRequestHandler):
         return self.rfile.read(length) if length > 0 else b""
 
     def _respond(self) -> None:
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == "/blob":
+            params = urllib.parse.parse_qs(parsed.query)
+            size = int(params.get("bytes", ["1048576"])[0])
+            size = max(0, min(size, 32 * 1024 * 1024))
+            body = (b"twoman-benchmark-" * ((size // 17) + 1))[:size]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         payload = {
             "method": self.command,
             "path": self.path,

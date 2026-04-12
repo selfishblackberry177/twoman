@@ -41,7 +41,7 @@ class _FakeController:
             deployment_id="deadbeefcafe",
             site_name="دروازه",
             site_slug="darvazeh",
-            hidden_upstream_proxy_url="socks5://127.0.0.1:1280",
+            hidden_upstream_proxy_url="socks5h://127.0.0.1:1280",
             hidden_upstream_proxy_label="wireproxy",
         )
 
@@ -52,7 +52,7 @@ class _FakeController:
         return "Passenger Python: recommended"
 
     def hidden_route_text(self) -> str:
-        return "WARP WireProxy via socks5://127.0.0.1:1280"
+        return "WARP WireProxy via socks5h://127.0.0.1:1280"
 
     def install_command(self) -> list[str]:
         return ["/usr/local/bin/twoman", "install"]
@@ -81,7 +81,7 @@ class TwomanManagerAppTests(unittest.IsolatedAsyncioTestCase):
             deployment_detail = str(app.query_one("#deployment-detail", Static).content)
             log_output = str(app.query_one("#log-output", Static).content)
             self.assertIn("Public origin: https://host.example.com", deployment_detail)
-            self.assertIn("Hidden route: WARP WireProxy via socks5://127.0.0.1:1280", deployment_detail)
+            self.assertIn("Hidden route: WARP WireProxy via socks5h://127.0.0.1:1280", deployment_detail)
             self.assertIn("line one", log_output)
 
             await pilot.click("#action-show-capabilities")

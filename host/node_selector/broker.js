@@ -82,6 +82,10 @@ const LANE_CTL = "ctl";
 const LANE_DATA = "data";
 const DEFAULT_DATA_REPLAY_RESEND_MS = 750;
 const DNS_FRAME_TYPES = new Set([FRAME_DNS_QUERY, FRAME_DNS_RESPONSE, FRAME_DNS_FAIL]);
+const PROFILE_SHARED_HOST_SAFE = "shared_host_safe";
+const PROFILE_MANAGED_HOST_HTTP = "managed_host_http";
+const PROFILE_MANAGED_HOST_WS = "managed_host_ws";
+const CAPABILITY_VERSION = 1;
 
 function coerceInt(value, fallbackValue, minimum = 1) {
   const parsed = Number.parseInt(value, 10);
@@ -89,6 +93,66 @@ function coerceInt(value, fallbackValue, minimum = 1) {
     return Math.max(minimum, fallbackValue);
   }
   return Math.max(minimum, parsed);
+}
+
+function brokerCapabilities() {
+  const agentDownWaitMs = state ? state.downWaitMsForRole("agent") : { ctl: 1000, data: 1000 };
+  const agentDownReadTimeoutSeconds = Math.max(15.0, (Math.max(agentDownWaitMs.ctl, agentDownWaitMs.data) / 1000.0) + 10.0);
+  const helperDownCombinedDataLane = state ? state.helperDownCombinedDataLane : false;
+  const agentDownCombinedDataLane = state ? state.agentDownCombinedDataLane : false;
+  const websocketPublicEnabled = state ? state.websocketPublicEnabled : false;
+  const supportedProfiles = [PROFILE_MANAGED_HOST_HTTP];
+  if (websocketPublicEnabled) {
+    supportedProfiles.push(PROFILE_MANAGED_HOST_WS);
+  }
+  return {
+    version: CAPABILITY_VERSION,
+    backend_family: "node_selector",
+    recommended_profile: PROFILE_MANAGED_HOST_HTTP,
+    supported_profiles: supportedProfiles,
+    profiles: {
+      [PROFILE_MANAGED_HOST_HTTP]: {
+        transport: "http",
+        helper: {
+          http2_enabled: { ctl: true, data: false },
+          down_lanes: helperDownCombinedDataLane ? ["data"] : [],
+          down_parallelism: { data: 2 },
+          upload_profiles: {
+            data: { max_batch_bytes: 65536, flush_delay_seconds: 0.004 }
+          },
+          idle_repoll_delay_seconds: { ctl: 0.05, data: 0.10 },
+          streaming_up_lanes: []
+        },
+        agent: {
+          http2_enabled: { ctl: false, data: false },
+          down_lanes: agentDownCombinedDataLane ? ["data"] : [],
+          proxy_keepalive_connections: 2,
+          proxy_keepalive_expiry_seconds: 15.0,
+          upload_profiles: {
+            data: { max_batch_bytes: 131072, flush_delay_seconds: 0.006 }
+          },
+          down_read_timeout_seconds: agentDownReadTimeoutSeconds,
+          idle_repoll_delay_seconds: { ctl: 0.05, data: 0.10 },
+          streaming_up_lanes: [],
+          ...(agentDownCombinedDataLane ? { stream_control_lane: "pri" } : {})
+        }
+      },
+      [PROFILE_MANAGED_HOST_WS]: {
+        transport: "ws",
+        helper: {
+          streaming_up_lanes: []
+        },
+        agent: {
+          streaming_up_lanes: []
+        }
+      }
+    },
+    camouflage: {
+      binary_media_type: BINARY_MEDIA_TYPE,
+      route_template: loadedConfig.route_template || "/{lane}/{direction}",
+      health_template: loadedConfig.health_template || "/health"
+    }
+  };
 }
 
 function defaultLogDir() {
@@ -425,8 +489,14 @@ class BrokerState {
     this.flushBackpressureBytes = Number(config.flush_backpressure_bytes || 512 * 1024);
     this.flushRetryDelayMs = Number(config.flush_retry_delay_ms || 5);
     this.dataReplayResendMs = Math.max(50, Number(config.data_replay_resend_ms || DEFAULT_DATA_REPLAY_RESEND_MS));
-    this.downWaitMs = this.normalizeDownWaitMs(config.down_wait_ms || {});
+    this.downWaitMsByRole = this.normalizeRoleDownWaitMs(config);
+    this.helperDownCombinedDataLane = Boolean(config.helper_down_combined_data_lane);
+    this.agentDownCombinedDataLane = Boolean(config.agent_down_combined_data_lane);
+    this.websocketPublicEnabled = Boolean(config.websocket_public_enabled);
+    this.streamingCtlDownHelper = Boolean(config.streaming_ctl_down_helper);
     this.streamingDataDownHelper = Boolean(config.streaming_data_down_helper);
+    this.streamingCtlDownAgent = Boolean(config.streaming_ctl_down_agent);
+    this.streamingDataDownAgent = Boolean(config.streaming_data_down_agent);
     this.laneProfiles = normalizeLaneProfiles(config);
     this.peers = new Map();
     this.streamsByHelper = new Map();
@@ -455,6 +525,41 @@ class BrokerState {
     const ctl = Math.max(50, Number(rawConfig.ctl || rawConfig.control || 1000));
     const data = Math.max(50, Number(rawConfig.data || 1000));
     return { ctl, data };
+  }
+
+  normalizeRoleDownWaitMs(config) {
+    const base = this.normalizeDownWaitMs(config.down_wait_ms || {});
+    const values = {
+      helper: { ...base },
+      agent: { ...base }
+    };
+    const byRole = (config && typeof config.down_wait_ms_by_role === "object" && config.down_wait_ms_by_role) || {};
+    for (const role of ["helper", "agent"]) {
+      const override = byRole[role];
+      if (!override || typeof override !== "object") {
+        continue;
+      }
+      values[role] = this.normalizeDownWaitMs({ ...values[role], ...override });
+    }
+    return values;
+  }
+
+  downWaitMsForRole(role) {
+    return this.downWaitMsByRole[role] || this.downWaitMsByRole.helper;
+  }
+
+  helperControlLane() {
+    return this.helperDownCombinedDataLane ? "pri" : LANE_CTL;
+  }
+
+  targetLaneForRole(targetRole, inboundLane, frameTypeId) {
+    if (targetRole === "agent" && this.agentDownCombinedDataLane) {
+      return frameTypeId === FRAME_DATA ? inboundLane : "pri";
+    }
+    if (targetRole === "helper" && this.helperDownCombinedDataLane) {
+      return (frameTypeId === FRAME_DATA || DNS_FRAME_TYPES.has(frameTypeId)) ? inboundLane : "pri";
+    }
+    return (frameTypeId === FRAME_DATA || DNS_FRAME_TYPES.has(frameTypeId)) ? inboundLane : null;
   }
 
   recordEvent(kind, details, options = {}) {
@@ -941,7 +1046,7 @@ class BrokerState {
       offset: frame.offset,
       payload: frame.payload
     };
-    const targetLane = (frame.typeId === FRAME_DATA || DNS_FRAME_TYPES.has(frame.typeId)) ? lane : null;
+    const targetLane = this.targetLaneForRole(targetRole, lane, frame.typeId);
     const queued = this.queueFrame(targetRole, targetPeerSessionId, outboundFrame, targetLane);
     if (queued) {
       this.recordEvent("frame_forward", {
@@ -961,7 +1066,7 @@ class BrokerState {
         streamId: frame.streamId,
         offset: 0,
         payload: makeErrorPayload("broker queue full")
-      });
+      }, this.helperControlLane());
     }
     if (frame.typeId === FRAME_RST) {
       this.dropStream(stream);
@@ -1109,7 +1214,7 @@ class BrokerState {
         streamId: frame.streamId,
         offset: 0,
         payload: makeErrorPayload(openError)
-      });
+      }, this.helperControlLane());
       return;
     }
     if (!agentSessionId) {
@@ -1124,7 +1229,7 @@ class BrokerState {
         streamId: frame.streamId,
         offset: 0,
         payload: makeErrorPayload("hidden agent unavailable")
-      });
+      }, this.helperControlLane());
       return;
     }
     const agentStreamId = this.nextAgentStreamId++;
@@ -1144,13 +1249,18 @@ class BrokerState {
       agent_stream_id: agentStreamId,
       helper_peer_label: helperPeerLabel
     });
-    this.queueFrame("agent", agentSessionId, {
-      typeId: FRAME_OPEN,
-      flags: frame.flags,
-      streamId: agentStreamId,
-      offset: frame.offset,
-      payload: frame.payload
-    });
+    this.queueFrame(
+      "agent",
+      agentSessionId,
+      {
+        typeId: FRAME_OPEN,
+        flags: frame.flags,
+        streamId: agentStreamId,
+        offset: frame.offset,
+        payload: frame.payload
+      },
+      this.agentDownCombinedDataLane ? "pri" : null
+    );
   }
 
   reserveHelperOpen(peer) {
@@ -1255,7 +1365,7 @@ class BrokerState {
             streamId: stream.helperStreamId,
             offset: 0,
             payload: makeErrorPayload("peer expired")
-          });
+          }, this.helperControlLane());
         }
         this.dropStream(stream);
       }
@@ -1299,7 +1409,7 @@ class BrokerState {
         streamId: stream.helperStreamId,
         offset: 0,
         payload: makeErrorPayload("stream expired")
-      });
+      }, this.helperControlLane());
       this.queueFrame("agent", stream.agentSessionId, {
         typeId: FRAME_RST,
         flags: 0,
@@ -1370,6 +1480,7 @@ class BrokerState {
       buffered_ctl_bytes: buffered.ctl,
       buffered_pri_bytes: buffered.pri,
       buffered_bulk_bytes: buffered.bulk,
+      capabilities: brokerCapabilities(),
       metrics: this.metrics,
       recent_event_count: this.recentEvents.length
     };
@@ -1766,13 +1877,26 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === "GET" && direction === "down") {
-      if (lane === LANE_DATA && headers.role === "helper" && state.streamingDataDownHelper) {
+      const roleDownWaitMs = state.downWaitMsForRole(headers.role);
+      if (
+        lane === LANE_CTL &&
+        ((headers.role === "helper" && state.streamingCtlDownHelper) ||
+          (headers.role === "agent" && state.streamingCtlDownAgent))
+      ) {
+        await handleLaneDownStream(peer, lane, res);
+        return;
+      }
+      if (
+        lane === LANE_DATA &&
+        ((headers.role === "helper" && state.streamingDataDownHelper) ||
+          (headers.role === "agent" && state.streamingDataDownAgent))
+      ) {
         await handleLaneDownStream(peer, lane, res);
         return;
       }
       const payload = lane === LANE_CTL
-        ? await state.nextCtlPayload(peer, state.downWaitMs.ctl)
-        : await state.nextDataPayload(peer, state.downWaitMs.data);
+        ? await state.nextCtlPayload(peer, roleDownWaitMs.ctl)
+        : await state.nextDataPayload(peer, roleDownWaitMs.data);
         
       let tokenStr = "twoman-default-key";
       if (headers.role === 'agent' && loadedConfig.agent_tokens && loadedConfig.agent_tokens.length > 0) {

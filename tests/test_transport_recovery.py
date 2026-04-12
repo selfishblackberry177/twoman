@@ -8,9 +8,9 @@ from twoman_protocol import FRAME_PING, Frame, LANE_CTL, encode_frame
 
 
 class _FakeStreamResponse:
-    def __init__(self, chunks, delays=None):
-        self.status_code = 200
-        self.headers = {"content-type": "image/webp"}
+    def __init__(self, chunks, delays=None, status_code=200, headers=None):
+        self.status_code = status_code
+        self.headers = headers if headers is not None else {"content-type": "image/webp"}
         self._chunks = list(chunks)
         self._delays = list(delays or [])
 
@@ -140,6 +140,47 @@ class TransportRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(any(event.get("kind") == "transport_down_rotate" for event in events))
         self.assertGreaterEqual(fake_client.stream_calls, 1)
+
+    async def test_down_loop_accepts_idle_no_content_polls(self):
+        transport = twoman_transport.LaneTransport(
+            base_url="https://example.invalid/base",
+            token="test-token",
+            role="helper",
+            peer_id="helper-test",
+            on_frame=_async_noop,
+            collapse_data_lanes=True,
+            idle_repoll_delay_seconds={"ctl": 0.0, "data": 0.0},
+            protocol_config={"down_read_timeout_seconds": 0.2, "down_stream_max_session_seconds": 60.0},
+        )
+        events = []
+        fake_client = _FakeClient(
+            [
+                _FakeStreamResponse(
+                    [],
+                    status_code=204,
+                    headers={"content-length": "0"},
+                )
+            ]
+        )
+        transport.clients[(LANE_CTL, "down")] = fake_client
+
+        def report(kind, **fields):
+            event = {"kind": kind, **fields}
+            events.append(event)
+            if kind == "transport_down_response":
+                transport.stop_event.set()
+
+        transport._report_event = report
+        task = asyncio.create_task(transport._down_loop(LANE_CTL))
+        await asyncio.wait_for(task, timeout=1.0)
+
+        self.assertEqual(fake_client.stream_calls, 1)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "transport_down_response")
+        self.assertEqual(events[0]["status_code"], 204)
+        self.assertEqual(events[0]["frame_count"], 0)
+        self.assertEqual(events[0]["non_ping_frames"], 0)
+        self.assertEqual(events[0]["payload_bytes"], 0)
 
 
 if __name__ == "__main__":

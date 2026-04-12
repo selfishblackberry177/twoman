@@ -94,7 +94,7 @@ class InstallState:
     deployment_id: str
     site_name: str
     site_slug: str
-    bridge_public_base_path: str = "/api/v1/telemetry"
+    bridge_public_base_path: str = ""
     passenger_app_name: str = ""
     passenger_app_root: str = ""
     node_app_root: str = ""
@@ -148,7 +148,7 @@ class InstallState:
             deployment_id=str(payload.get("deployment_id", "")).strip(),
             site_name=str(payload.get("site_name", "")).strip(),
             site_slug=str(payload.get("site_slug", "")).strip(),
-            bridge_public_base_path=str(payload.get("bridge_public_base_path", "/api/v1/telemetry")).strip() or "/api/v1/telemetry",
+            bridge_public_base_path=str(payload.get("bridge_public_base_path", "")).strip(),
             passenger_app_name=str(payload.get("passenger_app_name", "")).strip(),
             passenger_app_root=str(payload.get("passenger_app_root", "")).strip(),
             node_app_root=str(payload.get("node_app_root", "")).strip(),

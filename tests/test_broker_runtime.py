@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from host.runtime.http_broker_daemon import AsyncBrokerServer, BrokerState
+from host.runtime.http_broker_daemon import AsyncBrokerServer, BrokerState, _broker_capabilities
 from twoman_crypto import TransportCipher
 from twoman_http import build_connection_headers, expected_binary_media_type
 from twoman_protocol import (
@@ -19,8 +19,10 @@ from twoman_protocol import (
 class _FakeWriter:
     def __init__(self):
         self.closed = False
+        self.buffer = bytearray()
 
-    def write(self, _payload):
+    def write(self, payload):
+        self.buffer.extend(payload)
         return None
 
     async def drain(self):
@@ -69,6 +71,180 @@ class BrokerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         peer = server.state.peers[("helper", "helper-session")]
         self.assertEqual(peer.auth_token, "new-client-token")
         self.assertTrue(writer.closed)
+
+    async def test_agent_role_uses_longer_down_wait_window(self):
+        server = AsyncBrokerServer(
+            "127.0.0.1",
+            0,
+            {
+                "client_tokens": ["client-token"],
+                "agent_tokens": ["agent-token"],
+                "down_wait_ms": {"ctl": 250, "data": 250},
+                "down_wait_ms_by_role": {"agent": {"ctl": 10000, "data": 3000}},
+            },
+        )
+
+        self.assertEqual(server._down_wait_ms_for("helper", "ctl"), 250)
+        self.assertEqual(server._down_wait_ms_for("helper", "data"), 250)
+        self.assertEqual(server._down_wait_ms_for("agent", "ctl"), 10000)
+        self.assertEqual(server._down_wait_ms_for("agent", "data"), 3000)
+
+    async def test_broker_capabilities_publish_agent_read_timeout_for_long_polls(self):
+        capabilities = _broker_capabilities(
+            {
+                "backend_family": "passenger_python",
+                "down_wait_ms": {"ctl": 250, "data": 250},
+                "down_wait_ms_by_role": {"agent": {"ctl": 10000, "data": 3000}},
+            }
+        )
+
+        self.assertEqual(capabilities["backend_family"], "passenger_python")
+        self.assertEqual(
+            capabilities["profiles"]["shared_host_safe"]["agent"]["down_read_timeout_seconds"],
+            20.0,
+        )
+
+    async def test_broker_capabilities_keep_agent_parallelism_for_shared_host_polling(self):
+        capabilities = _broker_capabilities(
+            {
+                "backend_family": "passenger_python",
+                "agent_down_combined_data_lane": True,
+                "streaming_data_down_agent": True,
+            }
+        )
+
+        self.assertEqual(
+            capabilities["profiles"]["shared_host_safe"]["agent"]["down_parallelism"],
+            {"data": 2},
+        )
+
+    async def test_bridge_capabilities_increase_helper_parallelism_for_combined_data_downlink(self):
+        capabilities = _broker_capabilities(
+            {
+                "backend_family": "bridge_runtime",
+                "helper_down_combined_data_lane": True,
+            }
+        )
+
+        self.assertEqual(
+            capabilities["profiles"]["shared_host_safe"]["helper"]["down_parallelism"],
+            {"data": 2},
+        )
+
+    async def test_bridge_capabilities_keep_agent_parallelism_for_shared_host_polling(self):
+        capabilities = _broker_capabilities(
+            {
+                "backend_family": "bridge_runtime",
+                "agent_down_combined_data_lane": True,
+                "streaming_data_down_agent": True,
+            }
+        )
+
+        self.assertEqual(
+            capabilities["profiles"]["shared_host_safe"]["agent"]["down_parallelism"],
+            {"data": 2},
+        )
+
+    async def test_bridge_capabilities_move_agent_stream_control_to_priority_lane(self):
+        capabilities = _broker_capabilities(
+            {
+                "backend_family": "bridge_runtime",
+                "agent_down_combined_data_lane": True,
+            }
+        )
+
+        self.assertEqual(
+            capabilities["profiles"]["shared_host_safe"]["agent"]["stream_control_lane"],
+            "pri",
+        )
+
+    async def test_passenger_capabilities_move_agent_stream_control_to_priority_lane(self):
+        capabilities = _broker_capabilities(
+            {
+                "backend_family": "passenger_python",
+                "agent_down_combined_data_lane": True,
+            }
+        )
+
+        self.assertEqual(
+            capabilities["profiles"]["shared_host_safe"]["agent"]["stream_control_lane"],
+            "pri",
+        )
+
+    async def test_shared_host_backends_force_agent_data_downlink_to_polling(self):
+        server = AsyncBrokerServer(
+            "127.0.0.1",
+            0,
+            {
+                "backend_family": "bridge_runtime",
+                "client_tokens": ["client-token"],
+                "agent_tokens": ["agent-token"],
+                "streaming_ctl_down_helper": False,
+                "streaming_data_down_helper": False,
+                "streaming_ctl_down_agent": True,
+                "streaming_data_down_agent": True,
+            },
+        )
+
+        self.assertFalse(server.streaming_ctl_down_helper)
+        self.assertFalse(server.streaming_data_down_helper)
+        self.assertTrue(server.streaming_ctl_down_agent)
+        self.assertFalse(server.streaming_data_down_agent)
+
+    async def test_combined_agent_down_lane_routes_control_frames_over_priority_queue(self):
+        state = BrokerState(
+            {
+                "client_tokens": ["client-token"],
+                "agent_tokens": ["agent-token"],
+                "agent_down_combined_data_lane": True,
+            }
+        )
+        await state.ensure_peer("helper", "desktop", "helper-session", "client-token")
+        await state.ensure_peer("agent", "hidden", "agent-session", "agent-token")
+        queued_frames = []
+
+        async def fake_queue(role, peer_session_id, lane, frame):
+            queued_frames.append((role, peer_session_id, lane, frame))
+            return True
+
+        state.queue_frame = fake_queue
+        await state._handle_open("helper-session", Frame(FRAME_OPEN, stream_id=17, payload=b"payload"))
+        await state.handle_frame("helper", "helper-session", LANE_CTL, Frame(FRAME_WINDOW, stream_id=17, offset=7))
+
+        self.assertEqual(queued_frames[0][0], "agent")
+        self.assertEqual(queued_frames[0][2], "pri")
+        self.assertEqual(queued_frames[0][3].type_id, FRAME_OPEN)
+        self.assertEqual(queued_frames[1][0], "agent")
+        self.assertEqual(queued_frames[1][2], "pri")
+        self.assertEqual(queued_frames[1][3].type_id, FRAME_WINDOW)
+
+    async def test_combined_helper_down_lane_routes_control_frames_over_priority_queue(self):
+        state = BrokerState(
+            {
+                "client_tokens": ["client-token"],
+                "agent_tokens": ["agent-token"],
+                "helper_down_combined_data_lane": True,
+            }
+        )
+        await state.ensure_peer("helper", "desktop", "helper-session", "client-token")
+        await state.ensure_peer("agent", "hidden", "agent-session", "agent-token")
+        queued_frames = []
+
+        async def fake_queue(role, peer_session_id, lane, frame):
+            queued_frames.append((role, peer_session_id, lane, frame))
+            return True
+
+        state.queue_frame = fake_queue
+        await state._handle_open("helper-session", Frame(FRAME_OPEN, stream_id=17, payload=b"payload"))
+        stream = state.streams_by_helper[("helper-session", 17)]
+        await state.handle_frame("agent", "agent-session", LANE_CTL, Frame(FRAME_WINDOW, stream_id=stream.agent_stream_id, offset=7))
+
+        self.assertEqual(queued_frames[0][0], "agent")
+        self.assertEqual(queued_frames[0][2], LANE_CTL)
+        self.assertEqual(queued_frames[0][3].type_id, FRAME_OPEN)
+        self.assertEqual(queued_frames[1][0], "helper")
+        self.assertEqual(queued_frames[1][2], "pri")
+        self.assertEqual(queued_frames[1][3].type_id, FRAME_WINDOW)
 
     async def test_handle_open_rolls_back_stream_when_agent_queue_rejects_open(self):
         state = BrokerState({"client_tokens": ["client-token"], "agent_tokens": ["agent-token"]})
@@ -169,6 +345,43 @@ class BrokerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(queued_frames[1][2], "pri")
         self.assertEqual(queued_frames[1][3].type_id, FRAME_DNS_RESPONSE)
         self.assertEqual(queued_frames[1][3].stream_id, 41)
+
+    async def test_handle_ctl_down_returns_no_content_when_idle(self):
+        server = AsyncBrokerServer(
+            "127.0.0.1",
+            0,
+            {
+                "client_tokens": ["client-token"],
+                "agent_tokens": ["agent-token"],
+                "down_wait_ms": {"ctl": 0, "data": 0},
+            },
+        )
+        peer = await server.state.ensure_peer("helper", "desktop", "helper-session", "client-token")
+        writer = _FakeWriter()
+
+        await server._handle_ctl_down(writer, peer)
+
+        self.assertTrue(bytes(writer.buffer).startswith(b"HTTP/1.1 204 No Content\r\n"))
+        self.assertEqual(server.state.metrics["down_responses"][LANE_CTL], 0)
+
+    async def test_handle_data_down_returns_no_content_when_idle(self):
+        server = AsyncBrokerServer(
+            "127.0.0.1",
+            0,
+            {
+                "client_tokens": ["client-token"],
+                "agent_tokens": ["agent-token"],
+                "down_wait_ms": {"ctl": 0, "data": 0},
+            },
+        )
+        peer = await server.state.ensure_peer("agent", "hidden", "agent-session", "agent-token")
+        writer = _FakeWriter()
+
+        await server._handle_data_down(writer, peer)
+
+        self.assertTrue(bytes(writer.buffer).startswith(b"HTTP/1.1 204 No Content\r\n"))
+        self.assertEqual(server.state.metrics["down_responses"]["pri"], 0)
+        self.assertEqual(server.state.metrics["down_responses"]["bulk"], 0)
 
 
 if __name__ == "__main__":
