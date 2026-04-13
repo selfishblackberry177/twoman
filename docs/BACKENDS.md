@@ -81,6 +81,9 @@ Current status:
 - browser-grade smoke tests are passing on the current profile
 - the broker now advertises `managed_host_http` as the default profile and
   `managed_host_ws` as an optional higher-throughput profile
+- a Cloudflare-proxied hostname can front the managed host cleanly, but Twoman
+  should still follow the broker-advertised profile instead of assuming that
+  Cloudflare implies public WebSocket viability
 - current cPanel Node deploy defaults keep helper downlinks bounded with
   `streaming_data_down_helper=false`
 - current cPanel Node deploy defaults keep `streaming_data_down_agent=false`
@@ -96,6 +99,9 @@ Current status:
   site slug and the root `public_html` when `TWOMAN_CAMOUFLAGE_SITE_ROOT_INDEX=true`
 - camouflage deploys should also install matching `.htaccess` `ErrorDocument`
   rules so unknown Apache-served paths use that same themed 404 page
+- if the hidden server cannot reliably reach the managed host even through a
+  Cloudflare-proxied hostname, keep hidden-side WARP enabled and let the hidden
+  agent use that route only for host reachability and optional outbound egress
 
 Primary files:
 

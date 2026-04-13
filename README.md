@@ -75,6 +75,31 @@ If you also want the final public egress IP to be the WARP exit instead of the
 hidden server IP, enable the separate hidden outbound proxy option and point it
 at the same `socks5h://127.0.0.1:1280` listener.
 
+## Cloudflare Fronting
+
+Twoman can sit behind a Cloudflare-proxied hostname when the public host serves
+normal HTTP or HTTPS traffic through that name.
+
+Operational guidance:
+
+- a proxied Cloudflare `A`, `AAAA`, or `CNAME` record can hide the origin IP
+  and route client and hidden-server traffic to Cloudflare's edge first
+- this can help when the hidden server has trouble reaching the public host's
+  direct origin IP but can still reach Cloudflare normally
+- this does not remove the public host from the Twoman path; the host still
+  remains in-band behind Cloudflare
+- this does not mean WebSocket mode is always the right choice; Twoman still
+  follows the broker-advertised transport profile for the actual host/backend
+
+Recommended use:
+
+- keep the public broker on a normal HTTPS hostname
+- proxy that hostname through Cloudflare if your host and domain support it
+- keep hidden-side WARP enabled if the hidden server still cannot reliably
+  reach the proxied hostname directly
+- treat Cloudflare fronting as public-host protection and reachability help,
+  not as a replacement for hidden-side WARP
+
 ## Status
 
 This repository contains the current public implementation.

@@ -10,7 +10,7 @@
   - `scripts/install_hidden_server_local.sh`
   - `scripts/start_client.sh`
 - Verify the focused CI checks pass locally:
-  - `python3 -m unittest tests.test_transport_proxy tests.test_twoman_control_cpanel tests.test_twoman_control_installer tests.test_twoman_control_manager tests.test_desktop_client_tui`
+  - `python3 -m unittest tests.test_transport_proxy tests.test_transport_profiles tests.test_twoman_dns tests.test_twoman_proxy tests.test_twoman_control_cpanel tests.test_twoman_control_installer tests.test_twoman_control_manager tests.test_desktop_client_tui`
   - `bash tests/run_e2e.sh`
   - `bash tests/run_e2e_node_http.sh`
   - `bash tests/run_e2e_node_ws.sh`
@@ -23,6 +23,7 @@
 - Verify `host/storage/` is empty or absent
 - Verify `TWOMAN_TRACE` is not enabled in production
 - Verify broker health responds on the configured public base URI, for example `https://host.example.com/<public-base-uri>/health`
+- Verify any Cloudflare-fronted public hostname still serves broker health and camouflage pages through the intended proxied hostname
 - Verify SOCKS egress through the helper
 - Verify HTTP egress through the helper
-- Update `README.md`, `docs/EASY_DEPLOY.md`, and the release note under `docs/releases/`
+- Update `README.md`, `docs/EASY_DEPLOY.md`, `docs/BACKENDS.md`, and the release note under `docs/releases/`

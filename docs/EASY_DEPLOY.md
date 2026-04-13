@@ -81,6 +81,29 @@ The host route and the outbound route are separate settings. The first fixes
 hidden-server -> public-host reachability. The second changes what IP websites
 see for the final egress.
 
+## Optional Cloudflare Fronting
+
+If your public hostname is proxied through Cloudflare, Twoman can use that
+hostname as the public broker origin just like any other HTTPS site.
+
+Use this when:
+
+- you want the public host hidden behind a Cloudflare edge hostname
+- the hidden server can reach Cloudflare more reliably than the public host's
+  direct origin IP
+- you want a cleaner public-facing deployment story for a managed Node or
+  bridge-style host
+
+Important limits:
+
+- Cloudflare fronting does not bypass the public host; the host still runs the
+  Twoman broker behind the proxied hostname
+- Cloudflare fronting does not automatically make `managed_host_ws` the best
+  transport; the broker still advertises the right profile, and helpers/agents
+  should follow it
+- if the hidden server still has poor reachability to the proxied hostname,
+  keep the hidden-side WARP route enabled
+
 ## Run it
 
 From a cloned repo:

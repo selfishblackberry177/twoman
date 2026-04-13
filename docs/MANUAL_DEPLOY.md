@@ -90,6 +90,15 @@ Expected result:
 
 If the broker is not running, `api.php?action=health` will attempt to start it.
 
+Cloudflare note:
+
+- if this public hostname is fronted by a Cloudflare-proxied record, keep the
+  same proxied hostname in `broker_base_url`
+- Cloudflare can hide the direct origin IP, but it does not remove the public
+  host from the Twoman path
+- if the hidden server still cannot reliably reach that proxied hostname,
+  keep `upstream_proxy_url` enabled on the hidden side
+
 ## 2. Hidden server
 
 Copy these files to the hidden server, for example under `/opt/twoman`:
