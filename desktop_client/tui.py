@@ -349,10 +349,15 @@ class DesktopClientApp(App):
             # The refresh timer can overlap shutdown while Select internals unmount.
             return
 
-        self._render_status()
-        self._render_profile_details()
-        self._render_share_details()
-        self._render_logs()
+        try:
+            self._render_status()
+            self._render_profile_details()
+            self._render_share_details()
+            self._render_logs()
+        except NoMatches:
+            # Screen transitions can briefly remove widgets after the Selects
+            # were still present, especially under slower CI timing.
+            return
 
     def _render_status(self) -> None:
         status = self.controller.helper_status()
