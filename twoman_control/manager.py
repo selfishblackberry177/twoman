@@ -12,13 +12,20 @@ from twoman_control.models import (
     BACKEND_BRIDGE,
     BACKEND_NODE,
     BACKEND_PASSENGER,
+    InstanceRegistry,
     InstallState,
 )
-from twoman_control.registry import load_instance_state, load_registry, resolve_instance_name
+from twoman_control.registry import (
+    load_instance_state,
+    load_registry,
+    resolve_instance_name,
+    set_default_instance as registry_set_default_instance,
+)
 
 try:
     from textual import work
     from textual.app import App, ComposeResult
+    from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.screen import ModalScreen
     from textual.widgets import Button, Footer, Header, Static
@@ -36,14 +43,33 @@ class ActionResult:
     details: str = ""
 
 
+@dataclass(slots=True)
+class WorkerPayload:
+    kind: str
+    value: str | ActionResult
+
+
 class ManagerController:
     def __init__(self, control_root: Path, instance_name: str | None = None) -> None:
         self.control_root = control_root
-        self.instance_name = resolve_instance_name(control_root, instance_name)
-        self.state = load_instance_state(control_root, self.instance_name)
+        self.instance_name = ""
+        self.state: InstallState
+        self.switch_instance(instance_name)
+
+    def registry(self) -> InstanceRegistry:
+        return load_registry(self.control_root)
+
+    def switch_instance(self, instance_name: str | None) -> None:
+        self.instance_name = resolve_instance_name(self.control_root, instance_name)
+        self.state = load_instance_state(self.control_root, self.instance_name)
+
+    def set_default_instance(self, instance_name: str | None = None) -> None:
+        resolved = resolve_instance_name(self.control_root, instance_name or self.instance_name)
+        registry_set_default_instance(self.control_root, resolved)
+        self.switch_instance(resolved)
 
     def list_instances_text(self) -> str:
-        registry = load_registry(self.control_root)
+        registry = self.registry()
         lines = []
         for instance in registry.instances:
             marker = "*" if instance.name == registry.default_instance else " "
@@ -281,66 +307,91 @@ def run_basic_manager(control_root: Path, instance_name: str | None = None) -> N
 if TEXTUAL_AVAILABLE:
     APP_CSS = """
 Screen {
-    background: black;
-    color: white;
+    background: $surface;
+    color: $text;
 }
 
-#body {
+#layout {
+    height: 1fr;
+    padding: 1;
+}
+
+#sidebar {
+    width: 34;
+    min-width: 30;
+    max-width: 42;
+    border: round $accent;
+    padding: 1;
+    margin-right: 1;
+}
+
+#content {
+    padding-right: 1;
+}
+
+Button {
+    width: 1fr;
+    margin-bottom: 1;
+}
+
+#sidebar Button {
+    margin-bottom: 1;
+    height: auto;
+}
+
+ModalScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+.dialog {
+    width: 90;
+    height: auto;
+    background: $surface;
+    color: $text;
+    border: round $accent;
     padding: 1 2;
 }
 
-.card {
-    border: solid white;
-    padding: 1 1;
+.dialog-body {
+    max-height: 18;
+    overflow-y: auto;
+    margin-bottom: 1;
+}
+
+.panel {
+    border: round $accent;
+    padding: 1;
     margin-bottom: 1;
     height: auto;
 }
 
 .section-title {
     text-style: bold;
+    color: $accent;
     margin-bottom: 1;
-}
-
-Button {
-    margin-right: 1;
-    border: solid white;
-    background: black;
-    color: white;
 }
 
 #status-banner {
-    border: heavy white;
-    padding: 1 2;
+    border: round $success;
+}
+
+#result-output,
+#log-output,
+#client-detail,
+#deployment-detail {
+    background: $boost;
+    border: tall $panel;
+    padding: 1;
     height: auto;
-    margin-bottom: 1;
+}
+
+#result-output {
+    min-height: 6;
 }
 
 #log-output {
-    height: 18;
-    overflow-y: auto;
-    background: black;
-    color: white;
-    border: solid white;
-    padding: 1;
-}
-
-ModalScreen {
-    align: center middle;
-}
-
-.dialog {
-    width: 100;
-    height: auto;
-    background: black;
-    color: white;
-    border: heavy white;
-    padding: 1 2;
-}
-
-.dialog-body {
-    max-height: 20;
-    overflow-y: auto;
-    margin-bottom: 1;
+    min-height: 14;
 }
 """
 
@@ -363,17 +414,46 @@ ModalScreen {
                 self.dismiss(None)
 
 
+    class ConfirmCommandScreen(ModalScreen[None]):
+        def __init__(self, title: str, body: str, command: list[str]) -> None:
+            super().__init__()
+            self.title = title
+            self.body = body
+            self.command = list(command)
+
+        def compose(self) -> ComposeResult:
+            with Vertical(classes="dialog"):
+                yield Static(self.title, classes="section-title")
+                with VerticalScroll(classes="dialog-body"):
+                    yield Static(self.body)
+                with Horizontal():
+                    yield Button("Continue", id="confirm-continue", variant="warning")
+                    yield Button("Cancel", id="confirm-cancel")
+
+        def on_button_pressed(self, event: Button.Pressed) -> None:
+            if event.button.id == "confirm-cancel":
+                self.dismiss(None)
+                return
+            if event.button.id == "confirm-continue":
+                app = self.app
+                if hasattr(app, "pending_command"):
+                    app.pending_command = list(self.command)
+                app.exit()
+
+
     class TwomanManagerApp(App[None]):
         TITLE = "Twoman"
         SUB_TITLE = "Server control"
         CSS = APP_CSS
         BINDINGS = [
-            ("q", "quit", "Quit"),
-            ("v", "verify", "Verify"),
-            ("r", "restart_agent", "Restart agent"),
-            ("p", "restart_upstream_proxy", "Restart route proxy"),
-            ("c", "show_config", "Show config"),
-            ("h", "show_capabilities", "Capabilities"),
+            Binding("q", "quit", "Quit", show=True),
+            Binding("v", "verify", "Verify", show=True),
+            Binding("l", "refresh_logs", "Logs", show=True),
+            Binding("r", "restart_agent", "Restart agent", show=True),
+            Binding("p", "restart_upstream_proxy", "Restart route proxy", show=True),
+            Binding("c", "show_config", "Config", show=True),
+            Binding("h", "show_capabilities", "Capabilities", show=True),
+            Binding("d", "set_default", "Set default", show=True),
         ]
 
         def __init__(
@@ -390,75 +470,147 @@ ModalScreen {
             else:
                 raise ValueError("TwomanManagerApp requires either control_root or controller")
             self.last_result = ActionResult(False, "Not checked yet", "")
+            self.last_output = "Select an action to inspect or control the active instance."
+            self.log_output = "Loading logs..."
+            self.busy_action: str | None = None
+            self.pending_command: list[str] | None = None
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=False)
-            with VerticalScroll(id="body"):
-                with Vertical(id="status-banner"):
-                    yield Static("Twoman deployment", id="status-text")
-                    yield Static("", id="status-detail")
-                with Vertical(classes="card"):
-                    yield Static("Deployment", classes="section-title")
-                    yield Static("", id="deployment-detail")
-                    with Horizontal():
-                        yield Button("Verify now", id="action-verify", variant="primary")
-                        yield Button("Restart agent", id="action-restart-agent")
-                        yield Button("Restart route proxy", id="action-restart-upstream")
-                        yield Button("Run watchdog", id="action-restart-watchdog")
-                        yield Button("Redeploy host", id="action-redeploy")
-                        yield Button("Capabilities", id="action-show-capabilities")
-                with Vertical(classes="card"):
-                    yield Static("Client Config", classes="section-title")
-                    yield Static("", id="client-detail")
-                    with Horizontal():
-                        yield Button("Show import text", id="action-show-config")
-                        yield Button("Reconfigure", id="action-reconfigure")
-                with Vertical(classes="card"):
-                    yield Static("Logs", classes="section-title")
-                    yield Static("", id="log-output")
+            with Horizontal(id="layout"):
+                with Vertical(id="sidebar"):
+                    yield Static("Instances", classes="section-title")
+                    for instance in self.controller.registry().instances:
+                        yield Button("", id=f"instance-{instance.name}")
+                    yield Static("Instance Actions", classes="section-title")
+                    yield Button("Set Default", id="action-set-default")
+                    yield Button("Refresh Logs", id="action-refresh-logs")
+                    yield Button("Show Config", id="action-show-config")
+                    yield Button("Reconfigure", id="action-reconfigure", variant="warning")
+                    yield Button("Quit", id="action-quit", variant="error")
+                with VerticalScroll(id="content"):
+                    with Vertical(id="status-banner", classes="panel"):
+                        yield Static("Twoman deployment", id="status-text")
+                        yield Static("", id="status-detail")
+                    with Vertical(classes="panel"):
+                        yield Static("Deployment", classes="section-title")
+                        yield Static("", id="deployment-detail")
+                    with Vertical(classes="panel"):
+                        yield Static("Operations", classes="section-title")
+                        with Horizontal():
+                            yield Button("Verify", id="action-verify", variant="primary")
+                            yield Button("Restart Agent", id="action-restart-agent")
+                            yield Button("Restart Route Proxy", id="action-restart-upstream")
+                        with Horizontal():
+                            yield Button("Run Watchdog", id="action-restart-watchdog")
+                            yield Button("Redeploy Host", id="action-redeploy")
+                            yield Button("Capabilities", id="action-show-capabilities")
+                    with Vertical(classes="panel"):
+                        yield Static("Client Config", classes="section-title")
+                        yield Static("", id="client-detail")
+                    with Vertical(classes="panel"):
+                        yield Static("Result", classes="section-title")
+                        yield Static("", id="result-output")
+                    with Vertical(classes="panel"):
+                        yield Static("Recent Logs", classes="section-title")
+                        yield Static("", id="log-output")
             yield Footer()
 
         def on_mount(self) -> None:
             self.refresh_view()
+            self.start_task("logs")
+
+        def update_instance_buttons(self) -> None:
+            registry = self.controller.registry()
+            selected = self.controller.state.instance_name
+            for instance in registry.instances:
+                button = self.query_one(f"#instance-{instance.name}", Button)
+                markers = []
+                markers.append("*" if instance.name == registry.default_instance else " ")
+                markers.append(">" if instance.name == selected else " ")
+                button.label = f"{''.join(markers)} {instance.name}"
+                if instance.name == selected:
+                    button.variant = "primary"
+                elif instance.name == registry.default_instance:
+                    button.variant = "success"
+                else:
+                    button.variant = "default"
+
+        def set_busy_state(self, busy: bool) -> None:
+            button_ids = [
+                "action-set-default",
+                "action-refresh-logs",
+                "action-show-config",
+                "action-reconfigure",
+                "action-verify",
+                "action-restart-agent",
+                "action-restart-upstream",
+                "action-restart-watchdog",
+                "action-redeploy",
+                "action-show-capabilities",
+            ]
+            for button_id in button_ids:
+                self.query_one(f"#{button_id}", Button).disabled = busy
+            for instance in self.controller.registry().instances:
+                self.query_one(f"#instance-{instance.name}", Button).disabled = busy
 
         def refresh_view(self) -> None:
             state = self.controller.state
-            self.query_one("#status-text", Static).update(f"{state.backend} · {self.last_result.summary}")
-            self.query_one("#status-detail", Static).update(
-                f"instance={state.instance_name} · {state.broker_base_url}\n"
-                f"service={state.hidden_service_name} watchdog={state.watchdog_timer_name}"
-            )
-            self.query_one("#deployment-detail", Static).update(
-                "\n".join(
-                    [
-                        f"Public origin: {state.public_origin}",
-                        f"Instance: {state.instance_name}",
-                        f"Base path: {state.public_base_path}",
-                        f"Bridge path: {state.bridge_public_base_path or '(same as base path)'}",
-                        f"Hidden root: {state.hidden_install_root}",
-                        f"Agent peer: {state.agent_peer_id}",
-                        f"Hidden route: {self.controller.hidden_route_text()}",
-                        f"Outbound route: {self.controller.outbound_route_text()}",
-                        f"TLS verify: {state.verify_tls}",
-                    ]
+            if self.busy_action:
+                summary = f"{state.backend} · running {self.busy_action}"
+            else:
+                summary = f"{state.backend} · {self.last_result.summary}"
+            with self.batch_update():
+                self.query_one("#status-text", Static).update(summary)
+                self.query_one("#status-detail", Static).update(
+                    f"instance={state.instance_name} · {state.broker_base_url}\n"
+                    f"service={state.hidden_service_name} · watchdog={state.watchdog_timer_name}"
                 )
-            )
-            self.query_one("#client-detail", Static).update(
-                "\n".join(
-                    [
-                        f"Profile: {state.client_profile_name}",
-                        f"HTTP port: {state.client_http_port}",
-                        f"SOCKS port: {state.client_socks_port}",
-                        f"Launcher: {LAUNCHER_PATH}",
-                        "Instances:",
-                        self.controller.list_instances_text(),
-                    ]
+                self.query_one("#deployment-detail", Static).update(
+                    "\n".join(
+                        [
+                            f"Public origin: {state.public_origin}",
+                            f"Broker URL: {state.broker_base_url}",
+                            f"Base path: {state.public_base_path}",
+                            f"Bridge broker path: {state.bridge_public_base_path or '(same as base path)'}",
+                            f"Hidden root: {state.hidden_install_root}",
+                            f"Hidden service: {state.hidden_service_name}",
+                            f"Agent peer: {state.agent_peer_id}",
+                            f"Hidden route: {self.controller.hidden_route_text()}",
+                            f"Outbound route: {self.controller.outbound_route_text()}",
+                            f"TLS verify: {state.verify_tls}",
+                        ]
+                    )
                 )
-            )
-            self.query_one("#log-output", Static).update(self.controller.journal_tail())
+                self.query_one("#client-detail", Static).update(
+                    "\n".join(
+                        [
+                            f"Profile: {state.client_profile_name}",
+                            f"HTTP port: {state.client_http_port}",
+                            f"SOCKS port: {state.client_socks_port}",
+                            f"Launcher: {LAUNCHER_PATH}",
+                        ]
+                    )
+                )
+                self.query_one("#result-output", Static).update(self.last_output)
+                self.query_one("#log-output", Static).update(self.log_output)
+                self.update_instance_buttons()
+                self.set_busy_state(self.busy_action is not None)
 
         def on_button_pressed(self, event: Button.Pressed) -> None:
             button_id = event.button.id
+            if button_id and button_id.startswith("instance-"):
+                self.switch_instance(button_id[len("instance-") :])
+                return
+            if button_id == "action-quit":
+                self.exit()
+                return
+            if button_id == "action-set-default":
+                self.action_set_default()
+                return
+            if button_id == "action-refresh-logs":
+                self.action_refresh_logs()
+                return
             if button_id == "action-show-config":
                 self.push_screen(TextScreen("Twoman Import Text", self.controller.state.profile_share_text))
                 return
@@ -466,32 +618,58 @@ ModalScreen {
                 self.push_screen(TextScreen("Detected Host Capabilities", self.controller.capabilities_text()))
                 return
             if button_id == "action-reconfigure":
-                self.exit()
-                subprocess.run(self.controller.install_command(), check=False)
+                self.push_screen(
+                    ConfirmCommandScreen(
+                        "Run the installer?",
+                        "Twoman will leave the TUI and start the install wizard for the selected instance.\n\n"
+                        f"Instance: {self.controller.state.instance_name}\n"
+                        f"Command: {' '.join(self.controller.install_command())}",
+                        self.controller.install_command(),
+                    )
+                )
                 return
             if button_id == "action-verify":
-                self.verify_action()
+                self.action_verify()
                 return
             if button_id == "action-restart-agent":
-                self.restart_agent_action()
+                self.action_restart_agent()
                 return
             if button_id == "action-restart-upstream":
-                self.restart_upstream_proxy_action()
+                self.action_restart_upstream_proxy()
                 return
             if button_id == "action-restart-watchdog":
-                self.restart_watchdog_action()
+                self.action_restart_watchdog()
                 return
             if button_id == "action-redeploy":
-                self.redeploy_action()
+                self.action_redeploy()
+
+        def switch_instance(self, instance_name: str) -> None:
+            if self.busy_action:
+                self.notify("Wait for the current action to finish before switching instances.", severity="warning")
+                return
+            self.controller.switch_instance(instance_name)
+            self.last_result = ActionResult(True, f"active instance set to {instance_name}", "")
+            self.last_output = f"Selected instance: {instance_name}"
+            self.log_output = "Loading logs..."
+            self.refresh_view()
+            self.start_task("logs")
+
+        def start_task(self, kind: str) -> None:
+            if self.busy_action:
+                self.notify("Another action is still running.", severity="warning")
+                return
+            self.busy_action = kind
+            self.refresh_view()
+            self.run_task(kind)
 
         def action_verify(self) -> None:
-            self.verify_action()
+            self.start_task("verify")
 
         def action_restart_agent(self) -> None:
-            self.restart_agent_action()
+            self.start_task("restart-agent")
 
         def action_restart_upstream_proxy(self) -> None:
-            self.restart_upstream_proxy_action()
+            self.start_task("restart-upstream-proxy")
 
         def action_show_config(self) -> None:
             self.push_screen(TextScreen("Twoman Import Text", self.controller.state.profile_share_text))
@@ -499,40 +677,67 @@ ModalScreen {
         def action_show_capabilities(self) -> None:
             self.push_screen(TextScreen("Detected Host Capabilities", self.controller.capabilities_text()))
 
-        @work(thread=True, exclusive=True)
-        def verify_action(self) -> ActionResult:
-            return self.controller.verify()
+        def action_refresh_logs(self) -> None:
+            self.start_task("logs")
+
+        def action_set_default(self) -> None:
+            state = self.controller.state
+            self.controller.set_default_instance(state.instance_name)
+            self.last_result = ActionResult(True, f"default instance set to {state.instance_name}", "")
+            self.last_output = f"Default instance is now {state.instance_name}."
+            self.refresh_view()
 
         @work(thread=True, exclusive=True)
-        def restart_agent_action(self) -> ActionResult:
-            return self.controller.restart_agent()
+        def run_task(self, kind: str) -> WorkerPayload:
+            if kind == "logs":
+                return WorkerPayload(kind="logs", value=self.controller.journal_tail())
+            handlers = {
+                "verify": self.controller.verify,
+                "restart-agent": self.controller.restart_agent,
+                "restart-upstream-proxy": self.controller.restart_upstream_proxy,
+                "restart-watchdog": self.controller.restart_watchdog,
+                "redeploy": self.controller.redeploy_host,
+            }
+            return WorkerPayload(kind=kind, value=handlers[kind]())
 
-        @work(thread=True, exclusive=True)
-        def restart_upstream_proxy_action(self) -> ActionResult:
-            return self.controller.restart_upstream_proxy()
+        def action_restart_watchdog(self) -> None:
+            self.start_task("restart-watchdog")
 
-        @work(thread=True, exclusive=True)
-        def restart_watchdog_action(self) -> ActionResult:
-            return self.controller.restart_watchdog()
-
-        @work(thread=True, exclusive=True)
-        def redeploy_action(self) -> ActionResult:
-            return self.controller.redeploy_host()
+        def action_redeploy(self) -> None:
+            self.start_task("redeploy")
 
         def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+            if event.state == WorkerState.ERROR:
+                error = getattr(event.worker, "error", None) or getattr(event.worker, "exception", None) or "unknown error"
+                self.busy_action = None
+                self.last_result = ActionResult(False, "task failed", str(error))
+                self.last_output = str(error)
+                self.refresh_view()
+                self.notify("Task failed", severity="error")
+                return
             if event.state != WorkerState.SUCCESS:
                 return
-            result = event.worker.result
-            if isinstance(result, ActionResult):
-                self.last_result = result
-                severity = "information" if result.ok else "error"
-                self.notify(result.summary, severity=severity)
+            payload = event.worker.result
+            self.busy_action = None
+            if isinstance(payload, WorkerPayload) and payload.kind == "logs":
+                self.log_output = str(payload.value or "No logs available.").strip() or "No logs available."
                 self.refresh_view()
+                return
+            if isinstance(payload, WorkerPayload) and isinstance(payload.value, ActionResult):
+                result = payload.value
+                self.last_result = result
+                self.last_output = result.details or result.summary
+                severity = "information" if result.ok else "error"
+                self.refresh_view()
+                self.notify(result.summary, severity=severity)
+                self.start_task("logs")
 
 
 def launch_manager(control_root: Path, instance_name: str | None = None) -> None:
     if TEXTUAL_AVAILABLE:
         app = TwomanManagerApp(control_root, instance_name=instance_name)
         app.run()
+        if app.pending_command:
+            subprocess.run(app.pending_command, check=False)
         return
     run_basic_manager(control_root, instance_name)
