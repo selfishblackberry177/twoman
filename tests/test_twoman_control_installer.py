@@ -13,14 +13,20 @@ from twoman_control.installer import (
     _install_local_hidden_server,
     build_broker_base_url,
     collect_install_args,
-    state_path,
 )
 from twoman_control.models import BACKEND_BRIDGE, BACKEND_NODE, BACKEND_PASSENGER, InstallState
+from twoman_control.registry import (
+    DEFAULT_INSTANCE_NAME,
+    load_registry,
+    managed_instance_from_state,
+    state_path,
+)
 
 
 def _sample_state(control_root: Path) -> InstallState:
     return InstallState(
         version=1,
+        instance_name=DEFAULT_INSTANCE_NAME,
         backend=BACKEND_PASSENGER,
         public_origin="https://host.example.com",
         public_base_path="/sahar-honar-221b/payesh-asnad",
@@ -95,9 +101,15 @@ class TwomanInstallerTests(unittest.TestCase):
     def test_collect_install_args_reuses_existing_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             control_root = Path(temp_dir)
-            _sample_state(control_root).save(state_path(control_root))
+            state = _sample_state(control_root)
+            state.save(state_path(control_root, DEFAULT_INSTANCE_NAME))
+            registry = load_registry(control_root)
+            registry.default_instance = DEFAULT_INSTANCE_NAME
+            registry.upsert(managed_instance_from_state(control_root, state))
+            registry.save(control_root / "instances.json")
             args = collect_install_args(
                 argparse.Namespace(
+                    instance=DEFAULT_INSTANCE_NAME,
                     repo_root=Path("/tmp/repo"),
                     control_root=control_root,
                     install_root=None,
@@ -150,9 +162,10 @@ class TwomanInstallerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             args = collect_install_args(
                 argparse.Namespace(
+                    instance="bridge",
                     repo_root=Path("/tmp/repo"),
                     control_root=Path(temp_dir) / "control",
-                    install_root=Path("/opt/twoman"),
+                    install_root=None,
                     public_origin="https://host.example.com",
                     cpanel_base_url="https://host.example.com:2083",
                     cpanel_username="cpanel-user",
@@ -184,6 +197,7 @@ class TwomanInstallerTests(unittest.TestCase):
             )
 
         self.assertEqual(args.public_origin, "https://host.example.com")
+        self.assertEqual(args.instance_name, "bridge")
         self.assertEqual(args.cpanel_base_url, "https://host.example.com:2083")
         self.assertEqual(args.cpanel_username, "cpanel-user")
         self.assertEqual(args.cpanel_password, "cpanel-pass")
@@ -193,6 +207,7 @@ class TwomanInstallerTests(unittest.TestCase):
         self.assertTrue(args.verify_tls)
         self.assertEqual(args.hidden_upstream_proxy_url, "")
         self.assertEqual(args.hidden_outbound_proxy_url, "")
+        self.assertEqual(args.install_root, Path("/opt/twoman-bridge"))
 
     @patch("twoman_control.installer._run_script")
     def test_install_local_hidden_server_passes_hidden_proxy_env(self, run_script_mock) -> None:

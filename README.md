@@ -59,10 +59,19 @@ non-interactive example.
 After deployment:
 
 - `sudo twoman` opens the management TUI
+- `sudo twoman list` shows every managed tunnel instance under the shared control root
+- `sudo twoman set-default <instance>` changes which instance `sudo twoman` manages by default
 - `sudo twoman verify` runs a non-interactive health check
 - `sudo twoman logs` prints the hidden-agent journal tail
-- `sudo twoman show-config` prints the client import text again
+- `sudo twoman --instance <name> show-config` prints the client import text for one managed tunnel
 - `sudo twoman restart-upstream-proxy` restarts managed WireProxy when that route is enabled
+
+Multi-instance note:
+
+- one control root can manage multiple hidden-server tunnels at once
+- installer state now lives under `instances/<name>/`
+- new named installs default to `/opt/twoman-<name>` and `twoman-<name>.service`
+- when Node is available, the installer recommends it first
 
 Easy-deploy guide:
 - [docs/EASY_DEPLOY.md](docs/EASY_DEPLOY.md)

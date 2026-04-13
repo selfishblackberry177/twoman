@@ -24,9 +24,16 @@ from twoman_control.models import (
     BackendCapability,
     InstallState,
 )
+from twoman_control.registry import (
+    DEFAULT_INSTANCE_NAME,
+    legacy_state_path,
+    load_instance_state,
+    normalize_instance_name,
+    profile_share_path,
+    save_instance_state,
+    state_path,
+)
 
-
-STATE_FILENAME = "install-state.json"
 DEFAULT_BRIDGE_PUBLIC_BASE_PATH = ""
 LAUNCHER_PATH = Path(os.environ.get("TWOMAN_LAUNCHER_PATH", "/usr/local/bin/twoman"))
 
@@ -35,6 +42,7 @@ LAUNCHER_PATH = Path(os.environ.get("TWOMAN_LAUNCHER_PATH", "/usr/local/bin/twom
 class InstallArgs:
     repo_root: Path
     control_root: Path
+    instance_name: str
     install_root: Path
     public_origin: str
     cpanel_base_url: str
@@ -63,11 +71,6 @@ class InstallArgs:
     hidden_outbound_proxy_label: str
     verify_tls: bool | None
     skip_helper_probe: bool
-
-
-def state_path(control_root: Path) -> Path:
-    return control_root / STATE_FILENAME
-
 
 def _prompt_text(label: str, default: str = "", *, secret: bool = False, allow_blank: bool = False) -> str:
     while True:
@@ -264,6 +267,17 @@ def _normalize_optional_base_path(value: str) -> str:
     return _normalize_base_path(text)
 
 
+def _profile_label(site_name: str, backend: str, instance_name: str) -> str:
+    backend_label = {
+        BACKEND_NODE: "Node",
+        BACKEND_BRIDGE: "Bridge",
+        BACKEND_PASSENGER: "Passenger",
+    }.get(backend, instance_name.title())
+    if instance_name == DEFAULT_INSTANCE_NAME:
+        return f"{site_name} Host"
+    return f"{site_name} {backend_label}"
+
+
 def _venv_builder_python() -> str:
     return str(Path(getattr(sys, "_base_executable", sys.executable)).resolve())
 
@@ -281,12 +295,9 @@ def _run_script(script_path: Path, env: dict[str, str], *, cwd: Path) -> subproc
     )
 
 
-def _load_existing_state(control_root: Path) -> InstallState | None:
-    existing_path = state_path(control_root)
-    if not existing_path.exists():
-        return None
+def _load_existing_state(control_root: Path, instance_name: str) -> InstallState | None:
     try:
-        return InstallState.load(existing_path)
+        return load_instance_state(control_root, instance_name)
     except Exception:
         return None
 
@@ -517,12 +528,15 @@ def _infer_repo_root(args_repo_root: Path | None) -> Path:
 def collect_install_args(namespace: object) -> InstallArgs:
     repo_root = _infer_repo_root(getattr(namespace, "repo_root", None))
     default_control_root = Path(getattr(namespace, "control_root", "") or "/opt/twoman/control")
-    existing_state = _load_existing_state(default_control_root)
+    instance_name = normalize_instance_name(getattr(namespace, "instance", "") or DEFAULT_INSTANCE_NAME)
+    existing_state = _load_existing_state(default_control_root, instance_name)
     explicit_install_root = str(getattr(namespace, "install_root", "") or "").strip()
     if explicit_install_root:
         default_install_root = Path(explicit_install_root)
     elif existing_state is not None and existing_state.hidden_install_root:
         default_install_root = Path(existing_state.hidden_install_root)
+    elif instance_name != DEFAULT_INSTANCE_NAME:
+        default_install_root = Path(f"/opt/twoman-{instance_name}")
     else:
         default_install_root = Path("/opt/twoman")
     non_interactive = bool(getattr(namespace, "non_interactive", False))
@@ -660,6 +674,7 @@ def collect_install_args(namespace: object) -> InstallArgs:
     return InstallArgs(
         repo_root=repo_root,
         control_root=default_control_root,
+        instance_name=instance_name,
         install_root=default_install_root,
         public_origin=public_origin,
         cpanel_base_url=cpanel_base_url,
@@ -759,7 +774,12 @@ def install(namespace: object) -> InstallState:
             backend,
         )
 
-    defaults = build_generated_defaults(bundle_root, args.cpanel_home, args.site_name)
+    defaults = build_generated_defaults(
+        bundle_root,
+        args.cpanel_home,
+        args.site_name,
+        instance_name=args.instance_name,
+    )
 
     customize = args.customize or (not args.non_interactive and _prompt_bool("Customize generated paths and names?", False))
     public_base_path = args.public_base_path or (
@@ -808,8 +828,9 @@ def install(namespace: object) -> InstallState:
         public_base_path,
         bridge_public_base_path=bridge_public_base_path,
     )
+    client_profile_name = _profile_label(defaults.site_name, backend, args.instance_name)
     profile_share_text = build_profile_share_text(
-        name=f"{defaults.site_name} Host",
+        name=client_profile_name,
         broker_base_url=broker_base_url,
         client_token=defaults.client_token,
         verify_tls=verify_tls,
@@ -821,13 +842,14 @@ def install(namespace: object) -> InstallState:
 
     state = InstallState(
         version=1,
+        instance_name=args.instance_name,
         backend=backend,
         public_origin=args.public_origin,
         public_base_path=public_base_path,
         broker_base_url=broker_base_url,
         client_token=defaults.client_token,
         agent_token=defaults.agent_token,
-        client_profile_name=f"{defaults.site_name} Host",
+        client_profile_name=client_profile_name,
         profile_share_text=profile_share_text,
         cpanel_base_url=args.cpanel_base_url,
         cpanel_username=args.cpanel_username,
@@ -871,6 +893,7 @@ def install(namespace: object) -> InstallState:
     )
 
     print("\nDeploy summary:")
+    print(f"  instance: {state.instance_name}")
     print(f"  backend: {backend}")
     print(f"  public origin: {state.public_origin}")
     print(f"  broker URL: {state.broker_base_url}")
@@ -900,16 +923,15 @@ def install(namespace: object) -> InstallState:
             state.hidden_upstream_proxy_url,
         )
     print("Bootstrapping the local twoman management command...")
-    state.save(state_path(args.control_root))
-    (args.control_root / "profile-share.txt").write_text(f"{state.profile_share_text}\n", encoding="utf-8")
-    (args.control_root / "profile-share.txt").chmod(0o600)
+    save_instance_state(args.control_root, state)
     _create_control_venv(args.control_root, bundle_root)
     _install_launcher(args.control_root)
 
     print("\nTwoman deployment complete.")
     print(f"  Management command: {LAUNCHER_PATH}")
-    print(f"  State file: {state_path(args.control_root)}")
-    print(f"  Client config: {args.control_root / 'profile-share.txt'}")
+    print(f"  Instance: {state.instance_name}")
+    print(f"  State file: {state_path(args.control_root, state.instance_name)}")
+    print(f"  Client config: {profile_share_path(args.control_root, state.instance_name)}")
     print("\nImport text:")
     print(state.profile_share_text)
     return state

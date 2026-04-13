@@ -65,6 +65,7 @@ class GeneratedDefaults:
 @dataclass(slots=True)
 class InstallState:
     version: int
+    instance_name: str
     backend: str
     public_origin: str
     public_base_path: str
@@ -121,6 +122,7 @@ class InstallState:
     def from_dict(cls, payload: dict[str, Any]) -> "InstallState":
         return cls(
             version=int(payload.get("version", 1)),
+            instance_name=str(payload.get("instance_name", "default")).strip() or "default",
             backend=str(payload.get("backend", "")).strip(),
             public_origin=str(payload.get("public_origin", "")).strip(),
             public_base_path=str(payload.get("public_base_path", "")).strip(),
@@ -169,4 +171,92 @@ class InstallState:
 
     @classmethod
     def load(cls, path: Path) -> "InstallState":
+        return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
+
+
+@dataclass(slots=True)
+class ManagedInstance:
+    name: str
+    root: str
+    backend: str
+    broker_base_url: str
+    public_origin: str
+    public_base_path: str
+    hidden_install_root: str
+    hidden_service_name: str
+    client_profile_name: str
+    site_name: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "ManagedInstance":
+        return cls(
+            name=str(payload.get("name", "")).strip(),
+            root=str(payload.get("root", "")).strip(),
+            backend=str(payload.get("backend", "")).strip(),
+            broker_base_url=str(payload.get("broker_base_url", "")).strip(),
+            public_origin=str(payload.get("public_origin", "")).strip(),
+            public_base_path=str(payload.get("public_base_path", "")).strip(),
+            hidden_install_root=str(payload.get("hidden_install_root", "")).strip(),
+            hidden_service_name=str(payload.get("hidden_service_name", "")).strip(),
+            client_profile_name=str(payload.get("client_profile_name", "")).strip(),
+            site_name=str(payload.get("site_name", "")).strip(),
+        )
+
+
+@dataclass(slots=True)
+class InstanceRegistry:
+    version: int = 1
+    default_instance: str = ""
+    instances: list[ManagedInstance] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "default_instance": self.default_instance,
+            "instances": [instance.to_dict() for instance in self.instances],
+        }
+
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+        path.chmod(0o600)
+
+    def get(self, name: str) -> ManagedInstance | None:
+        for instance in self.instances:
+            if instance.name == name:
+                return instance
+        return None
+
+    def upsert(self, instance: ManagedInstance) -> None:
+        existing = self.get(instance.name)
+        if existing is None:
+            self.instances.append(instance)
+            self.instances.sort(key=lambda item: item.name)
+            return
+        existing.root = instance.root
+        existing.backend = instance.backend
+        existing.broker_base_url = instance.broker_base_url
+        existing.public_origin = instance.public_origin
+        existing.public_base_path = instance.public_base_path
+        existing.hidden_install_root = instance.hidden_install_root
+        existing.hidden_service_name = instance.hidden_service_name
+        existing.client_profile_name = instance.client_profile_name
+        existing.site_name = instance.site_name
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "InstanceRegistry":
+        return cls(
+            version=int(payload.get("version", 1)),
+            default_instance=str(payload.get("default_instance", "")).strip(),
+            instances=[
+                ManagedInstance.from_dict(item)
+                for item in list(payload.get("instances") or [])
+            ],
+        )
+
+    @classmethod
+    def load(cls, path: Path) -> "InstanceRegistry":
         return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))

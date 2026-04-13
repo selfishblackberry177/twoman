@@ -12,6 +12,7 @@ class _FakeController:
     def __init__(self) -> None:
         self.state = InstallState(
             version=1,
+            instance_name="node",
             backend=BACKEND_PASSENGER,
             public_origin="https://host.example.com",
             public_base_path="/darvazeh",
@@ -60,7 +61,10 @@ class _FakeController:
         return "WARP WireProxy via socks5h://127.0.0.1:1280"
 
     def install_command(self) -> list[str]:
-        return ["/usr/local/bin/twoman", "install"]
+        return ["/usr/local/bin/twoman", "install", "--instance", "node"]
+
+    def list_instances_text(self) -> str:
+        return "* node: passenger_python -> https://host.example.com/darvazeh"
 
     def verify(self) -> ActionResult:
         return ActionResult(True, "healthy", '{"ok": true}')
@@ -86,6 +90,7 @@ class TwomanManagerAppTests(unittest.IsolatedAsyncioTestCase):
             deployment_detail = str(app.query_one("#deployment-detail", Static).content)
             log_output = str(app.query_one("#log-output", Static).content)
             self.assertIn("Public origin: https://host.example.com", deployment_detail)
+            self.assertIn("Instance: node", deployment_detail)
             self.assertIn("Hidden route: WARP WireProxy via socks5h://127.0.0.1:1280", deployment_detail)
             self.assertIn("Outbound route: WARP WireProxy via socks5h://127.0.0.1:1280", deployment_detail)
             self.assertIn("line one", log_output)

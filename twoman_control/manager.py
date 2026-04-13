@@ -7,13 +7,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from twoman_http import httpx_request
-from twoman_control.installer import LAUNCHER_PATH, state_path
+from twoman_control.installer import LAUNCHER_PATH
 from twoman_control.models import (
     BACKEND_BRIDGE,
     BACKEND_NODE,
     BACKEND_PASSENGER,
     InstallState,
 )
+from twoman_control.registry import load_instance_state, load_registry, resolve_instance_name
 
 try:
     from textual import work
@@ -36,9 +37,18 @@ class ActionResult:
 
 
 class ManagerController:
-    def __init__(self, control_root: Path) -> None:
+    def __init__(self, control_root: Path, instance_name: str | None = None) -> None:
         self.control_root = control_root
-        self.state = InstallState.load(state_path(control_root))
+        self.instance_name = resolve_instance_name(control_root, instance_name)
+        self.state = load_instance_state(control_root, self.instance_name)
+
+    def list_instances_text(self) -> str:
+        registry = load_registry(self.control_root)
+        lines = []
+        for instance in registry.instances:
+            marker = "*" if instance.name == registry.default_instance else " "
+            lines.append(f"{marker} {instance.name}: {instance.backend} -> {instance.broker_base_url}")
+        return "\n".join(lines) or "No Twoman instances are installed."
 
     @property
     def bundle_root(self) -> Path:
@@ -201,7 +211,7 @@ class ManagerController:
         return ActionResult(result.returncode == 0, summary, details)
 
     def install_command(self) -> list[str]:
-        return [str(LAUNCHER_PATH), "install"]
+        return [str(LAUNCHER_PATH), "install", "--instance", self.state.instance_name]
 
 
 def _print_result(result: ActionResult) -> None:
@@ -211,13 +221,14 @@ def _print_result(result: ActionResult) -> None:
         print(result.details)
 
 
-def run_basic_manager(control_root: Path) -> None:
-    controller = ManagerController(control_root)
+def run_basic_manager(control_root: Path, instance_name: str | None = None) -> None:
+    controller = ManagerController(control_root, instance_name)
     while True:
         state = controller.state
         print("")
         print("Twoman")
         print("-------")
+        print(f"Instance: {state.instance_name}")
         print(f"Broker: {state.broker_base_url}")
         print(f"Hidden service: {state.hidden_service_name}")
         print(f"Install root: {state.hidden_install_root}")
@@ -231,10 +242,11 @@ def run_basic_manager(control_root: Path) -> None:
         print("5. Redeploy public host")
         print("6. Show import text")
         print("7. Show host capabilities")
-        print("8. Show recent logs")
-        print("9. Reconfigure")
-        print("10. Quit")
-        choice = input("Choose an action [1-10]: ").strip()
+        print("8. Show instances")
+        print("9. Show recent logs")
+        print("10. Reconfigure")
+        print("11. Quit")
+        choice = input("Choose an action [1-11]: ").strip()
         if choice == "1":
             _print_result(controller.verify())
         elif choice == "2":
@@ -253,11 +265,14 @@ def run_basic_manager(control_root: Path) -> None:
             print(controller.capabilities_text())
         elif choice == "8":
             print("")
-            print(controller.journal_tail())
+            print(controller.list_instances_text())
         elif choice == "9":
+            print("")
+            print(controller.journal_tail())
+        elif choice == "10":
             subprocess.run(controller.install_command(), check=False)
             return
-        elif choice == "10":
+        elif choice == "11":
             return
         else:
             print("Choose one of the listed numbers.")
@@ -361,12 +376,17 @@ ModalScreen {
             ("h", "show_capabilities", "Capabilities"),
         ]
 
-        def __init__(self, control_root: Path | None = None, controller: ManagerController | None = None) -> None:
+        def __init__(
+            self,
+            control_root: Path | None = None,
+            controller: ManagerController | None = None,
+            instance_name: str | None = None,
+        ) -> None:
             super().__init__()
             if controller is not None:
                 self.controller = controller
             elif control_root is not None:
-                self.controller = ManagerController(control_root)
+                self.controller = ManagerController(control_root, instance_name)
             else:
                 raise ValueError("TwomanManagerApp requires either control_root or controller")
             self.last_result = ActionResult(False, "Not checked yet", "")
@@ -405,12 +425,14 @@ ModalScreen {
             state = self.controller.state
             self.query_one("#status-text", Static).update(f"{state.backend} · {self.last_result.summary}")
             self.query_one("#status-detail", Static).update(
-                f"{state.broker_base_url}\nservice={state.hidden_service_name} watchdog={state.watchdog_timer_name}"
+                f"instance={state.instance_name} · {state.broker_base_url}\n"
+                f"service={state.hidden_service_name} watchdog={state.watchdog_timer_name}"
             )
             self.query_one("#deployment-detail", Static).update(
                 "\n".join(
                     [
                         f"Public origin: {state.public_origin}",
+                        f"Instance: {state.instance_name}",
                         f"Base path: {state.public_base_path}",
                         f"Bridge path: {state.bridge_public_base_path or '(same as base path)'}",
                         f"Hidden root: {state.hidden_install_root}",
@@ -428,6 +450,8 @@ ModalScreen {
                         f"HTTP port: {state.client_http_port}",
                         f"SOCKS port: {state.client_socks_port}",
                         f"Launcher: {LAUNCHER_PATH}",
+                        "Instances:",
+                        self.controller.list_instances_text(),
                     ]
                 )
             )
@@ -506,9 +530,9 @@ ModalScreen {
                 self.refresh_view()
 
 
-def launch_manager(control_root: Path) -> None:
+def launch_manager(control_root: Path, instance_name: str | None = None) -> None:
     if TEXTUAL_AVAILABLE:
-        app = TwomanManagerApp(control_root)
+        app = TwomanManagerApp(control_root, instance_name=instance_name)
         app.run()
         return
-    run_basic_manager(control_root)
+    run_basic_manager(control_root, instance_name)

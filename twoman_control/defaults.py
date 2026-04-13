@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from twoman_control.models import GeneratedDefaults
+from twoman_control.registry import DEFAULT_INSTANCE_NAME, normalize_instance_name
 
 
 def _safe_handle(value: str, suffix: str = "") -> str:
@@ -23,7 +24,28 @@ def _token(prefix: str) -> str:
     return f"{prefix}-{secrets.token_hex(8)}"
 
 
-def build_generated_defaults(bundle_root: Path, cpanel_home: str, site_name: str = "") -> GeneratedDefaults:
+def build_generated_defaults(
+    bundle_root: Path,
+    cpanel_home: str,
+    site_name: str = "",
+    *,
+    instance_name: str = DEFAULT_INSTANCE_NAME,
+) -> GeneratedDefaults:
+    instance_handle = normalize_instance_name(instance_name)
+    hidden_install_root = "/opt/twoman" if instance_handle == DEFAULT_INSTANCE_NAME else f"/opt/twoman-{instance_handle}"
+    hidden_service_name = (
+        "twoman-agent.service" if instance_handle == DEFAULT_INSTANCE_NAME else f"twoman-{instance_handle}.service"
+    )
+    watchdog_service_name = (
+        "twoman-agent-watchdog.service"
+        if instance_handle == DEFAULT_INSTANCE_NAME
+        else f"twoman-{instance_handle}-watchdog.service"
+    )
+    watchdog_timer_name = (
+        "twoman-agent-watchdog.timer"
+        if instance_handle == DEFAULT_INSTANCE_NAME
+        else f"twoman-{instance_handle}-watchdog.timer"
+    )
     deployment_id = secrets.token_hex(6)
     manifest_path = bundle_root / "scripts" / "generate_camouflage_site.py"
     command = ["python3", str(manifest_path), "--deployment-id", deployment_id]
@@ -45,12 +67,12 @@ def build_generated_defaults(bundle_root: Path, cpanel_home: str, site_name: str
         client_token=_token("twoman-client"),
         agent_token=_token("twoman-agent"),
         agent_peer_id=f"agent-{secrets.token_hex(4)}",
-        hidden_install_root="/opt/twoman",
-        hidden_service_name="twoman-agent.service",
+        hidden_install_root=hidden_install_root,
+        hidden_service_name=hidden_service_name,
         hidden_service_user="twoman",
         hidden_service_group="twoman",
-        watchdog_service_name="twoman-agent-watchdog.service",
-        watchdog_timer_name="twoman-agent-watchdog.timer",
+        watchdog_service_name=watchdog_service_name,
+        watchdog_timer_name=watchdog_timer_name,
     )
 
 
@@ -89,4 +111,3 @@ def build_profile_share_text(
         json.dumps(payload, separators=(",", ":")).encode("utf-8")
     ).decode("ascii").rstrip("=")
     return f"twoman://profile?data={encoded}"
-

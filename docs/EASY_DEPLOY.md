@@ -25,6 +25,10 @@ Twoman installer, and then:
 The current Linux machine becomes the hidden server. You do not need a second
 manual SSH deploy step for the hidden agent.
 
+One control root can manage multiple named Twoman instances. Each instance gets
+its own state directory, hidden install root, and systemd service, while the
+shared `twoman` launcher and control virtual environment stay global.
+
 ## Requirements
 
 - Ubuntu or another Linux distribution with `python3`, `curl`, and `systemd`
@@ -47,8 +51,15 @@ The installer derives these defaults automatically:
 - cPanel home directory: `/home/<cpanel-user>`
 - generated Persian site name and randomized public paths
 - Passenger app name / app root or Node selector app root
-- hidden-agent install root: `/opt/twoman`
-- hidden-agent service names: `twoman-agent.service` and watchdog units
+- hidden-agent install root: `/opt/twoman` for the default instance
+- hidden-agent service names: `twoman-agent.service` and watchdog units for the default instance
+
+For named instances:
+
+- use `--instance <name>`
+- default hidden install root becomes `/opt/twoman-<name>`
+- default hidden service becomes `twoman-<name>.service`
+- state is saved under `/opt/twoman/control/instances/<name>/`
 
 You can override the generated values when the installer asks whether to
 customize the deployment.
@@ -143,6 +154,7 @@ sudo bash scripts/install_twoman.sh \
 
 Useful flags:
 
+- `--instance <name>`: install or reconfigure one named Twoman tunnel under the shared control root
 - `--customize`: override generated paths, app roots, and service names
 - `--verify-tls` / `--no-verify-tls`: control TLS verification for broker traffic
 - `--hidden-outbound-proxy-url`: route final hidden-server egress through a SOCKS5 or HTTP CONNECT proxy
@@ -172,8 +184,9 @@ The installer prints:
 It also installs:
 
 - launcher: `/usr/local/bin/twoman`
-- state file: `/opt/twoman/control/install-state.json`
-- import text: `/opt/twoman/control/profile-share.txt`
+- registry: `/opt/twoman/control/instances.json`
+- state file: `/opt/twoman/control/instances/<name>/install-state.json`
+- import text: `/opt/twoman/control/instances/<name>/profile-share.txt`
 
 ## Management command
 
@@ -198,14 +211,19 @@ That opens the Textual TUI. The TUI exposes:
 Non-interactive commands are also available:
 
 ```bash
+sudo twoman list
+sudo twoman set-default node
 sudo twoman verify
 sudo twoman logs
-sudo twoman show-config
+sudo twoman --instance bridge show-config
 sudo twoman restart-agent
 sudo twoman restart-upstream-proxy
 sudo twoman run-watchdog
 sudo twoman redeploy-host
 ```
+
+Use `--instance <name>` with the operational commands whenever you want to
+target a non-default tunnel.
 
 ## Notes
 
