@@ -13,7 +13,7 @@ upload_file() {
   local source_path="$1"
   local remote_dir="$2"
   local remote_name="$3"
-  curl "${CPANEL_CURL_ARGS[@]}" "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl "${CPANEL_CURL_ARGS[@]}" "${CPANEL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     -F "dir=${remote_dir}" \
     -F "overwrite=1" \
     -F "file-1=@${source_path};filename=${remote_name}" \
@@ -24,7 +24,7 @@ upload_content() {
   local remote_dir="$1"
   local remote_name="$2"
   local content="$3"
-  curl "${CPANEL_CURL_ARGS[@]}" "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl "${CPANEL_CURL_ARGS[@]}" "${CPANEL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     --data-urlencode "dir=${remote_dir}" \
     --data-urlencode "file=${remote_name}" \
     --data-urlencode "content=${content}" \
@@ -48,7 +48,7 @@ upload_generated_file() {
 mkdir_api() {
   local parent_path="$1"
   local dir_name="$2"
-  curl "${CPANEL_CURL_ARGS[@]}" "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl "${CPANEL_CURL_ARGS[@]}" "${CPANEL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     --get \
     --data-urlencode "cpanel_jsonapi_user=${TWOMAN_CPANEL_USERNAME}" \
     --data-urlencode "cpanel_jsonapi_apiversion=2" \
@@ -82,13 +82,18 @@ require_env TWOMAN_CPANEL_HOME
 require_env TWOMAN_PUBLIC_ORIGIN
 require_env TWOMAN_CLIENT_TOKEN
 require_env TWOMAN_AGENT_TOKEN
-TWOMAN_UPSTREAM_PROXY_URL="${TWOMAN_UPSTREAM_PROXY_URL:-}"
+TWOMAN_CPANEL_PROXY_URL="${TWOMAN_CPANEL_PROXY_URL:-${TWOMAN_UPSTREAM_PROXY_URL:-}}"
+TWOMAN_PUBLIC_PROXY_URL="${TWOMAN_PUBLIC_PROXY_URL:-${TWOMAN_UPSTREAM_PROXY_URL:-}}"
 TWOMAN_CPANEL_CONNECT_TIMEOUT_SECONDS="${TWOMAN_CPANEL_CONNECT_TIMEOUT_SECONDS:-10}"
 TWOMAN_CPANEL_MAX_TIME_SECONDS="${TWOMAN_CPANEL_MAX_TIME_SECONDS:-60}"
 
-CURL_PROXY_ARGS=()
-if [ -n "${TWOMAN_UPSTREAM_PROXY_URL}" ]; then
-  CURL_PROXY_ARGS+=(--proxy "${TWOMAN_UPSTREAM_PROXY_URL}")
+CPANEL_PROXY_ARGS=()
+if [ -n "${TWOMAN_CPANEL_PROXY_URL}" ]; then
+  CPANEL_PROXY_ARGS+=(--proxy "${TWOMAN_CPANEL_PROXY_URL}")
+fi
+PUBLIC_PROXY_ARGS=()
+if [ -n "${TWOMAN_PUBLIC_PROXY_URL}" ]; then
+  PUBLIC_PROXY_ARGS+=(--proxy "${TWOMAN_PUBLIC_PROXY_URL}")
 fi
 CPANEL_CURL_ARGS=(
   -sk
@@ -307,14 +312,14 @@ upload_generated_file "${REMOTE_APP_DIR}" "config.php" "${HOST_CONFIG_CONTENT}"
 
 echo "Restarting broker..."
 upload_generated_file "${REMOTE_BASE}" "ops.php" "${OPS_RESTART_CONTENT}"
-restart_result="$(curl -sk "${CURL_PROXY_ARGS[@]}" --connect-timeout 10 --max-time 20 "${TWOMAN_PUBLIC_ORIGIN}/${PUBLIC_BASE_TRIMMED}/ops.php" || true)"
+restart_result="$(curl -sk "${PUBLIC_PROXY_ARGS[@]}" --connect-timeout 10 --max-time 20 "${TWOMAN_PUBLIC_ORIGIN}/${PUBLIC_BASE_TRIMMED}/ops.php" || true)"
 upload_generated_file "${REMOTE_BASE}" "ops.php" "${OPS_STUB_CONTENT}"
 if [ "${restart_result}" != "ok" ]; then
   echo "bridge restart endpoint did not return ok; continuing to direct health checks" >&2
 fi
 
 echo "Checking health..."
-curl -sk "${CURL_PROXY_ARGS[@]}" --connect-timeout 10 --max-time 20 -H "Authorization: Bearer ${TWOMAN_CLIENT_TOKEN}" \
+curl -sk "${PUBLIC_PROXY_ARGS[@]}" --connect-timeout 10 --max-time 20 -H "Authorization: Bearer ${TWOMAN_CLIENT_TOKEN}" \
   "${TWOMAN_PUBLIC_ORIGIN}/${PUBLIC_BASE_TRIMMED}/api.php?action=health"
 echo
 BROKER_BASE_URL="${TWOMAN_PUBLIC_ORIGIN%/}/${PUBLIC_BASE_TRIMMED}"
@@ -322,7 +327,7 @@ if [ -n "${TWOMAN_BRIDGE_PUBLIC_BASE_PATH}" ] && [ "${TWOMAN_BRIDGE_PUBLIC_BASE_
   BROKER_BASE_URL="${BROKER_BASE_URL%/}/$(printf '%s' "${TWOMAN_BRIDGE_PUBLIC_BASE_PATH}" | sed 's#^/##')"
 fi
 echo "Checking broker health..."
-curl -sk "${CURL_PROXY_ARGS[@]}" --connect-timeout 10 --max-time 20 -H "Authorization: Bearer ${TWOMAN_CLIENT_TOKEN}" \
+curl -sk "${PUBLIC_PROXY_ARGS[@]}" --connect-timeout 10 --max-time 20 -H "Authorization: Bearer ${TWOMAN_CLIENT_TOKEN}" \
   "${BROKER_BASE_URL%/}${TWOMAN_BRIDGE_HEALTH_TEMPLATE}"
 echo
 echo "Host deployment complete."

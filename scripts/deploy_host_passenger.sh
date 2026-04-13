@@ -12,7 +12,7 @@ require_env() {
 api_get() {
   local endpoint="$1"
   shift
-  curl "${CPANEL_CURL_ARGS[@]}" "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl "${CPANEL_CURL_ARGS[@]}" "${CPANEL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     --get \
     "$@" \
     "${TWOMAN_CPANEL_BASE_URL}/execute/${endpoint}"
@@ -21,7 +21,7 @@ api_get() {
 api_post() {
   local endpoint="$1"
   shift
-  curl "${CPANEL_CURL_ARGS[@]}" "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl "${CPANEL_CURL_ARGS[@]}" "${CPANEL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     "$@" \
     "${TWOMAN_CPANEL_BASE_URL}/execute/${endpoint}"
 }
@@ -30,7 +30,7 @@ upload_file() {
   local source_path="$1"
   local remote_dir="$2"
   local remote_name="$3"
-  curl "${CPANEL_CURL_ARGS[@]}" "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl "${CPANEL_CURL_ARGS[@]}" "${CPANEL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     -F "dir=${remote_dir}" \
     -F "overwrite=1" \
     -F "file-1=@${source_path};filename=${remote_name}" \
@@ -41,7 +41,7 @@ upload_content() {
   local remote_dir="$1"
   local remote_name="$2"
   local content="$3"
-  curl "${CPANEL_CURL_ARGS[@]}" "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl "${CPANEL_CURL_ARGS[@]}" "${CPANEL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     --data-urlencode "dir=${remote_dir}" \
     --data-urlencode "file=${remote_name}" \
     --data-urlencode "content=${content}" \
@@ -65,7 +65,7 @@ upload_generated_file() {
 mkdir_api() {
   local parent_path="$1"
   local dir_name="$2"
-  curl "${CPANEL_CURL_ARGS[@]}" "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl "${CPANEL_CURL_ARGS[@]}" "${CPANEL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     --get \
     --data-urlencode "cpanel_jsonapi_user=${TWOMAN_CPANEL_USERNAME}" \
     --data-urlencode "cpanel_jsonapi_apiversion=2" \
@@ -99,13 +99,18 @@ require_env TWOMAN_CPANEL_HOME
 require_env TWOMAN_PUBLIC_ORIGIN
 require_env TWOMAN_CLIENT_TOKEN
 require_env TWOMAN_AGENT_TOKEN
-TWOMAN_UPSTREAM_PROXY_URL="${TWOMAN_UPSTREAM_PROXY_URL:-}"
+TWOMAN_CPANEL_PROXY_URL="${TWOMAN_CPANEL_PROXY_URL:-${TWOMAN_UPSTREAM_PROXY_URL:-}}"
+TWOMAN_PUBLIC_PROXY_URL="${TWOMAN_PUBLIC_PROXY_URL:-${TWOMAN_UPSTREAM_PROXY_URL:-}}"
 TWOMAN_CPANEL_CONNECT_TIMEOUT_SECONDS="${TWOMAN_CPANEL_CONNECT_TIMEOUT_SECONDS:-10}"
 TWOMAN_CPANEL_MAX_TIME_SECONDS="${TWOMAN_CPANEL_MAX_TIME_SECONDS:-60}"
 
-CURL_PROXY_ARGS=()
-if [ -n "${TWOMAN_UPSTREAM_PROXY_URL}" ]; then
-  CURL_PROXY_ARGS+=(--proxy "${TWOMAN_UPSTREAM_PROXY_URL}")
+CPANEL_PROXY_ARGS=()
+if [ -n "${TWOMAN_CPANEL_PROXY_URL}" ]; then
+  CPANEL_PROXY_ARGS+=(--proxy "${TWOMAN_CPANEL_PROXY_URL}")
+fi
+PUBLIC_PROXY_ARGS=()
+if [ -n "${TWOMAN_PUBLIC_PROXY_URL}" ]; then
+  PUBLIC_PROXY_ARGS+=(--proxy "${TWOMAN_PUBLIC_PROXY_URL}")
 fi
 CPANEL_CURL_ARGS=(
   -sk
@@ -311,7 +316,7 @@ health_ok="false"
 health_body_path="$(mktemp)"
 trap 'rm -f "${health_body_path}"; cleanup' EXIT
 for _ in $(seq 1 45); do
-  health_code="$(curl -sk "${CURL_PROXY_ARGS[@]}" \
+  health_code="$(curl -sk "${PUBLIC_PROXY_ARGS[@]}" \
     --connect-timeout 10 \
     --max-time 20 \
     -H "Authorization: Bearer ${TWOMAN_CLIENT_TOKEN}" \

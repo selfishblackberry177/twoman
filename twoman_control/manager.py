@@ -114,7 +114,7 @@ class ManagerController:
                 headers={"Authorization": f"Bearer {self.state.client_token}"},
                 timeout=20.0,
                 verify=self.state.verify_tls,
-                proxy_url=self.state.hidden_upstream_proxy_url or None,
+                proxy_url=self.state.public_proxy_url or None,
                 follow_redirects=True,
             )
             response.raise_for_status()
@@ -178,6 +178,7 @@ class ManagerController:
                 "TWOMAN_CPANEL_USERNAME": state.cpanel_username,
                 "TWOMAN_CPANEL_PASSWORD": state.cpanel_password,
                 "TWOMAN_CPANEL_HOME": state.cpanel_home,
+                "TWOMAN_CPANEL_PROXY_URL": state.cpanel_proxy_url,
                 "TWOMAN_PUBLIC_ORIGIN": state.public_origin,
                 "TWOMAN_PUBLIC_BASE_PATH": state.public_base_path,
                 "TWOMAN_APP_NAME": state.passenger_app_name,
@@ -187,6 +188,7 @@ class ManagerController:
                 "TWOMAN_CAMOUFLAGE_SITE_ENABLED": "true",
                 "TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID": state.deployment_id,
                 "TWOMAN_CAMOUFLAGE_SITE_NAME": state.site_name,
+                "TWOMAN_PUBLIC_PROXY_URL": state.public_proxy_url,
             }
             script = self.bundle_root / "scripts" / "deploy_host_passenger.sh"
         elif state.backend == BACKEND_NODE:
@@ -195,6 +197,7 @@ class ManagerController:
                 "TWOMAN_CPANEL_USERNAME": state.cpanel_username,
                 "TWOMAN_CPANEL_PASSWORD": state.cpanel_password,
                 "TWOMAN_CPANEL_HOME": state.cpanel_home,
+                "TWOMAN_CPANEL_PROXY_URL": state.cpanel_proxy_url,
                 "TWOMAN_PUBLIC_HOST": state.public_origin.replace("https://", "").replace("http://", "").strip("/"),
                 "TWOMAN_NODE_APP_ROOT": state.node_app_root,
                 "TWOMAN_NODE_APP_URI": state.node_app_uri,
@@ -204,6 +207,7 @@ class ManagerController:
                 "TWOMAN_CAMOUFLAGE_SITE_ENABLED": "true",
                 "TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID": state.deployment_id,
                 "TWOMAN_CAMOUFLAGE_SITE_NAME": state.site_name,
+                "TWOMAN_PUBLIC_PROXY_URL": state.public_proxy_url,
             }
             script = self.bundle_root / "scripts" / "deploy_host_node_selector.sh"
         else:
@@ -212,11 +216,13 @@ class ManagerController:
                 "TWOMAN_CPANEL_USERNAME": state.cpanel_username,
                 "TWOMAN_CPANEL_PASSWORD": state.cpanel_password,
                 "TWOMAN_CPANEL_HOME": state.cpanel_home,
+                "TWOMAN_CPANEL_PROXY_URL": state.cpanel_proxy_url,
                 "TWOMAN_PUBLIC_ORIGIN": state.public_origin,
                 "TWOMAN_PUBLIC_BASE_PATH": state.public_base_path,
                 "TWOMAN_BRIDGE_PUBLIC_BASE_PATH": state.bridge_public_base_path,
                 "TWOMAN_CLIENT_TOKEN": state.client_token,
                 "TWOMAN_AGENT_TOKEN": state.agent_token,
+                "TWOMAN_PUBLIC_PROXY_URL": state.public_proxy_url,
                 "TWOMAN_CAMOUFLAGE_SITE_ENABLED": "true",
                 "TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID": state.deployment_id,
                 "TWOMAN_CAMOUFLAGE_SITE_NAME": state.site_name,
@@ -238,6 +244,9 @@ class ManagerController:
 
     def install_command(self) -> list[str]:
         return [str(LAUNCHER_PATH), "install", "--instance", self.state.instance_name]
+
+    def purge_command(self) -> list[str]:
+        return [str(LAUNCHER_PATH), "purge", "--instance", self.state.instance_name]
 
 
 def _print_result(result: ActionResult) -> None:
@@ -271,8 +280,9 @@ def run_basic_manager(control_root: Path, instance_name: str | None = None) -> N
         print("8. Show instances")
         print("9. Show recent logs")
         print("10. Reconfigure")
-        print("11. Quit")
-        choice = input("Choose an action [1-11]: ").strip()
+        print("11. Purge this instance")
+        print("12. Quit")
+        choice = input("Choose an action [1-12]: ").strip()
         if choice == "1":
             _print_result(controller.verify())
         elif choice == "2":
@@ -299,6 +309,9 @@ def run_basic_manager(control_root: Path, instance_name: str | None = None) -> N
             subprocess.run(controller.install_command(), check=False)
             return
         elif choice == "11":
+            subprocess.run(controller.purge_command(), check=False)
+            return
+        elif choice == "12":
             return
         else:
             print("Choose one of the listed numbers.")
@@ -487,6 +500,7 @@ ModalScreen {
                     yield Button("Refresh Logs", id="action-refresh-logs")
                     yield Button("Show Config", id="action-show-config")
                     yield Button("Reconfigure", id="action-reconfigure", variant="warning")
+                    yield Button("Purge Instance", id="action-purge", variant="error")
                     yield Button("Quit", id="action-quit", variant="error")
                 with VerticalScroll(id="content"):
                     with Vertical(id="status-banner", classes="panel"):
@@ -542,6 +556,7 @@ ModalScreen {
                 "action-refresh-logs",
                 "action-show-config",
                 "action-reconfigure",
+                "action-purge",
                 "action-verify",
                 "action-restart-agent",
                 "action-restart-upstream",
@@ -625,6 +640,17 @@ ModalScreen {
                         f"Instance: {self.controller.state.instance_name}\n"
                         f"Command: {' '.join(self.controller.install_command())}",
                         self.controller.install_command(),
+                    )
+                )
+                return
+            if button_id == "action-purge":
+                self.push_screen(
+                    ConfirmCommandScreen(
+                        "Purge this instance?",
+                        "Twoman will leave the TUI and purge the selected instance from the host and hidden server.\n\n"
+                        f"Instance: {self.controller.state.instance_name}\n"
+                        f"Command: {' '.join(self.controller.purge_command())}",
+                        self.controller.purge_command(),
                     )
                 )
                 return

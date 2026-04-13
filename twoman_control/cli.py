@@ -4,7 +4,7 @@ import argparse
 import os
 from pathlib import Path
 
-from twoman_control.installer import install
+from twoman_control.installer import install, purge_installation
 from twoman_control.registry import load_registry, resolve_instance_name, set_default_instance
 
 
@@ -23,6 +23,13 @@ def build_parser() -> argparse.ArgumentParser:
     install_parser.add_argument("--cpanel-username", default="")
     install_parser.add_argument("--cpanel-password", default="")
     install_parser.add_argument("--cpanel-home", default="")
+    install_parser.add_argument("--cpanel-proxy-url", default="")
+    install_parser.add_argument("--public-proxy-url", default="")
+    install_parser.add_argument("--server-host", default="")
+    install_parser.add_argument("--server-port", type=int, default=22)
+    install_parser.add_argument("--server-user", default="")
+    install_parser.add_argument("--server-password", default="")
+    install_parser.add_argument("--server-ssh-key", default="")
     install_parser.add_argument("--site-name", default="")
     install_parser.add_argument("--backend", default="")
     install_parser.add_argument("--public-base-path", default="")
@@ -60,6 +67,11 @@ def build_parser() -> argparse.ArgumentParser:
     ]:
         action_parser = subparsers.add_parser(name, help=help_text)
         action_parser.add_argument("--instance", default="")
+    purge_parser = subparsers.add_parser("purge", help="Purge an installed Twoman instance")
+    purge_parser.add_argument("--instance", default="")
+    purge_parser.add_argument("--host-only", action="store_true")
+    purge_parser.add_argument("--hidden-only", action="store_true")
+    purge_parser.add_argument("--keep-state", action="store_true")
     list_parser = subparsers.add_parser("list", help="List installed Twoman instances")
     list_parser.add_argument("--instance", default="")
     default_parser = subparsers.add_parser("set-default", help="Set the default Twoman instance")
@@ -118,6 +130,23 @@ def main() -> int:
     command = args.command or "tui"
     if command == "install":
         install(args)
+        return 0
+    if command == "purge":
+        purge_host = not bool(args.hidden_only)
+        purge_hidden = not bool(args.host_only)
+        if not purge_host and not purge_hidden:
+            raise SystemExit("purge requires at least one of host or hidden removal")
+        state = purge_installation(
+            _control_root(),
+            _selected_instance(args) or None,
+            purge_host=purge_host,
+            purge_hidden=purge_hidden,
+            remove_state_files=not bool(args.keep_state),
+        )
+        print(
+            f"purged instance {state.instance_name}: "
+            f"{'host ' if purge_host else ''}{'hidden ' if purge_hidden else ''}".strip()
+        )
         return 0
     from twoman_control.manager import ManagerController, launch_manager
 

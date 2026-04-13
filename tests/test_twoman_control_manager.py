@@ -41,6 +41,13 @@ def _build_state(
         cpanel_username="cpanel-user",
         cpanel_password="cpanel-pass",
         cpanel_home="/home/cpanel-user",
+        cpanel_proxy_url="",
+        public_proxy_url="",
+        hidden_server_host="",
+        hidden_server_port=22,
+        hidden_server_user="",
+        hidden_server_password="",
+        hidden_server_ssh_key="",
         control_root="/opt/twoman/control",
         bundle_root="/opt/twoman/control/bundle",
         hidden_install_root=hidden_install_root,
@@ -147,6 +154,9 @@ class _FakeController:
     def install_command(self) -> list[str]:
         return ["/usr/local/bin/twoman", "install", "--instance", self.state.instance_name]
 
+    def purge_command(self) -> list[str]:
+        return ["/usr/local/bin/twoman", "purge", "--instance", self.state.instance_name]
+
     def list_instances_text(self) -> str:
         registry = self.registry()
         lines = []
@@ -232,6 +242,15 @@ class TwomanManagerAppTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await pilot.click("#confirm-continue")
         self.assertEqual(app.pending_command, ["/usr/local/bin/twoman", "install", "--instance", "node"])
+
+    async def test_purge_sets_pending_command_and_exits_cleanly(self) -> None:
+        app = TwomanManagerApp(controller=_FakeController())
+        async with app.run_test(size=(160, 50)) as pilot:
+            await pilot.pause()
+            await pilot.click("#action-purge")
+            await pilot.pause()
+            await pilot.click("#confirm-continue")
+        self.assertEqual(app.pending_command, ["/usr/local/bin/twoman", "purge", "--instance", "node"])
 
     async def test_verify_updates_result_output(self) -> None:
         app = TwomanManagerApp(controller=_FakeController())

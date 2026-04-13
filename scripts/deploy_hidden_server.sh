@@ -20,6 +20,8 @@ TWOMAN_AGENT_PEER_ID="${TWOMAN_AGENT_PEER_ID:-agent-main}"
 TWOMAN_SERVER_PASSWORD="${TWOMAN_SERVER_PASSWORD:-}"
 TWOMAN_SERVER_SSH_KEY="${TWOMAN_SERVER_SSH_KEY:-}"
 TWOMAN_AGENT_SERVICE_NAME="${TWOMAN_AGENT_SERVICE_NAME:-twoman-agent.service}"
+TWOMAN_WATCHDOG_SERVICE_NAME="${TWOMAN_WATCHDOG_SERVICE_NAME:-twoman-agent-watchdog.service}"
+TWOMAN_WATCHDOG_TIMER_NAME="${TWOMAN_WATCHDOG_TIMER_NAME:-twoman-agent-watchdog.timer}"
 TWOMAN_VERIFY_TLS="${TWOMAN_VERIFY_TLS:-true}"
 TWOMAN_HTTP2_CTL="${TWOMAN_HTTP2_CTL:-false}"
 TWOMAN_HTTP2_DATA="${TWOMAN_HTTP2_DATA:-false}"
@@ -218,10 +220,10 @@ chown -R '${TWOMAN_AGENT_SERVICE_USER}:${TWOMAN_AGENT_SERVICE_GROUP}' '${TWOMAN_
 cat > '/etc/systemd/system/${TWOMAN_AGENT_SERVICE_NAME}' <<'EOF'
 ${SERVICE_CONTENT}
 EOF
-cat > '/etc/systemd/system/twoman-agent-watchdog.service' <<'EOF'
+cat > '/etc/systemd/system/${TWOMAN_WATCHDOG_SERVICE_NAME}' <<'EOF'
 ${WATCHDOG_SERVICE_CONTENT}
 EOF
-install -m 0644 '${TWOMAN_SERVER_DIR}/twoman-agent-watchdog.timer' /etc/systemd/system/twoman-agent-watchdog.timer
+install -m 0644 '${TWOMAN_SERVER_DIR}/twoman-agent-watchdog.timer' /etc/systemd/system/${TWOMAN_WATCHDOG_TIMER_NAME}
 chmod 755 '${TWOMAN_SERVER_DIR}/install_watchdog.sh' '${TWOMAN_SERVER_DIR}/agent_watchdog.py'
 if ! python3 -m venv --help >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
@@ -239,11 +241,11 @@ fi
 '${TWOMAN_SERVER_DIR}/.venv/bin/python' -m py_compile '${TWOMAN_SERVER_DIR}/agent.py' '${TWOMAN_SERVER_DIR}/agent_watchdog.py'
 systemctl daemon-reload
 systemctl enable --now '${TWOMAN_AGENT_SERVICE_NAME}'
-systemctl enable --now twoman-agent-watchdog.timer
+systemctl enable --now '${TWOMAN_WATCHDOG_TIMER_NAME}'
 systemctl restart '${TWOMAN_AGENT_SERVICE_NAME}'
-systemctl start twoman-agent-watchdog.service
+systemctl start '${TWOMAN_WATCHDOG_SERVICE_NAME}'
 systemctl is-active '${TWOMAN_AGENT_SERVICE_NAME}'
-systemctl is-active twoman-agent-watchdog.timer
+systemctl is-active '${TWOMAN_WATCHDOG_TIMER_NAME}'
 "
 
 echo "Hidden server deployment complete."

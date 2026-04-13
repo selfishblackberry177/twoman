@@ -28,6 +28,7 @@ from twoman_control.registry import (
     DEFAULT_INSTANCE_NAME,
     legacy_state_path,
     load_instance_state,
+    remove_instance,
     normalize_instance_name,
     profile_share_path,
     save_instance_state,
@@ -49,6 +50,13 @@ class InstallArgs:
     cpanel_username: str
     cpanel_password: str
     cpanel_home: str
+    cpanel_proxy_url: str
+    public_proxy_url: str
+    hidden_server_host: str
+    hidden_server_port: int
+    hidden_server_user: str
+    hidden_server_password: str
+    hidden_server_ssh_key: str
     site_name: str
     backend: str
     non_interactive: bool
@@ -152,6 +160,7 @@ def _copy_selected_paths(source_root: Path, bundle_root: Path) -> None:
         "requirements.txt",
         "runtime_diagnostics.py",
         "twoman_crypto.py",
+        "twoman_dns.py",
         "twoman_http.py",
         "twoman_proxy.py",
         "twoman_protocol.py",
@@ -372,27 +381,39 @@ def _helper_probe(
                 time.sleep(0.25)
             if not listen_state_path.exists():
                 raise RuntimeError("temporary helper did not publish listener state")
-            probe = subprocess.run(
-                [
-                    "curl",
-                    "-sS",
-                    "-m",
-                    "45",
-                    "-x",
-                    f"http://127.0.0.1:{http_port}",
-                    "-o",
-                    "/dev/null",
-                    "-w",
-                    "%{http_code}",
-                    "https://example.com",
-                ],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            status_code = probe.stdout.strip()
-            if status_code not in {"200", "301", "302"}:
-                raise RuntimeError(f"helper probe failed with status {status_code or probe.stderr.strip()}")
+            last_error = "helper probe never ran"
+            for _ in range(6):
+                probe = subprocess.run(
+                    [
+                        "curl",
+                        "-sS",
+                        "--connect-timeout",
+                        "10",
+                        "-m",
+                        "20",
+                        "-x",
+                        f"http://127.0.0.1:{http_port}",
+                        "-o",
+                        "/dev/null",
+                        "-w",
+                        "%{http_code}",
+                        "https://www.google.com/generate_204",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                status_code = probe.stdout.strip()
+                if status_code in {"200", "204", "301", "302"}:
+                    return
+                last_error = status_code or probe.stderr.strip() or "unknown helper probe failure"
+                time.sleep(2.0)
+            helper_log = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+            helper_tail = "\n".join(helper_log.strip().splitlines()[-20:]).strip()
+            detail = last_error
+            if helper_tail:
+                detail = f"{detail}\nHelper log tail:\n{helper_tail}"
+            raise RuntimeError(f"helper probe failed\n{detail}")
         finally:
             process.terminate()
             try:
@@ -418,7 +439,8 @@ def _deploy_host(bundle_root: Path, state: InstallState) -> None:
             "TWOMAN_CAMOUFLAGE_SITE_ENABLED": "true",
             "TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID": state.deployment_id,
             "TWOMAN_CAMOUFLAGE_SITE_NAME": state.site_name,
-            "TWOMAN_UPSTREAM_PROXY_URL": state.hidden_upstream_proxy_url,
+            "TWOMAN_CPANEL_PROXY_URL": state.cpanel_proxy_url,
+            "TWOMAN_PUBLIC_PROXY_URL": state.public_proxy_url,
         }
         script = bundle_root / "scripts" / "deploy_host_passenger.sh"
     elif state.backend == BACKEND_NODE:
@@ -437,7 +459,8 @@ def _deploy_host(bundle_root: Path, state: InstallState) -> None:
             "TWOMAN_CAMOUFLAGE_SITE_ENABLED": "true",
             "TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID": state.deployment_id,
             "TWOMAN_CAMOUFLAGE_SITE_NAME": state.site_name,
-            "TWOMAN_UPSTREAM_PROXY_URL": state.hidden_upstream_proxy_url,
+            "TWOMAN_CPANEL_PROXY_URL": state.cpanel_proxy_url,
+            "TWOMAN_PUBLIC_PROXY_URL": state.public_proxy_url,
         }
         script = bundle_root / "scripts" / "deploy_host_node_selector.sh"
     else:
@@ -451,7 +474,8 @@ def _deploy_host(bundle_root: Path, state: InstallState) -> None:
             "TWOMAN_BRIDGE_PUBLIC_BASE_PATH": state.bridge_public_base_path,
             "TWOMAN_CLIENT_TOKEN": state.client_token,
             "TWOMAN_AGENT_TOKEN": state.agent_token,
-            "TWOMAN_UPSTREAM_PROXY_URL": state.hidden_upstream_proxy_url,
+            "TWOMAN_CPANEL_PROXY_URL": state.cpanel_proxy_url,
+            "TWOMAN_PUBLIC_PROXY_URL": state.public_proxy_url,
             "TWOMAN_CAMOUFLAGE_SITE_ENABLED": "true",
             "TWOMAN_CAMOUFLAGE_DEPLOYMENT_ID": state.deployment_id,
             "TWOMAN_CAMOUFLAGE_SITE_NAME": state.site_name,
@@ -491,20 +515,158 @@ def _install_local_hidden_server(bundle_root: Path, state: InstallState) -> None
         )
 
 
+def _install_remote_hidden_server(bundle_root: Path, state: InstallState) -> None:
+    env = {
+        "TWOMAN_SERVER_HOST": state.hidden_server_host,
+        "TWOMAN_SERVER_PORT": str(state.hidden_server_port),
+        "TWOMAN_SERVER_USER": state.hidden_server_user,
+        "TWOMAN_SERVER_PASSWORD": state.hidden_server_password,
+        "TWOMAN_SERVER_SSH_KEY": state.hidden_server_ssh_key,
+        "TWOMAN_SERVER_DIR": state.hidden_install_root,
+        "TWOMAN_BROKER_BASE_URL": state.broker_base_url,
+        "TWOMAN_AGENT_TOKEN": state.agent_token,
+        "TWOMAN_AGENT_PEER_ID": state.agent_peer_id,
+        "TWOMAN_AGENT_SERVICE_NAME": state.hidden_service_name,
+        "TWOMAN_AGENT_SERVICE_USER": state.hidden_service_user,
+        "TWOMAN_AGENT_SERVICE_GROUP": state.hidden_service_group,
+        "TWOMAN_WATCHDOG_SERVICE_NAME": state.watchdog_service_name,
+        "TWOMAN_WATCHDOG_TIMER_NAME": state.watchdog_timer_name,
+        "TWOMAN_VERIFY_TLS": "true" if state.verify_tls else "false",
+        "TWOMAN_HTTP2_CTL": "false",
+        "TWOMAN_HTTP2_DATA": "false",
+        "TWOMAN_DISABLE_IPV6_ORIGIN": "true",
+        "TWOMAN_PREFER_IPV4": "true",
+        "TWOMAN_UPSTREAM_PROXY_URL": state.hidden_upstream_proxy_url,
+        "TWOMAN_UPSTREAM_PROXY_LABEL": state.hidden_upstream_proxy_label,
+        "TWOMAN_OUTBOUND_PROXY_URL": state.hidden_outbound_proxy_url,
+        "TWOMAN_OUTBOUND_PROXY_LABEL": state.hidden_outbound_proxy_label,
+    }
+    result = _run_script(bundle_root / "scripts" / "deploy_hidden_server.sh", env, cwd=bundle_root)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"remote hidden-server install failed\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+
+
+def _install_hidden_server(bundle_root: Path, state: InstallState) -> None:
+    if state.hidden_server_host:
+        _install_remote_hidden_server(bundle_root, state)
+        return
+    _install_local_hidden_server(bundle_root, state)
+
+
+def _purge_local_hidden_server(bundle_root: Path, state: InstallState) -> None:
+    env = {
+        "TWOMAN_INSTALL_ROOT": state.hidden_install_root,
+        "TWOMAN_AGENT_SERVICE_NAME": state.hidden_service_name,
+        "TWOMAN_WATCHDOG_SERVICE_NAME": state.watchdog_service_name,
+        "TWOMAN_WATCHDOG_TIMER_NAME": state.watchdog_timer_name,
+    }
+    result = _run_script(bundle_root / "scripts" / "purge_hidden_server_local.sh", env, cwd=bundle_root)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"local hidden-server purge failed\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+
+
+def _purge_remote_hidden_server(bundle_root: Path, state: InstallState) -> None:
+    env = {
+        "TWOMAN_SERVER_HOST": state.hidden_server_host,
+        "TWOMAN_SERVER_PORT": str(state.hidden_server_port),
+        "TWOMAN_SERVER_USER": state.hidden_server_user,
+        "TWOMAN_SERVER_PASSWORD": state.hidden_server_password,
+        "TWOMAN_SERVER_SSH_KEY": state.hidden_server_ssh_key,
+        "TWOMAN_INSTALL_ROOT": state.hidden_install_root,
+        "TWOMAN_AGENT_SERVICE_NAME": state.hidden_service_name,
+        "TWOMAN_WATCHDOG_SERVICE_NAME": state.watchdog_service_name,
+        "TWOMAN_WATCHDOG_TIMER_NAME": state.watchdog_timer_name,
+    }
+    result = _run_script(bundle_root / "scripts" / "purge_hidden_server.sh", env, cwd=bundle_root)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"remote hidden-server purge failed\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+
+
+def _purge_hidden_server(bundle_root: Path, state: InstallState) -> None:
+    if state.hidden_server_host:
+        _purge_remote_hidden_server(bundle_root, state)
+        return
+    _purge_local_hidden_server(bundle_root, state)
+
+
+def _purge_host(bundle_root: Path, state: InstallState) -> None:
+    if state.backend == BACKEND_NODE:
+        env = {
+            "TWOMAN_CPANEL_BASE_URL": state.cpanel_base_url,
+            "TWOMAN_CPANEL_USERNAME": state.cpanel_username,
+            "TWOMAN_CPANEL_PASSWORD": state.cpanel_password,
+            "TWOMAN_CPANEL_HOME": state.cpanel_home,
+            "TWOMAN_PUBLIC_HOST": state.public_origin.replace("https://", "").replace("http://", "").strip("/"),
+            "TWOMAN_NODE_APP_ROOT": state.node_app_root,
+            "TWOMAN_ADMIN_SCRIPT_NAME": state.admin_script_name,
+            "TWOMAN_CPANEL_PROXY_URL": state.cpanel_proxy_url,
+            "TWOMAN_PUBLIC_PROXY_URL": state.public_proxy_url,
+        }
+        script = bundle_root / "scripts" / "purge_host_node_selector.sh"
+    elif state.backend == BACKEND_BRIDGE:
+        env = {
+            "TWOMAN_CPANEL_BASE_URL": state.cpanel_base_url,
+            "TWOMAN_CPANEL_USERNAME": state.cpanel_username,
+            "TWOMAN_CPANEL_PASSWORD": state.cpanel_password,
+            "TWOMAN_CPANEL_HOME": state.cpanel_home,
+            "TWOMAN_PUBLIC_BASE_PATH": state.public_base_path,
+            "TWOMAN_CPANEL_PROXY_URL": state.cpanel_proxy_url,
+            "TWOMAN_PUBLIC_PROXY_URL": state.public_proxy_url,
+        }
+        script = bundle_root / "scripts" / "purge_host_bridge.sh"
+    else:
+        raise RuntimeError(f"purge is not implemented for backend {state.backend}")
+    result = _run_script(script, env, cwd=bundle_root)
+    if result.returncode != 0:
+        raise RuntimeError(f"host purge failed\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
+
+
+def purge_installation(
+    control_root: Path,
+    instance_name: str | None,
+    *,
+    purge_host: bool = True,
+    purge_hidden: bool = True,
+    remove_state_files: bool = True,
+) -> InstallState:
+    state = load_instance_state(control_root, instance_name)
+    bundle_root = Path(state.bundle_root)
+    if purge_host:
+        _purge_host(bundle_root, state)
+    if purge_hidden:
+        _purge_hidden_server(bundle_root, state)
+    if remove_state_files:
+        remove_instance(control_root, state.instance_name)
+    return state
+
+
 def _verify_final_health(state: InstallState) -> None:
-    response = httpx_request(
-        "GET",
-        f"{state.broker_base_url.rstrip('/')}/health",
-        headers={"Authorization": f"Bearer {state.client_token}"},
-        timeout=20.0,
-        verify=state.verify_tls,
-        proxy_url=state.hidden_upstream_proxy_url or None,
-        follow_redirects=True,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if not payload.get("ok"):
-        raise RuntimeError(f"broker health failed: {payload}")
+    deadline = time.time() + 60.0
+    last_payload: dict[str, object] | None = None
+    while time.time() < deadline:
+        response = httpx_request(
+            "GET",
+            f"{state.broker_base_url.rstrip('/')}/health",
+            headers={"Authorization": f"Bearer {state.client_token}"},
+            timeout=20.0,
+            verify=state.verify_tls,
+            proxy_url=state.public_proxy_url or None,
+            follow_redirects=True,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        last_payload = payload
+        peers = int(payload.get("stats", {}).get("peers", 0) or 0)
+        if payload.get("ok") and peers >= 1:
+            return
+        time.sleep(2.0)
+    raise RuntimeError(f"broker health failed to reach a live peer: {last_payload}")
 
 
 def _print_capabilities(capabilities: Iterable[BackendCapability]) -> None:
@@ -576,6 +738,27 @@ def collect_install_args(namespace: object) -> InstallArgs:
         cpanel_home = f"/home/{cpanel_username}"
     if not cpanel_home and not non_interactive:
         cpanel_home = _prompt_text("cPanel home directory", "/home/cpanel-user")
+    public_proxy_url = _normalize_proxy_url(
+        getattr(namespace, "public_proxy_url", "") or (existing_state.public_proxy_url if existing_state else "")
+    )
+
+    hidden_server_host = str(
+        getattr(namespace, "server_host", "") or (existing_state.hidden_server_host if existing_state else "")
+    ).strip()
+    hidden_server_port = int(
+        getattr(namespace, "server_port", 0) or (existing_state.hidden_server_port if existing_state else 22) or 22
+    )
+    hidden_server_user = str(
+        getattr(namespace, "server_user", "") or (existing_state.hidden_server_user if existing_state else "")
+    ).strip()
+    if hidden_server_host and not hidden_server_user:
+        hidden_server_user = "root"
+    hidden_server_password = str(
+        getattr(namespace, "server_password", "") or (existing_state.hidden_server_password if existing_state else "")
+    ).strip()
+    hidden_server_ssh_key = str(
+        getattr(namespace, "server_ssh_key", "") or (existing_state.hidden_server_ssh_key if existing_state else "")
+    ).strip()
 
     site_name = str(getattr(namespace, "site_name", "") or (existing_state.site_name if existing_state else "")).strip()
     if not site_name and not non_interactive:
@@ -681,6 +864,15 @@ def collect_install_args(namespace: object) -> InstallArgs:
         cpanel_username=cpanel_username,
         cpanel_password=cpanel_password,
         cpanel_home=cpanel_home,
+        cpanel_proxy_url=str(
+            getattr(namespace, "cpanel_proxy_url", "") or (existing_state.cpanel_proxy_url if existing_state else "")
+        ).strip(),
+        public_proxy_url=public_proxy_url,
+        hidden_server_host=hidden_server_host,
+        hidden_server_port=hidden_server_port,
+        hidden_server_user=hidden_server_user,
+        hidden_server_password=hidden_server_password,
+        hidden_server_ssh_key=hidden_server_ssh_key,
         site_name=site_name,
         backend=backend,
         non_interactive=non_interactive,
@@ -752,7 +944,8 @@ def install(namespace: object) -> InstallState:
         username=args.cpanel_username,
         password=args.cpanel_password,
         cpanel_home=args.cpanel_home,
-        proxy_url=args.hidden_upstream_proxy_url,
+        proxy_url=args.cpanel_proxy_url,
+        public_proxy_url=args.public_proxy_url,
     )
     tls_verify_supported = cpanel.verify_public_tls(args.public_origin)
     verify_tls = tls_verify_supported if args.verify_tls is None else bool(args.verify_tls)
@@ -855,6 +1048,13 @@ def install(namespace: object) -> InstallState:
         cpanel_username=args.cpanel_username,
         cpanel_password=args.cpanel_password,
         cpanel_home=args.cpanel_home,
+        cpanel_proxy_url=args.cpanel_proxy_url,
+        public_proxy_url=args.public_proxy_url,
+        hidden_server_host=args.hidden_server_host,
+        hidden_server_port=args.hidden_server_port,
+        hidden_server_user=args.hidden_server_user,
+        hidden_server_password=args.hidden_server_password,
+        hidden_server_ssh_key=args.hidden_server_ssh_key,
         control_root=str(args.control_root),
         bundle_root=str(bundle_root),
         hidden_install_root=str(args.install_root),
@@ -898,6 +1098,13 @@ def install(namespace: object) -> InstallState:
     print(f"  public origin: {state.public_origin}")
     print(f"  broker URL: {state.broker_base_url}")
     print(f"  hidden install root: {state.hidden_install_root}")
+    print(f"  public route: {state.public_proxy_url or 'direct'}")
+    hidden_target = (
+        f"{state.hidden_server_user}@{state.hidden_server_host}:{state.hidden_server_port}"
+        if state.hidden_server_host
+        else "local machine"
+    )
+    print(f"  hidden target: {hidden_target}")
     print(f"  hidden service: {state.hidden_service_name}")
     print(f"  hidden route: {_proxy_display_name(state.hidden_upstream_proxy_label, state.hidden_upstream_proxy_url)}")
     print(f"  outbound route: {_proxy_display_name(state.hidden_outbound_proxy_label, state.hidden_outbound_proxy_url)}")
@@ -907,8 +1114,8 @@ def install(namespace: object) -> InstallState:
     args.control_root.mkdir(parents=True, exist_ok=True)
     print("\nDeploying public host backend...")
     _deploy_host(bundle_root, state)
-    print("Installing hidden agent on this Linux machine...")
-    _install_local_hidden_server(bundle_root, state)
+    print("Installing hidden agent...")
+    _install_hidden_server(bundle_root, state)
     print("Verifying live broker health...")
     _verify_final_health(state)
     if not args.skip_helper_probe:
@@ -920,7 +1127,7 @@ def install(namespace: object) -> InstallState:
             state.verify_tls,
             state.client_http2_ctl,
             state.client_http2_data,
-            state.hidden_upstream_proxy_url,
+            state.public_proxy_url,
         )
     print("Bootstrapping the local twoman management command...")
     save_instance_state(args.control_root, state)

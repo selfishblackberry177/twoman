@@ -53,9 +53,11 @@ class CpanelClient:
     cpanel_home: str
     verify: bool = True
     proxy_url: str = ""
+    public_proxy_url: str = ""
 
     def __post_init__(self) -> None:
         self.proxy_url = _normalize_proxy_url(self.proxy_url)
+        self.public_proxy_url = _normalize_proxy_url(self.public_proxy_url)
 
     def _request_with_retry(self, method: str, endpoint: str, *, timeout: float, retries: int = 3, **kwargs: Any) -> httpx.Response:
         last_error: Exception | None = None
@@ -85,7 +87,7 @@ class CpanelClient:
             url,
             timeout=timeout,
             verify=verify,
-            proxy_url=self.proxy_url or None,
+            proxy_url=self.public_proxy_url or self.proxy_url or None,
             follow_redirects=True,
         )
         response.raise_for_status()
@@ -129,14 +131,30 @@ class CpanelClient:
             raise RuntimeError(f"save_file_content failed: {payload}")
 
     def delete_file(self, remote_dir: str, filename: str) -> None:
-        self._api_post(
-            "Fileman/file_op",
-            data={
+        remote_dir_path = Path(remote_dir)
+        try:
+            relative_path = str((remote_dir_path / filename).relative_to(self.cpanel_home))
+        except ValueError:
+            relative_path = str(remote_dir_path / filename)
+        response = httpx_request(
+            "GET",
+            f"{self.base_url.rstrip('/')}/json-api/cpanel",
+            auth=(self.username, self.password),
+            timeout=20.0,
+            verify=self.verify,
+            proxy_url=self.proxy_url or None,
+            follow_redirects=True,
+            params={
+                "cpanel_jsonapi_user": self.username,
+                "cpanel_jsonapi_apiversion": 2,
+                "cpanel_jsonapi_module": "Fileman",
+                "cpanel_jsonapi_func": "fileop",
                 "op": "trash",
-                "sourcefiles": filename,
-                "metadata": remote_dir,
+                "sourcefiles": relative_path,
+                "doubledecode": 1,
             },
         )
+        response.raise_for_status()
 
     def passenger_supported(self) -> BackendCapability:
         try:
@@ -197,15 +215,20 @@ class CpanelClient:
         )
 
     def node_selector_supported(self, public_origin: str, public_verify_tls: bool) -> BackendCapability:
+        bundle_path = Path(__file__).resolve().parents[1] / "host" / "node_selector" / "app.js"
         local_node = shutil.which("node")
         local_npx = shutil.which("npx")
-        if not local_node or not local_npx:
+        if not bundle_path.exists() and (not local_node or not local_npx):
             return BackendCapability(
                 key=BACKEND_NODE,
                 label="CloudLinux Node Selector",
                 available=False,
-                reason="Local prerequisites missing: both node and npx are required to bundle the Node broker.",
-                details={"local_node": bool(local_node), "local_npx": bool(local_npx)},
+                reason="Node broker bundle is unavailable and local node/npx are missing.",
+                details={
+                    "bundled_app": bundle_path.exists(),
+                    "local_node": bool(local_node),
+                    "local_npx": bool(local_npx),
+                },
             )
         probe_name = f"twoman_probe_{secrets.token_hex(4)}.php"
         public_html = f"{self.cpanel_home.rstrip('/')}/public_html"
@@ -218,7 +241,7 @@ $result = [
 ];
 if ($result['selector_executable'] && $result['proc_open_available']) {
   $spec = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
-  $proc = proc_open($selector . ' list --json --interpreter nodejs 2>&1', $spec, $pipes);
+  $proc = proc_open($selector . ' get --json --interpreter nodejs 2>&1', $spec, $pipes);
   if (is_resource($proc)) {
     fclose($pipes[0]);
     $stdout = stream_get_contents($pipes[1]);
@@ -311,7 +334,7 @@ echo json_encode($result);
                 public_origin.rstrip("/"),
                 timeout=10.0,
                 verify=True,
-                proxy_url=self.proxy_url or None,
+                proxy_url=self.public_proxy_url or self.proxy_url or None,
                 follow_redirects=True,
             )
             response.read()

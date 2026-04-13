@@ -13,7 +13,7 @@ upload_file() {
   local source_path="$1"
   local remote_dir="$2"
   local remote_name="$3"
-  curl -sk "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl -sk "${CPANEL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     -F "dir=${remote_dir}" \
     -F "overwrite=1" \
     -F "file-1=@${source_path};filename=${remote_name}" \
@@ -24,7 +24,7 @@ upload_content() {
   local remote_dir="$1"
   local remote_name="$2"
   local content="$3"
-  curl -sk "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl -sk "${CPANEL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     --data-urlencode "dir=${remote_dir}" \
     --data-urlencode "file=${remote_name}" \
     --data-urlencode "content=${content}" \
@@ -37,7 +37,7 @@ upload_content() {
 delete_remote_file() {
   local remote_dir="$1"
   local remote_name="$2"
-  curl -sk "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl -sk "${CPANEL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     --data-urlencode "op=trash" \
     --data-urlencode "sourcefiles=${remote_name}" \
     --data-urlencode "metadata=${remote_dir}" \
@@ -47,7 +47,7 @@ delete_remote_file() {
 mkdir_api() {
   local parent_path="$1"
   local dir_name="$2"
-  curl -sk "${CURL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
+  curl -sk "${CPANEL_PROXY_ARGS[@]}" --user "${TWOMAN_CPANEL_USERNAME}:${TWOMAN_CPANEL_PASSWORD}" \
     --get \
     --data-urlencode "cpanel_jsonapi_user=${TWOMAN_CPANEL_USERNAME}" \
     --data-urlencode "cpanel_jsonapi_apiversion=2" \
@@ -76,7 +76,7 @@ ensure_remote_dir() {
 
 run_admin_mode() {
   local mode="$1"
-  curl -sk "${CURL_PROXY_ARGS[@]}" --connect-timeout 10 --max-time 20 "https://${TWOMAN_PUBLIC_HOST}/${TWOMAN_ADMIN_SCRIPT_NAME}?mode=${mode}" | python3 -c '
+  curl -sk "${PUBLIC_PROXY_ARGS[@]}" --connect-timeout 10 --max-time 20 "https://${TWOMAN_PUBLIC_HOST}/${TWOMAN_ADMIN_SCRIPT_NAME}?mode=${mode}" | python3 -c '
 import json, sys
 payload = json.load(sys.stdin)
 if payload.get("code", 1) != 0:
@@ -92,11 +92,16 @@ require_env TWOMAN_CPANEL_HOME
 require_env TWOMAN_PUBLIC_HOST
 require_env TWOMAN_CLIENT_TOKEN
 require_env TWOMAN_AGENT_TOKEN
-TWOMAN_UPSTREAM_PROXY_URL="${TWOMAN_UPSTREAM_PROXY_URL:-}"
+TWOMAN_CPANEL_PROXY_URL="${TWOMAN_CPANEL_PROXY_URL:-${TWOMAN_UPSTREAM_PROXY_URL:-}}"
+TWOMAN_PUBLIC_PROXY_URL="${TWOMAN_PUBLIC_PROXY_URL:-${TWOMAN_UPSTREAM_PROXY_URL:-}}"
 
-CURL_PROXY_ARGS=()
-if [ -n "${TWOMAN_UPSTREAM_PROXY_URL}" ]; then
-  CURL_PROXY_ARGS+=(--proxy "${TWOMAN_UPSTREAM_PROXY_URL}")
+CPANEL_PROXY_ARGS=()
+if [ -n "${TWOMAN_CPANEL_PROXY_URL}" ]; then
+  CPANEL_PROXY_ARGS+=(--proxy "${TWOMAN_CPANEL_PROXY_URL}")
+fi
+PUBLIC_PROXY_ARGS=()
+if [ -n "${TWOMAN_PUBLIC_PROXY_URL}" ]; then
+  PUBLIC_PROXY_ARGS+=(--proxy "${TWOMAN_PUBLIC_PROXY_URL}")
 fi
 
 TWOMAN_CAMOUFLAGE_SITE_ENABLED="${TWOMAN_CAMOUFLAGE_SITE_ENABLED:-false}"
@@ -111,12 +116,19 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
-npx --yes esbuild host/node_selector/broker.js \
-  --bundle \
-  --platform=node \
-  --target=node20 \
-  --format=cjs \
-  --outfile="${TWOMAN_NODE_BUNDLE_PATH}" >/dev/null
+if [ -f "host/node_selector/app.js" ]; then
+  cp "host/node_selector/app.js" "${TWOMAN_NODE_BUNDLE_PATH}"
+elif command -v npx >/dev/null 2>&1; then
+  npx --yes esbuild host/node_selector/broker.js \
+    --bundle \
+    --platform=node \
+    --target=node20 \
+    --format=cjs \
+    --outfile="${TWOMAN_NODE_BUNDLE_PATH}" >/dev/null
+else
+  echo "missing host/node_selector/app.js and npx is unavailable to build it" >&2
+  exit 1
+fi
 
 TWOMAN_NODE_APP_ROOT="${TWOMAN_NODE_APP_ROOT:-${TWOMAN_CPANEL_HOME}/rahkar_node}"
 TWOMAN_NODE_APP_URI="${TWOMAN_NODE_APP_URI:-/rahkar-node}"
@@ -302,7 +314,7 @@ run_admin_mode restart
 
 echo "Checking Node broker health..."
 sleep 3
-curl -sk "${CURL_PROXY_ARGS[@]}" --connect-timeout 10 --max-time 20 -H "Authorization: Bearer ${TWOMAN_CLIENT_TOKEN}" "https://${TWOMAN_PUBLIC_HOST}${TWOMAN_NODE_APP_URI}/health" | python3 -c '
+curl -sk "${PUBLIC_PROXY_ARGS[@]}" --connect-timeout 10 --max-time 20 -H "Authorization: Bearer ${TWOMAN_CLIENT_TOKEN}" "https://${TWOMAN_PUBLIC_HOST}${TWOMAN_NODE_APP_URI}/health" | python3 -c '
 import json, sys
 payload = json.load(sys.stdin)
 if not payload.get("ok"):

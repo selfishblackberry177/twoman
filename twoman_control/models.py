@@ -78,6 +78,13 @@ class InstallState:
     cpanel_username: str
     cpanel_password: str
     cpanel_home: str
+    cpanel_proxy_url: str
+    public_proxy_url: str
+    hidden_server_host: str
+    hidden_server_port: int
+    hidden_server_user: str
+    hidden_server_password: str
+    hidden_server_ssh_key: str
     control_root: str
     bundle_root: str
     hidden_install_root: str
@@ -135,6 +142,13 @@ class InstallState:
             cpanel_username=str(payload.get("cpanel_username", "")).strip(),
             cpanel_password=str(payload.get("cpanel_password", "")).strip(),
             cpanel_home=str(payload.get("cpanel_home", "")).strip(),
+            cpanel_proxy_url=str(payload.get("cpanel_proxy_url", "")).strip(),
+            public_proxy_url=str(payload.get("public_proxy_url", "")).strip(),
+            hidden_server_host=str(payload.get("hidden_server_host", "")).strip(),
+            hidden_server_port=int(payload.get("hidden_server_port", 22)),
+            hidden_server_user=str(payload.get("hidden_server_user", "")).strip(),
+            hidden_server_password=str(payload.get("hidden_server_password", "")).strip(),
+            hidden_server_ssh_key=str(payload.get("hidden_server_ssh_key", "")).strip(),
             control_root=str(payload.get("control_root", "")).strip(),
             bundle_root=str(payload.get("bundle_root", "")).strip(),
             hidden_install_root=str(payload.get("hidden_install_root", "")).strip(),
